@@ -2,7 +2,7 @@
 
 **Offline Terminal Workbench for FTIR, ¹H NMR, ¹³C NMR & UV-Vis Spectroscopy and Polymer Chemistry**
 
-Built in **Rust** (`ratatui` + `crossterm`) with optional **Python** (`matplotlib` / `scipy` / `numpy`) tools for publication figures, printed-spectrum digitization, and open-library fetching • Created by **Muhammad Musavi**
+Built in **Rust** (`ratatui` + `crossterm`) with optional **Python** (`matplotlib` / `scipy` / `numpy`) tools for publication figures, printed-spectrum digitization, and open-library fetching.
 
 ---
 
