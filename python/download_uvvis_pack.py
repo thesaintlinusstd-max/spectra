@@ -500,7 +500,11 @@ def main() -> int:
     parser.add_argument("--photochemcad", action="store_true", help="Download OMLC PhotochemCAD only")
     parser.add_argument("--nist", action="store_true", help="Download NIST WebBook UV-Vis only")
     parser.add_argument("--force-nist", action="store_true", help="Re-check all NIST UV-Vis indices")
-    parser.add_argument("--out-dir", default="library/uvvis", help="Output directory")
+    parser.add_argument(
+        "--out-dir",
+        default=str(Path(__file__).resolve().parent.parent / "library" / "uvvis"),
+        help="Output directory (default: <repo_root>/library/uvvis)",
+    )
     args = parser.parse_args()
 
     if not (args.all or args.photochemcad or args.nist):

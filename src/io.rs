@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{RwLock, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -907,50 +908,74 @@ fn name_match_score(query_norm: &str, stem_norm: &str) -> Option<i32> {
     Some(score - (s_tokens.len().min(40) as i32))
 }
 
-/// Every reference spectrum on disk, indexed once per process. Building the
-/// index is a single `readdir` per folder; re-walking it on every keystroke of
-/// the search modal is what made the UI feel frozen on slow disks.
-pub fn library_index() -> &'static [LibraryEntry] {
-    static INDEX: std::sync::OnceLock<Vec<LibraryEntry>> = std::sync::OnceLock::new();
-    INDEX.get_or_init(|| {
-        let mut out: Vec<LibraryEntry> = Vec::new();
-        let mut seen: HashSet<PathBuf> = HashSet::new();
-        for root in library_roots() {
-            let Ok(rd) = fs::read_dir(&root) else {
+/// Every reference spectrum on disk, indexed lazily and refreshable.
+/// Uses OnceLock<RwLock<Vec<LibraryEntry>>> so the index can be rebuilt
+/// after downloading new reference packs without restarting the app.
+fn library_index_lock() -> &'static RwLock<Vec<LibraryEntry>> {
+    static INDEX: OnceLock<RwLock<Vec<LibraryEntry>>> = OnceLock::new();
+    INDEX.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Build the library index from disk (scans all library roots).
+fn build_library_index() -> Vec<LibraryEntry> {
+    let mut out: Vec<LibraryEntry> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for root in library_roots() {
+        let Ok(rd) = fs::read_dir(&root) else {
+            continue;
+        };
+        for item in rd.flatten() {
+            let path = item.path();
+            if !is_spectrum_extension(&path) {
                 continue;
-            };
-            for item in rd.flatten() {
-                let path = item.path();
-                if !is_spectrum_extension(&path) {
-                    continue;
-                }
-                // `file_type` avoids an extra blocking stat on network mounts.
-                let is_file = match item.file_type() {
-                    Ok(ft) if ft.is_symlink() => path.is_file(),
-                    Ok(ft) => ft.is_file(),
-                    Err(_) => false,
-                };
-                if !is_file || !seen.insert(path.clone()) {
-                    continue;
-                }
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if stem.is_empty() {
-                    continue;
-                }
-                out.push(LibraryEntry {
-                    kind: infer_file_kind(&path, &stem),
-                    path,
-                    stem,
-                    score: 0,
-                });
             }
+            let is_file = match item.file_type() {
+                Ok(ft) if ft.is_symlink() => path.is_file(),
+                Ok(ft) => ft.is_file(),
+                Err(_) => false,
+            };
+            if !is_file || !seen.insert(path.clone()) {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            if stem.is_empty() {
+                continue;
+            }
+            out.push(LibraryEntry {
+                kind: infer_file_kind(&path, &stem),
+                path,
+                stem,
+                score: 0,
+            });
         }
-        out
-    })
+    }
+    out
+}
+
+/// Get the current library index, initializing it on first access.
+pub fn library_index() -> Vec<LibraryEntry> {
+    let lock = library_index_lock();
+    let guard = lock.read().unwrap();
+    if guard.is_empty() {
+        drop(guard);
+        let mut write_guard = lock.write().unwrap();
+        if write_guard.is_empty() {
+            *write_guard = build_library_index();
+        }
+    }
+    lock.read().unwrap().clone()
+}
+
+/// Force a re-scan of all library directories.
+/// Call this after downloading new reference packs so search/matcher see them immediately.
+pub fn refresh_library_index() {
+    let lock = library_index_lock();
+    let mut guard = lock.write().unwrap();
+    *guard = build_library_index();
 }
 
 /// Rank every reference spectrum whose file name matches `query`.

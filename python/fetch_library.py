@@ -177,9 +177,11 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 def cmd_list(_args: argparse.Namespace) -> int:
     total = 0
-    for sub in ("library/ftir", "library/nmr", "library/uvvis"):
-        directory = Path(sub)
-        print(f"[{sub}]")
+    # Resolve library root relative to this script so it works from any CWD
+    lib_root = Path(__file__).resolve().parent.parent / "library"
+    for sub in ("ftir", "nmr", "uvvis"):
+        directory = lib_root / sub
+        print(f"[{directory}]")
         if not directory.is_dir():
             print("  (missing)")
             continue
@@ -240,26 +242,32 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="SPECTRA open spectral-library fetcher")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # Resolve library root relative to this script so defaults work from any CWD
+    _lib_root = Path(__file__).resolve().parent.parent / "library"
+    _default_ftir = str(_lib_root / "ftir")
+    _default_nmr = str(_lib_root / "nmr")
+    _default_uvvis = str(_lib_root / "uvvis")
+
     p_nist = sub.add_parser("nist", help="download an experimental IR spectrum from NIST WebBook")
     p_nist.add_argument("query", help="compound name or CAS registry number")
-    p_nist.add_argument("--out-dir", default="library/ftir")
+    p_nist.add_argument("--out-dir", default=_default_ftir)
     p_nist.set_defaults(func=cmd_nist)
 
     p_nmr = sub.add_parser("nmr", help="download a JCAMP-DX spectrum from nmrshiftdb2")
     p_nmr.add_argument("smiles")
     p_nmr.add_argument("--nucleus", default="1h", choices=["1h", "13c"])
     p_nmr.add_argument("--name", default=None)
-    p_nmr.add_argument("--out-dir", default="library/nmr")
+    p_nmr.add_argument("--out-dir", default=_default_nmr)
     p_nmr.set_defaults(func=cmd_nmr)
 
     p_import = sub.add_parser("import", help="index local FLOPP / Open Specy reference folders")
     p_import.add_argument("source")
-    p_import.add_argument("--out-dir", default="library/ftir")
+    p_import.add_argument("--out-dir", default=_default_ftir)
     p_import.set_defaults(func=cmd_import)
 
     p_uvvis = sub.add_parser("uvvis", help="download an experimental UV-Vis spectrum from NIST WebBook")
     p_uvvis.add_argument("cas", help="CAS registry number (e.g., 71-43-2)")
-    p_uvvis.add_argument("--out-dir", default="library/uvvis")
+    p_uvvis.add_argument("--out-dir", default=_default_uvvis)
     p_uvvis.set_defaults(func=cmd_uvvis)
 
     p_list = sub.add_parser("list", help="list local reference spectra")

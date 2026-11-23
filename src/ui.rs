@@ -1507,7 +1507,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     ]);
 
     let hints = TextLine::from(Span::styled(
-        " Click/Drag:Cursor/Zoom | Wheel/+/-:Zoom | h/l:Move | g:GoTo | v:HD/Dots | a:%T↔Abs | b:Base | m:Smooth | w:Norm | s:Stack | p:Peaks | M:Library | n/N:Jump | x:Pin | c:Copy | e:Export",
+        " Click/Drag:Cursor/Zoom | Wheel/+/-:Zoom | h/l:Move | g:GoTo | v:HD/Dots | a:%T↔Abs | b:Base | m:Smooth | w:Norm | s:Stack | p:Peaks | M:Library | n/N:Jump | x:Pin | c:Copy | e:Export | D:Libraries",
         Style::default().fg(TEXT_MUTED),
     ));
 
@@ -2136,6 +2136,116 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                 rect,
             );
         }
+        Modal::LibrarySetup(st) => {
+            let rect = centered_rect(76, 52, area);
+            frame.render_widget(Clear, rect);
+
+            let pack_info: [(&str, &str, &str, &str); 5] = [
+                (
+                    "NIST FTIR",
+                    "download_polymer_pack.py --nist",
+                    "~2 MB  •  ~35 spectra",
+                    "NIST WebBook (JCAMP-DX)",
+                ),
+                (
+                    "UV-Vis PhotochemCAD + NIST",
+                    "download_uvvis_pack.py --all",
+                    "~2 MB  •  189 spectra",
+                    "OMLC PhotochemCAD + NIST WebBook UV-Vis",
+                ),
+                (
+                    "Zenodo FTIR-Plastics",
+                    "download_polymer_pack.py --zenodo",
+                    "~253 MB  •  ~1,200 spectra",
+                    "Zenodo FTIR-Plastics (INFRA-ART, MNHN)",
+                ),
+                (
+                    "nmrshiftdb2 NMR",
+                    "download_polymer_pack.py --nmr",
+                    "~159 MB  •  58k compounds",
+                    "nmrshiftdb2 SDF dump (1H/13C shifts)",
+                ),
+                (
+                    "Mega FTIR (RRUFF + INFRA-ART + MNHN + NIST)",
+                    "download_mega_ir.py --all",
+                    "~158 MB  •  ~2,000 spectra",
+                    "RRUFF minerals + INFRA-ART pigments + MNHN + NIST",
+                ),
+            ];
+
+            let mut lines = vec![
+                TextLine::from(Span::styled(
+                    "  Select reference library packs to download (network required):",
+                    Style::default().fg(TEXT_MUTED),
+                )),
+                TextLine::from(""),
+            ];
+
+            for (i, (name, _script, size, source)) in pack_info.iter().enumerate() {
+                let is_sel = i == st.selected;
+                let checked = if st.checks[i] { "✓" } else { " " };
+                let check_style = if st.checks[i] {
+                    Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT_MUTED)
+                };
+                let row_style = if is_sel {
+                    Style::default().bg(SURFACE_ALT).fg(ACCENT_YELLOW).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                lines.push(TextLine::from(vec![
+                    Span::styled(
+                        if is_sel { " ▶ " } else { "   " },
+                        Style::default().fg(ACCENT_GREEN),
+                    ),
+                    Span::styled(
+                        format!("[{}] ", checked),
+                        check_style,
+                    ),
+                    Span::styled(
+                        format!("{:<30} ", name),
+                        row_style,
+                    ),
+                    Span::styled(
+                        format!("({}) ", size),
+                        Style::default().fg(ACCENT_AQUA),
+                    ),
+                    Span::styled(
+                        format!("— {}", source),
+                        Style::default().fg(TEXT_MUTED),
+                    ),
+                ]));
+            }
+
+            lines.push(TextLine::from(""));
+            lines.push(TextLine::from(Span::styled(
+                "  Default: NIST FTIR + UV-Vis (fast ~4 MB). Large packs unchecked to avoid accidental 400+ MB downloads.",
+                Style::default().fg(ACCENT_AMBER),
+            )));
+            lines.push(TextLine::from(""));
+
+            if let Some(ref fb) = st.feedback {
+                for line in fb.lines() {
+                    lines.push(TextLine::from(Span::styled(
+                        format!("  {}", line),
+                        Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+                    )));
+                }
+                lines.push(TextLine::from(""));
+            }
+
+            lines.push(TextLine::from(Span::styled(
+                "  [j/k] Move  [Space] Toggle  [a] Select All/None  [Enter] Download  [Esc] Close",
+                Style::default().fg(TEXT_MUTED),
+            )));
+
+            frame.render_widget(
+                Paragraph::new(lines).block(modal_block("Reference Library Downloader [D]", ACCENT_GREEN)),
+                rect,
+            );
+        }
         Modal::Help => {
             let rect = centered_rect(88, 84, area);
             let block = modal_block(
@@ -2326,6 +2436,7 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("                    Ctrl+U clears, Esc clears the search then closes."),
         TextLine::from("                    The last folder you visited is remembered."),
         TextLine::from("   d                Built-in demo presets (FTIR, ¹H, ¹³C, UV-Vis examples)"),
+        TextLine::from("   D                Download open reference libraries (NIST, PhotochemCAD, Zenodo, nmrshiftdb2, RRUFF)"),
         TextLine::from("   /                Global search: files, library spectra, polymers,"),
         TextLine::from("                    solvents and tools in one place."),
         TextLine::from("   M                Library matcher: ranks references by Hit Quality"),

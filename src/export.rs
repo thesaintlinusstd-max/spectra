@@ -308,6 +308,94 @@ pub fn open_exported_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Library Downloader Integration
+// ============================================================================
+
+/// Run selected library download packs and return a summary string.
+/// Items are tuples of (script_name, args_as_single_string).
+/// Returns a clean summary with total files downloaded per pack.
+pub fn run_library_downloads(items: &[(&str, &str)]) -> Result<String> {
+    use std::process::Command;
+
+    let mut summary_lines: Vec<String> = Vec::new();
+    let mut total_files = 0;
+
+    for (script_name, args_str) in items {
+        let (python, script) = find_python_script(script_name)?;
+        let args: Vec<&str> = if args_str.is_empty() {
+            vec![]
+        } else {
+            args_str.split_whitespace().collect()
+        };
+        let mut cmd = Command::new(&python);
+        cmd.arg(&script).args(&args);
+
+        let output = cmd
+            .output()
+            .with_context(|| format!("Failed executing {} {}", python.display(), script.display()))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            let err_msg = stderr.trim();
+            if err_msg.is_empty() {
+                summary_lines.push(format!("✗ {}: failed (exit code {})", script_name, output.status));
+            } else {
+                summary_lines.push(format!("✗ {}: {}", script_name, err_msg));
+            }
+            continue;
+        }
+
+        // Extract "Total ... downloaded: N" or similar from stdout
+        let mut pack_total = 0;
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.starts_with("Total ") && line.contains("downloaded:") {
+                if let Some(num_str) = line.split("downloaded:").nth(1) {
+                    if let Ok(n) = num_str.trim().parse::<usize>() {
+                        pack_total = n;
+                    }
+                }
+            } else if line.contains("summary:") && line.contains("downloaded") {
+                // PhotochemCAD/NIST UV-Vis summary lines
+                if let Some(idx) = line.find("downloaded") {
+                    let before = &line[..idx];
+                    if let Some(num_str) = before.split_whitespace().last() {
+                        if let Ok(n) = num_str.parse::<usize>() {
+                            pack_total = n;
+                        }
+                    }
+                }
+            }
+        }
+        if pack_total > 0 {
+            summary_lines.push(format!("✓ {}: {} spectra", script_name, pack_total));
+            total_files += pack_total;
+        } else if !stdout.trim().is_empty() {
+            // Fallback: show last few lines
+            let last_lines: Vec<&str> = stdout.lines().rev().take(3).collect();
+            for l in last_lines.iter().rev() {
+                if !l.trim().is_empty() {
+                    summary_lines.push(format!("  {}", l.trim()));
+                }
+            }
+        } else {
+            summary_lines.push(format!("✓ {}: completed", script_name));
+        }
+    }
+
+    if summary_lines.is_empty() {
+        return Ok("No packs selected or all failed.".into());
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("Downloaded {} reference spectra total.\n", total_files));
+    out.push_str(&summary_lines.join("\n"));
+    Ok(out)
+}
+
 pub fn run_python_digitize(
     img_path: &Path,
     kind: crate::data::SpectrumKind,

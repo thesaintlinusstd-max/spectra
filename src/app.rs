@@ -263,6 +263,26 @@ pub struct CandidatePickerState {
     pub selected: usize,
 }
 
+/// State for the Reference Library Downloader modal (Shift+D / D).
+#[derive(Debug, Clone)]
+pub struct LibrarySetupState {
+    pub selected: usize,          // 0..4 index of current row
+    pub checks: [bool; 5],        // checkbox state per pack
+    pub feedback: Option<String>, // status message after download
+}
+
+impl Default for LibrarySetupState {
+    fn default() -> Self {
+        // Default: NIST FTIR (~2 MB) + UV-Vis (~2 MB) checked for quick start.
+        // Large packs (Zenodo 253 MB, nmrshiftdb2 159 MB, Mega FTIR 158 MB) unchecked.
+        Self {
+            selected: 0,
+            checks: [true, true, false, false, false],
+            feedback: None,
+        }
+    }
+}
+
 /// Long-running work that must not block the UI thread.
 #[derive(Debug, Clone)]
 pub struct BusyState {
@@ -278,6 +298,7 @@ pub enum TaskOutcome {
     },
     LibraryMatch(Vec<crate::matcher::LibraryMatch>),
     Export(std::result::Result<PathBuf, String>),
+    LibraryDownload(std::result::Result<String, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +314,7 @@ pub enum Modal {
     LibraryMatch(LibraryMatchState),
     CandidatePicker(CandidatePickerState),
     Busy(BusyState),
+    LibrarySetup(LibrarySetupState),
 }
 
 #[derive(Debug, Clone)]
@@ -591,6 +613,19 @@ impl App {
 
         app.recompute_processing();
         app.reset_zoom();
+
+        // If library is empty (fresh clone with no downloaded packs), show a helpful hint.
+        // Only do this when there was no CLI error (warnings empty) to avoid spamming tests.
+        if warnings.is_empty() {
+            let lib_count = crate::io::library_index()
+                .iter()
+                .filter(|e| e.path.to_string_lossy().contains("library"))
+                .count();
+            if lib_count == 0 {
+                app.status_msg.push_str(" · Library empty — press [D] to download reference spectra");
+            }
+        }
+
         app
     }
 
@@ -960,6 +995,28 @@ impl App {
                     }
                 }
             }
+            TaskOutcome::LibraryDownload(result) => {
+                match result {
+                    Ok(summary) => {
+                        // Refresh the library index so new files are immediately visible
+                        crate::io::refresh_library_index();
+                        self.modal = Modal::LibrarySetup(LibrarySetupState {
+                            selected: 0,
+                            checks: [false, false, false, false, false], // uncheck all after success
+                            feedback: Some(summary),
+                        });
+                        self.status_msg = "Library download complete — press [M] to match or [/] to search".into();
+                    }
+                    Err(e) => {
+                        self.modal = Modal::LibrarySetup(LibrarySetupState {
+                            selected: 0,
+                            checks: [true, true, false, false, false],
+                            feedback: Some(format!("Error: {}", e)),
+                        });
+                        self.status_msg = format!("Library download failed: {}", e);
+                    }
+                }
+            }
         }
     }
 
@@ -1085,6 +1142,7 @@ impl App {
             | Modal::ImportConfig(_)
             | Modal::LibraryMatch(_)
             | Modal::CandidatePicker(_)
+            | Modal::LibrarySetup(_)
             | Modal::Busy(_) => return,
         }
 
@@ -1764,6 +1822,15 @@ impl App {
             }
             KeyCode::Char('F') => {
                 self.open_file_picker(true);
+                return;
+            }
+            KeyCode::Char('D') => {
+                self.modal = Modal::LibrarySetup(LibrarySetupState::default());
+                return;
+            }
+            // Also allow Shift+d (explicit) as some terminals report it differently
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.modal = Modal::LibrarySetup(LibrarySetupState::default());
                 return;
             }
             KeyCode::Char('d') => {
@@ -2852,6 +2919,69 @@ impl App {
                         self.execute_export();
                     }
                     _ => self.modal = Modal::Export(st),
+                }
+            }
+            Modal::LibrarySetup(mut st) => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        st.selected = (st.selected + st.checks.len() - 1) % st.checks.len();
+                        st.feedback = None;
+                        self.modal = Modal::LibrarySetup(st);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        st.selected = (st.selected + 1) % st.checks.len();
+                        st.feedback = None;
+                        self.modal = Modal::LibrarySetup(st);
+                    }
+                    KeyCode::Char(' ') => {
+                        st.checks[st.selected] = !st.checks[st.selected];
+                        st.feedback = None;
+                        self.modal = Modal::LibrarySetup(st);
+                    }
+                    KeyCode::Char('a') => {
+                        let all_checked = st.checks.iter().all(|&c| c);
+                        for c in &mut st.checks {
+                            *c = !all_checked;
+                        }
+                        st.feedback = None;
+                        self.modal = Modal::LibrarySetup(st);
+                    }
+                    KeyCode::Enter => {
+                        // Build the list of (script, args) for checked packs
+                        let packs: [(&str, &str); 5] = [
+                            ("download_polymer_pack.py", "--nist"),      // 0: NIST FTIR (~2 MB)
+                            ("download_uvvis_pack.py", "--all"),         // 1: UV-Vis PhotochemCAD + NIST (~2 MB)
+                            ("download_polymer_pack.py", "--zenodo"),    // 2: Zenodo FTIR-Plastics (~253 MB)
+                            ("download_polymer_pack.py", "--nmr"),       // 3: nmrshiftdb2 NMR (~159 MB)
+                            ("download_mega_ir.py", "--all"),            // 4: Mega FTIR RRUFF+INFRA-ART+MNHN+NIST (~158 MB)
+                        ];
+                        let selected: Vec<(&str, &str)> = st
+                            .checks
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, &c)| c)
+                            .map(|(i, _)| packs[i])
+                            .collect();
+                        if selected.is_empty() {
+                            st.feedback = Some("No packs selected — press [Space] to check at least one".into());
+                            self.modal = Modal::LibrarySetup(st);
+                            return;
+                        }
+                        // Launch background download task
+                        self.start_task("Downloading open reference libraries…", move || {
+                            let result = crate::export::run_library_downloads(&selected);
+                            TaskOutcome::LibraryDownload(result.map_err(|e| e.to_string()))
+                        });
+                        // Show busy modal immediately; feedback will update when task completes
+                        self.modal = Modal::Busy(BusyState {
+                            label: "Downloading open reference libraries…".into(),
+                            started: Instant::now(),
+                        });
+                    }
+                    _ => {
+                        st.feedback = None;
+                        self.modal = Modal::LibrarySetup(st);
+                    }
                 }
             }
             Modal::Busy(busy) => {
