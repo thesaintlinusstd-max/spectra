@@ -1,0 +1,9 @@
+/target/
+/library/
+/exports/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+**/*.rs.bk
+.DS_Store
