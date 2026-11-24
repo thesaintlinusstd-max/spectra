@@ -1388,5 +1388,129 @@ mod tests {
         let fwhm = peaks[0].fwhm.expect("expected finite FWHM");
         assert!(fwhm.is_finite() && fwhm > 0.0, "expected positive finite FWHM, got {}", fwhm);
     }
+
+    #[test]
+    fn test_jcamp_micrometers_ir_and_hz_nmr() {
+        let ir_um = "\
+##TITLE=IR Micrometers Test
+##JCAMP-DX=4.24
+##DATA TYPE=INFRARED SPECTRUM
+##XUNITS=MICROMETERS
+##YUNITS=TRANSMITTANCE
+##XYPOINTS=(XY..XY)
+2.5 95.0; 5.0 80.0; 10.0 30.0; 15.0 90.0
+##END=
+";
+        let ir_spec = parse_jcamp_dx(ir_um, "ir_um".into(), None).unwrap();
+        assert_eq!(ir_spec.kind, SpectrumKind::Ftir);
+        assert!(ir_spec.x.windows(2).all(|w| w[0] <= w[1]));
+        assert!(
+            (ir_spec.x[0] - 666.666667).abs() < 0.05,
+            "expected ~666.67 cm⁻¹, got {}",
+            ir_spec.x[0]
+        );
+        assert!(
+            (*ir_spec.x.last().unwrap() - 4000.0).abs() < 0.05,
+            "expected ~4000.0 cm⁻¹, got {}",
+            ir_spec.x.last().unwrap()
+        );
+
+        let nmr_hz = "\
+##TITLE=1H NMR Hz Test
+##JCAMP-DX=5.00
+##DATA TYPE=NMR SPECTRUM
+##XUNITS=HZ
+##YUNITS=ARBITRARY UNITS
+##.OBSERVE FREQUENCY=400.0
+##XYPOINTS=(XY..XY)
+0.0 10.0; 1440.0 85.0; 4000.0 5.0
+##END=
+";
+        let nmr_spec = parse_jcamp_dx(nmr_hz, "nmr_hz".into(), None).unwrap();
+        assert_eq!(nmr_spec.kind, SpectrumKind::Hnmr);
+        assert!(nmr_spec.x.windows(2).all(|w| w[0] <= w[1]));
+        assert!(
+            (nmr_spec.x[0] - 0.0).abs() < 1e-6,
+            "expected 0.0 ppm, got {}",
+            nmr_spec.x[0]
+        );
+        assert!(
+            (*nmr_spec.x.last().unwrap() - 10.0).abs() < 1e-6,
+            "expected 10.0 ppm, got {}",
+            nmr_spec.x.last().unwrap()
+        );
+
+        let uv_wn = "\
+##TITLE=UV-Vis Wavenumber Test
+##JCAMP-DX=4.24
+##DATA TYPE=UV/VIS SPECTRUM
+##XUNITS=1/CM
+##YUNITS=ABSORBANCE
+##XYPOINTS=(XY..XY)
+20000.0 0.10; 35000.0 0.80; 50000.0 0.25
+##END=
+";
+        let uv_spec = parse_jcamp_dx(uv_wn, "uv_wn".into(), None).unwrap();
+        assert_eq!(uv_spec.kind, SpectrumKind::UvVis);
+        assert!(uv_spec.x.windows(2).all(|w| w[0] <= w[1]));
+        assert!(
+            (uv_spec.x[0] - 200.0).abs() < 1e-6,
+            "expected 200.0 nm, got {}",
+            uv_spec.x[0]
+        );
+        assert!(
+            (*uv_spec.x.last().unwrap() - 500.0).abs() < 1e-6,
+            "expected 500.0 nm, got {}",
+            uv_spec.x.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_jcamp_multiblock_link_parses() {
+        let jdx = "\
+##TITLE=Compound Link Container
+##JCAMP-DX=5.01
+##DATA TYPE=LINK
+##BLOCKS=2
+##END=
+##TITLE=Real Spectrum
+##JCAMP-DX=5.01
+##DATA TYPE=INFRARED SPECTRUM
+##XUNITS=1/CM
+##YUNITS=ABSORBANCE
+##XYPOINTS=(XY..XY) 500.0 0.05; 1725.0 0.90; 4000.0 0.02
+##END=
+";
+        let spec = parse_jcamp_dx(jdx, "fallback".into(), None)
+            .expect("LINK container should parse the inner spectrum block");
+        assert_eq!(spec.name, "Real Spectrum");
+        assert_eq!(spec.kind, SpectrumKind::Ftir);
+        assert_eq!(spec.x.len(), 3);
+        assert!((spec.x[1] - 1725.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_nmr_library_matcher_identifies_pmma_hnmr() {
+        let pmma = crate::data::pmma_hnmr_spectrum();
+        let matches = crate::matcher::match_nmr_library(
+            &pmma,
+            ProcessConfig::default(),
+            SolventId::Cdcl3,
+        );
+        assert!(!matches.is_empty(), "NMR matcher returned no candidates");
+        assert!(
+            matches
+                .iter()
+                .take(3)
+                .any(|m| (m.short.eq_ignore_ascii_case("PMMA") || m.name.contains("PMMA"))
+                    && m.hqi_pct > 70.0),
+            "Expected PMMA in top 3 NMR matches with HQI > 70%, got: {:?}",
+            matches
+                .iter()
+                .take(3)
+                .map(|m| (&m.short, m.hqi_pct))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 

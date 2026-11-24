@@ -401,6 +401,26 @@ fn tokenize_asdf_line(line: &str) -> Vec<AsdfToken> {
     tokens
 }
 
+fn parse_xypoints_line(
+    line: &str,
+    xfactor: f64,
+    yfactor: f64,
+    out: &mut Vec<(f64, f64)>,
+) {
+    for chunk in line.split(';') {
+        let nums: Vec<f64> = chunk
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<f64>().ok())
+            .collect();
+        let mut idx = 0;
+        while idx + 1 < nums.len() {
+            out.push((nums[idx] * xfactor, nums[idx + 1] * yfactor));
+            idx += 2;
+        }
+    }
+}
+
 pub fn parse_jcamp_dx(
     text: &str,
     default_name: String,
@@ -412,10 +432,11 @@ pub fn parse_jcamp_dx(
     let mut yunits = String::new();
     let mut firstx: Option<f64> = None;
     let mut lastx: Option<f64> = None;
-    let mut npoints: Option<usize> = None;
+    let mut _npoints: Option<usize> = None;
     let mut deltax: Option<f64> = None;
     let mut xfactor: f64 = 1.0;
     let mut yfactor: f64 = 1.0;
+    let mut observe_freq_mhz: Option<f64> = None;
     let mut metadata: Vec<(String, String)> = vec![("Format".into(), "JCAMP-DX".into())];
 
     #[derive(PartialEq, Eq)]
@@ -459,7 +480,7 @@ pub fn parse_jcamp_dx(
                     }
                     "FIRSTX" => firstx = val.parse().ok(),
                     "LASTX" => lastx = val.parse().ok(),
-                    "NPOINTS" => npoints = val.parse().ok(),
+                    "NPOINTS" => _npoints = val.parse().ok(),
                     "DELTAX" => deltax = val.parse().ok(),
                     "XFACTOR" => {
                         if let Ok(v) = val.parse() {
@@ -472,6 +493,10 @@ pub fn parse_jcamp_dx(
                         }
                     }
                     ".OBSERVEFREQUENCY" | "OBSERVEFREQUENCY" => {
+                        observe_freq_mhz = val
+                            .split_whitespace()
+                            .next()
+                            .and_then(|s| s.parse::<f64>().ok());
                         metadata.push(("Freq (MHz)".into(), val.to_string()));
                     }
                     ".SOLVENTNAME" | "SOLVENTNAME" => {
@@ -481,14 +506,30 @@ pub fn parse_jcamp_dx(
                         let up = val.to_ascii_uppercase();
                         if up.contains("XY..XY") {
                             mode = DataMode::XyPoints;
+                            if let Some(pos) = val.find(')') {
+                                let rest = val[pos + 1..].trim();
+                                if !rest.is_empty() {
+                                    parse_xypoints_line(rest, xfactor, yfactor, &mut xypoints_pairs);
+                                }
+                            }
                         } else {
                             mode = DataMode::XyData;
                         }
                     }
                     "XYPOINTS" | "PEAKTABLE" => {
                         mode = DataMode::XyPoints;
+                        if let Some(pos) = val.find(')') {
+                            let rest = val[pos + 1..].trim();
+                            if !rest.is_empty() {
+                                parse_xypoints_line(rest, xfactor, yfactor, &mut xypoints_pairs);
+                            }
+                        }
                     }
-                    "END" => break,
+                    "END" => {
+                        if !xydata_lines.is_empty() || !xypoints_pairs.is_empty() {
+                            break;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -498,18 +539,7 @@ pub fn parse_jcamp_dx(
         match mode {
             DataMode::None => {}
             DataMode::XyPoints => {
-                for chunk in line.split(';') {
-                    let nums: Vec<f64> = chunk
-                        .split(|c: char| c == ',' || c.is_whitespace())
-                        .filter(|s| !s.is_empty())
-                        .filter_map(|s| s.parse::<f64>().ok())
-                        .collect();
-                    let mut idx = 0;
-                    while idx + 1 < nums.len() {
-                        xypoints_pairs.push((nums[idx] * xfactor, nums[idx + 1] * yfactor));
-                        idx += 2;
-                    }
-                }
+                parse_xypoints_line(line, xfactor, yfactor, &mut xypoints_pairs);
             }
             DataMode::XyData => {
                 xydata_lines.push(line.to_string());
@@ -588,7 +618,7 @@ pub fn parse_jcamp_dx(
 
         let x0 = firstx.or(first_line_x).unwrap_or(0.0);
         let dx = if let Some(lx) = lastx {
-            let denom = (npoints.unwrap_or(raw_ys.len()).max(2) - 1) as f64;
+            let denom = (raw_ys.len().max(2) - 1) as f64;
             (lx - x0) / denom
         } else {
             deltax.unwrap_or(1.0)
@@ -606,14 +636,67 @@ pub fn parse_jcamp_dx(
     let (mut xs, mut ys) = finalize_points(pts)?;
 
     let xu = xunits.to_ascii_uppercase();
+    let dt_up = data_type.to_ascii_uppercase();
+    let is_uv_hint = dt_up.contains("UV")
+        || dt_up.contains("ULTRAVIOLET")
+        || kind_override == Some(SpectrumKind::UvVis);
+
     let is_micrometer = xu.contains("MICROMETER") || xu.contains("MICRON") || xu == "UM";
+    let is_wavenumber = xu.contains("1/CM") || xu.contains("CM-1") || xu.contains("WAVENUMBER");
+    let is_hz = xu == "HZ" || xu == "HERTZ" || xu.starts_with("HZ ");
+
+    let mut need_resort = false;
     if is_micrometer {
-        for v in &mut xs {
-            *v *= 1000.0;
+        let x_max = xs.last().copied().unwrap_or(0.0);
+        if is_uv_hint || x_max <= 2.0 {
+            // UV-Vis / NIR wavelength in µm -> nm
+            for v in &mut xs {
+                *v *= 1000.0;
+            }
+        } else {
+            // Infrared spectrum in µm (e.g. 2.5..15 µm) -> cm⁻¹ = 10_000 / µm
+            let mut converted = Vec::with_capacity(xs.len());
+            for (x, y) in xs.into_iter().zip(ys.into_iter()) {
+                if x > 1e-6 {
+                    converted.push((10_000.0 / x, y));
+                }
+            }
+            let (nx, ny) = finalize_points(converted)?;
+            xs = nx;
+            ys = ny;
+            need_resort = false;
+        }
+    } else if is_wavenumber && is_uv_hint {
+        // UV-Vis stored in 1/cm -> nm = 1e7 / wn
+        let mut converted = Vec::with_capacity(xs.len());
+        for (x, y) in xs.into_iter().zip(ys.into_iter()) {
+            if x > 1e-6 {
+                converted.push((1.0e7 / x, y));
+            }
+        }
+        let (nx, ny) = finalize_points(converted)?;
+        xs = nx;
+        ys = ny;
+    } else if is_hz {
+        if let Some(freq) = observe_freq_mhz.filter(|&f| f > 1.0) {
+            for v in &mut xs {
+                *v /= freq;
+            }
+            need_resort = true;
         }
     }
 
-    let hint = format!("{} {} {}", data_type, xunits, yunits);
+    if need_resort {
+        let pairs: Vec<(f64, f64)> = xs.into_iter().zip(ys).collect();
+        let (nx, ny) = finalize_points(pairs)?;
+        xs = nx;
+        ys = ny;
+    }
+
+    let mut hint = format!("{} {} {}", data_type, xunits, yunits);
+    if is_hz && observe_freq_mhz.is_some() && dt_up.is_empty() {
+        hint.push_str(" NMR ppm");
+    }
     let kind = kind_override.unwrap_or_else(|| {
         infer_kind(xs[0], *xs.last().unwrap_or(&xs[0]), Some(&hint))
     });
@@ -959,23 +1042,25 @@ fn build_library_index() -> Vec<LibraryEntry> {
 /// Get the current library index, initializing it on first access.
 pub fn library_index() -> Vec<LibraryEntry> {
     let lock = library_index_lock();
-    let guard = lock.read().unwrap();
+    let guard = lock.read().unwrap_or_else(|e| e.into_inner());
     if guard.is_empty() {
         drop(guard);
-        let mut write_guard = lock.write().unwrap();
+        let mut write_guard = lock.write().unwrap_or_else(|e| e.into_inner());
         if write_guard.is_empty() {
             *write_guard = build_library_index();
         }
     }
-    lock.read().unwrap().clone()
+    lock.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Force a re-scan of all library directories.
 /// Call this after downloading new reference packs so search/matcher see them immediately.
 pub fn refresh_library_index() {
     let lock = library_index_lock();
-    let mut guard = lock.write().unwrap();
+    let mut guard = lock.write().unwrap_or_else(|e| e.into_inner());
     *guard = build_library_index();
+    drop(guard);
+    crate::matcher::invalidate_matcher_cache();
 }
 
 /// Rank every reference spectrum whose file name matches `query`.

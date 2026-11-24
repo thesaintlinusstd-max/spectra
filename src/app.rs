@@ -1455,47 +1455,44 @@ impl App {
 
     pub fn open_library_match(&mut self) {
         let Some(spec) = self.traces.get(self.active_trace) else {
-            self.status_msg = "Load an FTIR or UV-Vis spectrum before running library matching".into();
+            self.status_msg = "Load a spectrum before running library matching".into();
             return;
         };
         let kind = spec.kind;
-        if !matches!(kind, SpectrumKind::Ftir | SpectrumKind::UvVis) {
-            self.status_msg =
-                "Library matching supports FTIR and UV-Vis spectra".into();
-            return;
-        }
-        // Matching parses the whole reference pack, which takes seconds on a
-        // slow/external disk — never do it on the UI thread.
+        // Matching parses the whole reference pack on cold start, which takes seconds
+        // on a slow/external disk — never do it on the UI thread.
         let spec = spec.clone();
         let cfg = self.process_cfg;
+        let solvent = self.nmr_solvent;
         self.start_task("Matching against the reference library…", move || {
             TaskOutcome::LibraryMatch(match kind {
+                SpectrumKind::Ftir => crate::matcher::match_ftir_library(&spec, cfg),
                 SpectrumKind::UvVis => crate::matcher::match_uvvis_library(&spec, cfg),
-                _ => crate::matcher::match_ftir_library(&spec, cfg),
+                SpectrumKind::Hnmr | SpectrumKind::Cnmr => {
+                    crate::matcher::match_nmr_library(&spec, cfg, solvent)
+                }
             })
         });
     }
 
     pub fn apply_library_match(&mut self, m: &crate::matcher::LibraryMatch) {
-        let uvvis = self.current_kind() == SpectrumKind::UvVis;
+        let kind = self.current_kind();
         let loaded = if m.is_builtin {
-            if uvvis {
-                // Built-in UV-Vis references are demo presets, not polymers.
-                DemoPreset::ALL
-                    .iter()
-                    .filter(|p| p.kind() == SpectrumKind::UvVis)
-                    .flat_map(|p| generate_demo_preset(*p))
-                    .find(|s| s.name == m.name)
-            } else {
-                find_polymer_by_short(&m.short)
-                    .map(|p| synthesize_polymer_reference(p, SpectrumKind::Ftir))
+            match kind {
+                SpectrumKind::UvVis => {
+                    // Built-in UV-Vis references are demo presets, not polymers.
+                    DemoPreset::ALL
+                        .iter()
+                        .filter(|p| p.kind() == SpectrumKind::UvVis)
+                        .flat_map(|p| generate_demo_preset(*p))
+                        .find(|s| s.name == m.name)
+                }
+                SpectrumKind::Ftir | SpectrumKind::Hnmr | SpectrumKind::Cnmr => {
+                    find_polymer_by_short(&m.short)
+                        .map(|p| synthesize_polymer_reference(p, kind))
+                }
             }
         } else {
-            let kind = if uvvis {
-                SpectrumKind::UvVis
-            } else {
-                SpectrumKind::Ftir
-            };
             m.file_path
                 .as_deref()
                 .and_then(|p| load_spectrum_file(p, Some(kind)).ok())
@@ -1506,14 +1503,14 @@ impl App {
                 spec.visible = true;
                 let label = spec.name.clone();
                 let unit = spec.raw_y_unit;
-                if uvvis {
+                if kind == SpectrumKind::UvVis {
                     // UV-Vis: Swapped renders %T, Native renders Abs.
                     self.process_cfg.y_pref = if unit == YUnit::Transmittance {
                         YAxisPreference::Swapped
                     } else {
                         YAxisPreference::Native
                     };
-                } else if unit == YUnit::Transmittance {
+                } else if kind == SpectrumKind::Ftir && unit == YUnit::Transmittance {
                     self.process_cfg.y_pref = YAxisPreference::Native;
                 }
                 let (_, notes) = self.absorb_specs(vec![spec], true);
