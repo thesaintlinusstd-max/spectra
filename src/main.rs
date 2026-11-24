@@ -33,7 +33,9 @@ use crate::io::{
     load_spectrum_file, resolve_library_query, search_library_for_kind, write_sample_files,
     LibraryEntry,
 };
-use crate::processing::{detect_peaks, process_trace, ProcessConfig, SmoothLevel};
+use crate::processing::{
+    detect_peaks, process_trace, BaselineMode, ProcessConfig, SmoothLevel, YAxisPreference,
+};
 
 /// Positional CLI arguments are usually file paths, but `spectra butane` is a
 /// natural thing to type. Bare words that name a technique (`nmr`, `ftir`,
@@ -286,8 +288,16 @@ fn run_headless_export(
         _ => SmoothLevel::Off,
     };
     let cfg = ProcessConfig {
-        ftir_absorbance: absorbance,
-        baseline,
+        y_pref: if absorbance {
+            YAxisPreference::Swapped
+        } else {
+            YAxisPreference::Native
+        },
+        baseline: if baseline {
+            BaselineMode::Rubberband
+        } else {
+            BaselineMode::Off
+        },
         smooth: smooth_lvl,
         normalize: false,
     };
@@ -676,17 +686,18 @@ mod tests {
             "broad carboxylic O–H must not rank first at 2916 cm⁻¹"
         );
 
-        let pvdf = match_ftir(840.0);
+        let pvdf = crate::data::match_ftir_with_context(840.0, &[1402.0, 1275.0, 1175.0, 840.0, 510.0]);
         assert!(
-            pvdf.iter().any(|b| b.group.contains("PVDF β-phase")),
+            pvdf.iter().any(|b| b.band.group.contains("PVDF β-phase")),
             "expected PVDF β-phase assignment at 840 cm⁻¹, got {:?}",
-            pvdf.iter().map(|b| b.group).collect::<Vec<_>>()
+            pvdf.iter().map(|b| b.band.group).collect::<Vec<_>>()
         );
         assert!(
-            pvdf[0].group.contains("PVDF β-phase"),
-            "PVDF β-phase should rank first at 840 cm⁻¹, got: {}",
-            pvdf[0].group
+            pvdf[0].band.group.contains("PVDF β-phase"),
+            "PVDF β-phase should rank first at 840 cm⁻¹ with PVDF context, got: {}",
+            pvdf[0].band.group
         );
+        assert!(pvdf[0].confirmed, "PVDF β-phase should be confirmed in PVDF context");
     }
 
     #[test]
@@ -1196,6 +1207,186 @@ mod tests {
         let (abs_region, sol_color) = crate::data::uvvis_color_info(500.0);
         assert!(abs_region.contains("Green"));
         assert!(sol_color.contains("Purple") || sol_color.contains("Magenta"));
+    }
+
+    #[test]
+    fn test_mma_monomer_context_aware_labels_no_false_positives() {
+        let mma = crate::data::mma_monomer_spectrum();
+        let (xs, ys, yu) = process_trace(&mma, ProcessConfig::default());
+        let peaks = detect_peaks(&xs, &ys, mma.kind, yu, 0.08, 16);
+        assert!(!peaks.is_empty(), "MMA monomer should yield detected peaks");
+
+        for p in &peaks {
+            for bad in ["Polyimide", "Calcium", "CaCO", "Sulfone", "POM", "Si–CH₃"] {
+                assert!(
+                    !p.label.contains(bad),
+                    "MMA peak {} should not be mislabeled with '{}'",
+                    p.label,
+                    bad
+                );
+            }
+        }
+
+        let p1722 = peaks
+            .iter()
+            .min_by(|a, b| (a.x - 1722.0).abs().total_cmp(&(b.x - 1722.0).abs()))
+            .expect("expected ~1722 peak");
+        assert!(
+            p1722.label.contains("C=O"),
+            "~1722 cm⁻¹ peak should be labeled with C=O, got: {}",
+            p1722.label
+        );
+
+        let p1443 = peaks
+            .iter()
+            .min_by(|a, b| (a.x - 1443.0).abs().total_cmp(&(b.x - 1443.0).abs()))
+            .expect("expected ~1443 peak");
+        assert!(
+            p1443.label.contains("CH"),
+            "~1443 cm⁻¹ peak should be labeled with CH, got: {}",
+            p1443.label
+        );
+    }
+
+    #[test]
+    fn test_confirmed_specific_materials_still_identify() {
+        let pi = crate::data::match_ftir_with_context(1720.0, &[1778.0, 1720.0, 1375.0, 725.0]);
+        assert!(
+            pi[0].confirmed && pi[0].band.group.contains("Polyimide"),
+            "Polyimide should be confirmed at 1720 cm⁻¹ with PI context, got: {} (confirmed={})",
+            pi[0].band.group,
+            pi[0].confirmed
+        );
+
+        let caco3 = crate::data::match_ftir_with_context(1425.0, &[1425.0, 875.0, 712.0]);
+        assert!(
+            caco3[0].confirmed && caco3[0].band.group.contains("Calcium Carbonate"),
+            "CaCO₃ should be confirmed at 1425 cm⁻¹ with calcite context, got: {} (confirmed={})",
+            caco3[0].band.group,
+            caco3[0].confirmed
+        );
+
+        let pdms_795 = crate::data::match_ftir_with_context(795.0, &[2962.0, 1260.0, 1080.0, 1015.0, 795.0]);
+        assert!(
+            pdms_795[0].confirmed && pdms_795[0].band.group.contains("Si–CH₃"),
+            "PDMS Si–CH₃ should be confirmed at 795 cm⁻¹, got: {} (confirmed={})",
+            pdms_795[0].band.group,
+            pdms_795[0].confirmed
+        );
+
+        let pdms_1260 = crate::data::match_ftir_with_context(1260.0, &[2962.0, 1260.0, 1080.0, 1015.0, 795.0]);
+        assert!(
+            pdms_1260[0].confirmed && pdms_1260[0].band.group.contains("Si–CH₃"),
+            "PDMS Si–CH₃ should be confirmed at 1260 cm⁻¹, got: {} (confirmed={})",
+            pdms_1260[0].band.group,
+            pdms_1260[0].confirmed
+        );
+    }
+
+    #[test]
+    fn test_asls_recovers_curved_baseline() {
+        let n = 1000;
+        let mut baseline = Vec::with_capacity(n);
+        let mut signal = Vec::with_capacity(n);
+        let mut raw = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64;
+            let b = 0.25 + 0.45 * (t - 0.5).powi(2) + 0.10 * t;
+            let p1 = 0.90 / (1.0 + ((i as f64 - 300.0) / 8.0).powi(2));
+            let p2 = 0.70 / (1.0 + ((i as f64 - 700.0) / 10.0).powi(2));
+            let s = p1 + p2;
+            baseline.push(b);
+            signal.push(s);
+            raw.push(b + s);
+        }
+
+        let corr = crate::processing::asls_baseline(&raw, 1e6, 0.01, 10);
+        let mut max_off_err = 0.0_f64;
+        for i in 0..n {
+            if (i as f64 - 300.0).abs() > 45.0 && (i as f64 - 700.0).abs() > 55.0 {
+                max_off_err = max_off_err.max(corr[i].abs());
+            }
+        }
+        assert!(
+            max_off_err < 0.025,
+            "AsLS off-peak residual should be < 0.025, got {:.4}",
+            max_off_err
+        );
+        assert!(
+            corr[300] > 0.90 * signal[300],
+            "AsLS should preserve >90% of peak 1 height: {:.4} vs {:.4}",
+            corr[300],
+            signal[300]
+        );
+        assert!(
+            corr[700] > 0.90 * signal[700],
+            "AsLS should preserve >90% of peak 2 height: {:.4} vs {:.4}",
+            corr[700],
+            signal[700]
+        );
+    }
+
+    #[test]
+    fn test_tauc_ignores_deep_uv_second_band() {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        let eg_true = 3.20_f64;
+        for nm in (200..=600).step_by(2) {
+            let nm_f = nm as f64;
+            let hv = 1239.84193 / nm_f;
+            // Direct-allowed TiO2 onset around 3.20 eV + strong 220 nm deep-UV Gaussian band
+            let edge = if hv > eg_true {
+                0.75 * ((hv - eg_true) / 0.35).sqrt().min(1.3)
+            } else {
+                0.01 * ((hv - eg_true) / 0.12).exp()
+            };
+            let deep_uv = 2.4 * (-0.5 * ((nm_f - 220.0) / 14.0).powi(2)).exp();
+            x.push(nm_f);
+            y.push(0.02 + edge + deep_uv);
+        }
+
+        let spec = Spectrum {
+            name: "tio2_deep_uv".into(),
+            source_path: None,
+            kind: SpectrumKind::UvVis,
+            raw_y_unit: YUnit::Absorbance,
+            x,
+            y,
+            visible: true,
+            color_idx: 0,
+            metadata: vec![],
+        };
+
+        let res = crate::processing::compute_tauc_band_gap(
+            &spec,
+            crate::processing::TaucMode::Direct,
+        )
+        .expect("should compute Tauc band gap");
+        assert!(
+            (3.10..=3.30).contains(&res.band_gap_ev),
+            "Tauc Eg should be in [3.10, 3.30] eV, got {:.3} eV",
+            res.band_gap_ev
+        );
+        assert!(
+            res.r_squared > 0.95,
+            "Tauc R² should be > 0.95, got {:.4}",
+            res.r_squared
+        );
+    }
+
+    #[test]
+    fn test_detect_peaks_plateau_and_fwhm() {
+        let xs: Vec<f64> = (0..9).map(|i| 100.0 + i as f64 * 10.0).collect();
+        let ys = vec![0.0, 0.2, 0.5, 1.0, 1.0, 1.0, 0.5, 0.2, 0.0];
+        let peaks = detect_peaks(&xs, &ys, SpectrumKind::UvVis, YUnit::Absorbance, 0.1, 5);
+        assert_eq!(peaks.len(), 1, "expected 1 plateau peak, got {:?}", peaks);
+        assert!(
+            (peaks[0].x - 140.0).abs() < 1e-6,
+            "plateau peak should center on midpoint 140.0, got {}",
+            peaks[0].x
+        );
+        let fwhm = peaks[0].fwhm.expect("expected finite FWHM");
+        assert!(fwhm.is_finite() && fwhm > 0.0, "expected positive finite FWHM, got {}", fwhm);
     }
 }
 

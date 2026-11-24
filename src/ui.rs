@@ -1497,7 +1497,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 "Y:{}  View:{}  Base:{}  Smooth:{}  Norm:{}  Stack:{}",
                 y_status,
                 if app.hd_mode { "HD" } else { "Braille" },
-                if app.process_cfg.baseline { "ON" } else { "OFF" },
+                app.process_cfg.baseline.label(),
                 app.process_cfg.smooth.label(),
                 if app.process_cfg.normalize { "ON" } else { "OFF" },
                 if app.stacked { "ON" } else { "OFF" },

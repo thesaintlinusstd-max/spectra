@@ -365,7 +365,7 @@ fn compute_plot_hash(app: &App) -> u64 {
     app.show_peaks.hash(&mut h);
     app.show_solvent_markers.hash(&mut h);
     app.nmr_solvent.index().hash(&mut h);
-    app.process_cfg.ftir_absorbance.hash(&mut h);
+    app.process_cfg.y_pref.hash(&mut h);
     app.process_cfg.baseline.hash(&mut h);
     (app.process_cfg.smooth as u8).hash(&mut h);
     app.process_cfg.normalize.hash(&mut h);

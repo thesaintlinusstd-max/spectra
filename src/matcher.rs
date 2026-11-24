@@ -12,7 +12,9 @@ use crate::data::{
     POLYMERS_DB,
 };
 use crate::io::load_spectrum_file;
-use crate::processing::{process_trace, rubberband_baseline, ProcessConfig, SmoothLevel};
+use crate::processing::{
+    process_trace, rubberband_baseline, BaselineMode, ProcessConfig, SmoothLevel, YAxisPreference,
+};
 
 const GRID_LO: f64 = 520.0;
 const GRID_HI: f64 = 3760.0;
@@ -70,8 +72,8 @@ fn prepare(spec: &Spectrum, cfg: ProcessConfig) -> Option<Vec<f64>> {
         return None;
     }
     let abs_cfg = ProcessConfig {
-        ftir_absorbance: true,
-        baseline: false,
+        y_pref: YAxisPreference::Swapped,
+        baseline: BaselineMode::Off,
         smooth: cfg.smooth,
         normalize: false,
     };
@@ -311,8 +313,8 @@ fn prepare_uvvis(spec: &Spectrum, cfg: ProcessConfig) -> Option<Vec<f64>> {
         return None;
     }
     let abs_cfg = ProcessConfig {
-        ftir_absorbance: false,
-        baseline: false,
+        y_pref: YAxisPreference::Native,
+        baseline: BaselineMode::Off,
         smooth: cfg.smooth,
         normalize: false,
     };

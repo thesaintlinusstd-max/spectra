@@ -9,9 +9,9 @@ use ratatui::layout::Rect;
 
 use crate::clipboard::{copy_png_file, copy_text};
 use crate::data::{
-    best_short_peak_label_with_solvent, find_polymer_by_short, generate_demo_preset,
-    match_cnmr, match_ftir, match_hnmr, match_solvent_impurities, match_uvvis,
-    synthesize_polymer_reference, uvvis_color_info, DemoPreset, SolventId, Spectrum,
+    best_peak_label_in_context, best_short_peak_label_with_solvent, find_polymer_by_short,
+    generate_demo_preset, match_cnmr, match_ftir, match_hnmr, match_solvent_impurities,
+    match_uvvis, synthesize_polymer_reference, uvvis_color_info, DemoPreset, SolventId, Spectrum,
     SpectrumKind, YUnit, CNMR_DB, FTIR_DB, HNMR_DB, POLYMERS_DB, SOLVENT_IMPURITIES, UVVIS_DB,
 };
 use crate::export::{
@@ -22,8 +22,8 @@ use crate::io::{expand_tilde, load_spectrum_file, parse_pasted_paths, search_lib
 use crate::processing::{
     auto_ftir_conversion, beer_lambert_conc, compute_tauc_band_gap, detect_peaks,
     ftir_conversion_percent, interpolate_y, nmr_mn_dpn, process_trace, pu_hydrogen_bond_index,
-    pvdf_beta_fraction, tacticity_stats, ConversionResult, HydrogenBondIndex, Peak, ProcessConfig,
-    SmoothLevel, TacticityResult, TaucMode, TaucResult,
+    pvdf_beta_fraction, tacticity_stats, BaselineMode, ConversionResult, HydrogenBondIndex, Peak,
+    ProcessConfig, SmoothLevel, TacticityResult, TaucMode, TaucResult, YAxisPreference,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,9 +663,10 @@ impl App {
                 self.peak_threshold,
                 16,
             );
+            let peak_xs: Vec<f64> = self.auto_peaks.iter().map(|p| p.x).collect();
             for peak in &mut self.auto_peaks {
                 peak.label =
-                    best_short_peak_label_with_solvent(kind, peak.x, self.nmr_solvent);
+                    best_peak_label_in_context(kind, peak.x, &peak_xs, self.nmr_solvent);
 
                 // NMR: label detected solvent/impurity peaks explicitly, but never
                 // hijack a genuine polymer signal that sits even closer.
@@ -1312,6 +1313,8 @@ impl App {
             x: self.cursor_x,
             y,
             prominence: 1.0,
+            fwhm: None,
+            snr: 0.0,
             label: label.clone(),
             pinned: true,
         });
@@ -1504,10 +1507,14 @@ impl App {
                 let label = spec.name.clone();
                 let unit = spec.raw_y_unit;
                 if uvvis {
-                    // UV-Vis: ftir_absorbance=true renders %T, false renders Abs.
-                    self.process_cfg.ftir_absorbance = unit == YUnit::Transmittance;
+                    // UV-Vis: Swapped renders %T, Native renders Abs.
+                    self.process_cfg.y_pref = if unit == YUnit::Transmittance {
+                        YAxisPreference::Swapped
+                    } else {
+                        YAxisPreference::Native
+                    };
                 } else if unit == YUnit::Transmittance {
-                    self.process_cfg.ftir_absorbance = false;
+                    self.process_cfg.y_pref = YAxisPreference::Native;
                 }
                 let (_, notes) = self.absorb_specs(vec![spec], true);
                 self.status_msg = format!(
@@ -1568,8 +1575,8 @@ impl App {
     fn pull_peak_absorbance(&self, center: f64, half: f64) -> Option<f64> {
         let spec = self.traces.get(self.active_trace)?;
         let cfg = ProcessConfig {
-            ftir_absorbance: true,
-            baseline: true,
+            y_pref: YAxisPreference::Swapped,
+            baseline: BaselineMode::Rubberband,
             smooth: SmoothLevel::Off,
             normalize: false,
         };
@@ -1904,20 +1911,27 @@ impl App {
             }
             KeyCode::Char('a') => {
                 if self.current_kind() == SpectrumKind::Ftir {
-                    self.process_cfg.ftir_absorbance = !self.process_cfg.ftir_absorbance;
+                    self.process_cfg.y_pref = match self.process_cfg.y_pref {
+                        YAxisPreference::Native => YAxisPreference::Swapped,
+                        YAxisPreference::Swapped => YAxisPreference::Native,
+                    };
                     self.recompute_processing();
                     self.status_msg = format!(
                         "FTIR Y-Axis: {}",
-                        if self.process_cfg.ftir_absorbance { "Absorbance (A)" } else { "Transmittance (%T)" }
+                        if self.process_cfg.y_pref == YAxisPreference::Swapped {
+                            "Absorbance (A)"
+                        } else {
+                            "Transmittance (%T)"
+                        }
                     );
                 }
             }
             KeyCode::Char('b') => {
-                self.process_cfg.baseline = !self.process_cfg.baseline;
+                self.process_cfg.baseline = self.process_cfg.baseline.next();
                 self.recompute_processing();
                 self.status_msg = format!(
-                    "Rubberband Baseline Correction: {}",
-                    if self.process_cfg.baseline { "ON" } else { "OFF" }
+                    "Baseline Correction: {}",
+                    self.process_cfg.baseline.label()
                 );
             }
             KeyCode::Char('m') => {
@@ -2769,11 +2783,11 @@ impl App {
                         };
                         if !st.is_image {
                             match st.kind_choice {
-                                0 => self.process_cfg.ftir_absorbance = false,
-                                1 => self.process_cfg.ftir_absorbance = true,
+                                0 => self.process_cfg.y_pref = YAxisPreference::Native,
+                                1 => self.process_cfg.y_pref = YAxisPreference::Swapped,
                                 // UV-Vis: Abs (5) keeps the default; %T (6) flips the toggle.
-                                5 => self.process_cfg.ftir_absorbance = false,
-                                6 => self.process_cfg.ftir_absorbance = true,
+                                5 => self.process_cfg.y_pref = YAxisPreference::Native,
+                                6 => self.process_cfg.y_pref = YAxisPreference::Swapped,
                                 _ => {}
                             }
                             let path = st.path.clone();
@@ -2803,10 +2817,10 @@ impl App {
                                     }
                                     .to_string();
                                     match st.kind_choice {
-                                        0 => self.process_cfg.ftir_absorbance = false,
-                                        1 => self.process_cfg.ftir_absorbance = true,
-                                        5 => self.process_cfg.ftir_absorbance = false,
-                                        6 => self.process_cfg.ftir_absorbance = true,
+                                        0 => self.process_cfg.y_pref = YAxisPreference::Native,
+                                        1 => self.process_cfg.y_pref = YAxisPreference::Swapped,
+                                        5 => self.process_cfg.y_pref = YAxisPreference::Native,
+                                        6 => self.process_cfg.y_pref = YAxisPreference::Swapped,
                                         _ => {}
                                     }
                                     // The Python digitizer reads the raster and
