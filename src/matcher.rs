@@ -370,9 +370,7 @@ fn cache_file_path(kind: SpectrumKind) -> PathBuf {
         // library_roots() yields .../library/ftir, .../library/nmr, .../samples, etc.
         if let Some(parent) = root.parent() {
             if parent.file_name().and_then(|s| s.to_str()) == Some("library") {
-                if let Some(base) = parent.parent() {
-                    return base.join(".cache").join(filename);
-                }
+                return parent.join(".cache").join(filename);
             }
         }
     }

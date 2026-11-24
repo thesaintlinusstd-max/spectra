@@ -15,8 +15,8 @@ use crate::data::{
     SpectrumKind, YUnit, CNMR_DB, FTIR_DB, HNMR_DB, POLYMERS_DB, SOLVENT_IMPURITIES, UVVIS_DB,
 };
 use crate::export::{
-    open_exported_file, run_python_digitize, run_python_export, ExportFormat, ExportPayload,
-    ExportPeak, ExportPeakMode, ExportStyle, ExportTrace,
+    open_exported_file, run_export, ExportFormat, ExportPayload, ExportPeak, ExportPeakMode,
+    ExportStyle, ExportTrace,
 };
 use crate::io::{expand_tilde, load_spectrum_file, parse_pasted_paths, search_library};
 use crate::processing::{
@@ -1753,7 +1753,7 @@ impl App {
         self.pending_export = Some(state.clone());
         self.start_task(
             format!("Rendering {} …", state.format.label()),
-            move || TaskOutcome::Export(run_python_export(&payload, &out_path).map_err(|e| e.to_string())),
+            move || TaskOutcome::Export(run_export(&payload, &out_path).map_err(|e| e.to_string())),
         );
     }
 
@@ -2820,13 +2820,13 @@ impl App {
                                         6 => self.process_cfg.y_pref = YAxisPreference::Swapped,
                                         _ => {}
                                     }
-                                    // The Python digitizer reads the raster and
-                                    // traces the curve: seconds to minutes on a
-                                    // big scan, so it must run off the UI thread.
+                                    // Pure-Rust offline digitizer (Viterbi DP):
+                                    // fast, but still runs off the UI thread so
+                                    // large scans never block input.
                                     let path = st.path.clone();
                                     let append = st.append_mode;
                                     self.start_task("Digitizing spectrum image…", move || {
-                                        match run_python_digitize(
+                                        match crate::digitize::digitize_spectrum_image(
                                             &path, kind, y_unit, l, r, &bg_mode,
                                         ) {
                                             Ok(spec) => TaskOutcome::Loaded {

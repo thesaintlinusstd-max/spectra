@@ -1,11 +1,13 @@
 mod app;
 mod clipboard;
 mod data;
+mod digitize;
 mod export;
 mod io;
 mod kitty_plot;
 mod matcher;
 mod processing;
+mod svg_export;
 mod theme;
 mod ui;
 
@@ -28,7 +30,7 @@ use ratatui::Terminal;
 
 use crate::app::App;
 use crate::data::{SpectrumKind, YUnit};
-use crate::export::{find_python_script, run_python_export, ExportPayload, ExportPeak, ExportStyle, ExportTrace};
+use crate::export::{find_python_script, run_export, ExportPayload, ExportPeak, ExportStyle, ExportTrace};
 use crate::io::{
     load_spectrum_file, resolve_library_query, search_library_for_kind, write_sample_files,
     LibraryEntry,
@@ -348,7 +350,7 @@ fn run_headless_export(
         peaks: peaks_out,
     };
 
-    let saved = run_python_export(&payload, &output)?;
+    let saved = run_export(&payload, &output)?;
     println!("Exported publication figure: {}", saved.display());
     Ok(())
 }
@@ -1511,6 +1513,196 @@ mod tests {
                 .map(|m| (&m.short, m.hqi_pct))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_native_rust_digitizer_recovers_curve() {
+        let w = 400u32;
+        let h = 240u32;
+        let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
+
+        // Light-gray horizontal & vertical gridlines inside box (x=40..380, y=20..200)
+        for gy in [50u32, 90, 130, 170] {
+            for x in 40..=380 {
+                img.put_pixel(x, gy, image::Rgb([210, 210, 210]));
+            }
+        }
+        for gx in [100u32, 170, 240, 310] {
+            for y in 20..=200 {
+                img.put_pixel(gx, y, image::Rgb([210, 210, 210]));
+            }
+        }
+
+        // Black axis box (x=40..380, y=20..200)
+        for x in 40..=380 {
+            img.put_pixel(x, 20, image::Rgb([0, 0, 0]));
+            img.put_pixel(x, 200, image::Rgb([0, 0, 0]));
+        }
+        for y in 20..=200 {
+            img.put_pixel(40, y, image::Rgb([0, 0, 0]));
+            img.put_pixel(380, y, image::Rgb([0, 0, 0]));
+        }
+
+        // Small black text/legend rectangle (x=310..360, y=30..45)
+        for y in 30..=45 {
+            for x in 310..=360 {
+                img.put_pixel(x, y, image::Rgb([0, 0, 0]));
+            }
+        }
+
+        // Solid blue spectrum curve (25, 80, 180), 3px thick:
+        // flat 95%T baseline with Lorentzian trough down to 15%T centered at 1725 cm^-1
+        // inside the crop box (x=43..377, y=23..197).
+        let x0 = 43.0_f64;
+        let x1 = 377.0_f64;
+        let y0 = 23.0_f64;
+        let y1 = 197.0_f64;
+        for px in 43u32..=377 {
+            let u = (px as f64 - x0) / (x1 - x0);
+            let wn = 4000.0 + u * (400.0 - 4000.0);
+            let dx = (wn - 1725.0) / 45.0;
+            let t_pct = 95.0 - 80.0 / (1.0 + dx * dx);
+            let py_f = y0 + (100.0 - t_pct) / 100.0 * (y1 - y0);
+            let py = py_f.round() as i32;
+            for dy in -1..=1 {
+                let yy = py + dy;
+                if (21..=199).contains(&yy) {
+                    img.put_pixel(px, yy as u32, image::Rgb([25, 80, 180]));
+                }
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "spectra_test_digitize_{}.png",
+            std::process::id()
+        ));
+        img.save(&tmp).expect("save synthetic PNG");
+
+        let spec = crate::digitize::digitize_spectrum_image(
+            &tmp,
+            SpectrumKind::Ftir,
+            YUnit::Transmittance,
+            4000.0,
+            400.0,
+            "auto",
+        )
+        .expect("digitize synthetic spectrum");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(spec.kind, SpectrumKind::Ftir);
+        assert!(spec.x.len() >= 300, "expected >= 300 points, got {}", spec.x.len());
+        assert!(spec.x.windows(2).all(|w| w[0] < w[1]), "x must be strictly ascending");
+
+        let (min_idx, _) = spec
+            .y
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap();
+        let min_x = spec.x[min_idx];
+        assert!(
+            (min_x - 1725.0).abs() <= 40.0,
+            "expected trough near 1725 cm^-1, got {}",
+            min_x
+        );
+    }
+
+    #[test]
+    fn test_native_svg_export_ftir_and_uvvis() {
+        let tmp_ftir = std::env::temp_dir().join(format!(
+            "spectra_test_ftir_{}.svg",
+            std::process::id()
+        ));
+        let tmp_uv = std::env::temp_dir().join(format!(
+            "spectra_test_uvvis_{}.svg",
+            std::process::id()
+        ));
+
+        let x_ir: Vec<f64> = (0..100).map(|i| 400.0 + i as f64 * 36.0).collect();
+        let y_ir1: Vec<f64> = x_ir
+            .iter()
+            .map(|&x| 95.0 - 60.0 / (1.0 + ((x - 1725.0) / 40.0).powi(2)))
+            .collect();
+        let y_ir2: Vec<f64> = x_ir
+            .iter()
+            .map(|&x| 92.0 - 50.0 / (1.0 + ((x - 2950.0) / 60.0).powi(2)))
+            .collect();
+
+        let ftir_payload = ExportPayload {
+            mode: "ftir".into(),
+            y_unit: "transmittance".into(),
+            style: "acs".into(),
+            stacked: true,
+            dpi: 600,
+            title: "MMA <vs> PMMA & Co.".into(),
+            x_bounds: [400.0, 4000.0],
+            active_trace: 0,
+            traces: vec![
+                ExportTrace {
+                    name: "PMMA".into(),
+                    x: x_ir.clone(),
+                    y: y_ir1,
+                },
+                ExportTrace {
+                    name: "MMA".into(),
+                    x: x_ir,
+                    y: y_ir2,
+                },
+            ],
+            peaks: vec![
+                ExportPeak { x: 1725.0, y: 35.0, label: "C=O 1725".into(), pinned: true },
+                ExportPeak { x: 2950.0, y: 78.0, label: "C-H 2950".into(), pinned: false },
+                ExportPeak { x: 1450.0, y: 82.0, label: "CH2 1450".into(), pinned: false },
+                ExportPeak { x: 1150.0, y: 80.0, label: "C-O 1150".into(), pinned: false },
+            ],
+        };
+
+        let saved_ftir = crate::export::run_export(&ftir_payload, &tmp_ftir)
+            .expect("export FTIR SVG");
+        assert!(saved_ftir.is_file());
+        let ftir_svg = std::fs::read_to_string(&saved_ftir).expect("read FTIR SVG");
+        assert!(ftir_svg.starts_with("<svg"));
+        assert!(ftir_svg.ends_with("</svg>"));
+        assert!(ftir_svg.contains("&amp;"));
+        assert!(ftir_svg.contains("&lt;"));
+        assert!(ftir_svg.contains("peak-leaders"));
+        assert!(ftir_svg.contains("peak-labels"));
+
+        let x_uv: Vec<f64> = (200..=800).step_by(5).map(|v| v as f64).collect();
+        let y_uv: Vec<f64> = x_uv
+            .iter()
+            .map(|&x| 0.05 + 0.9 * (-((x - 450.0) / 40.0).powi(2)).exp())
+            .collect();
+        let uv_payload = ExportPayload {
+            mode: "uvvis".into(),
+            y_unit: "absorbance".into(),
+            style: "everforest".into(),
+            stacked: false,
+            dpi: 600,
+            title: "UV-Vis Dye".into(),
+            x_bounds: [200.0, 800.0],
+            active_trace: 0,
+            traces: vec![ExportTrace {
+                name: "Dye".into(),
+                x: x_uv,
+                y: y_uv,
+            }],
+            peaks: vec![ExportPeak {
+                x: 450.0,
+                y: 0.95,
+                label: "λmax 450 nm".into(),
+                pinned: true,
+            }],
+        };
+
+        let saved_uv = crate::export::run_export(&uv_payload, &tmp_uv)
+            .expect("export UV-Vis SVG");
+        let uv_svg = std::fs::read_to_string(&saved_uv).expect("read UV-Vis SVG");
+        assert!(uv_svg.contains("vis-rainbow"));
+        assert!(uv_svg.contains("Wavelength"));
+
+        let _ = std::fs::remove_file(&tmp_ftir);
+        let _ = std::fs::remove_file(&tmp_uv);
     }
 }
 

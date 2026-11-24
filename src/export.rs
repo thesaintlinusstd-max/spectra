@@ -255,6 +255,18 @@ pub fn find_python_and_script() -> Result<(PathBuf, PathBuf)> {
     find_python_script("export_plot.py")
 }
 
+pub fn run_export(payload: &ExportPayload, output_path: &Path) -> Result<PathBuf> {
+    let is_svg = output_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("svg"))
+        .unwrap_or(false);
+    if is_svg {
+        return crate::svg_export::write_publication_svg(payload, output_path);
+    }
+    run_python_export(payload, output_path)
+}
+
 pub fn run_python_export(payload: &ExportPayload, output_path: &Path) -> Result<PathBuf> {
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -396,6 +408,7 @@ pub fn run_library_downloads(items: &[(&str, &str)]) -> Result<String> {
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn run_python_digitize(
     img_path: &Path,
     kind: crate::data::SpectrumKind,
