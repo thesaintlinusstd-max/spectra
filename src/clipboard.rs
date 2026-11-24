@@ -46,21 +46,44 @@ pub fn copy_text(text: &str) -> Result<&'static str> {
 pub fn copy_png_file(path: &Path) -> Result<()> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read exported image: {}", path.display()))?;
-    let mut child = Command::new("wl-copy")
+
+    // 1. Wayland (Hyprland) native wl-copy
+    if let Ok(mut child) = Command::new("wl-copy")
         .args(["--type", "image/png"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("Failed to spawn wl-copy (install wl-clipboard)")?;
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&bytes);
+        }
+        if let Ok(status) = child.wait() {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&bytes)?;
+    // 2. X11 fallback
+    if let Ok(mut child) = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "image/png", "-i"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&bytes);
+        }
+        if let Ok(status) = child.wait() {
+            if status.success() {
+                return Ok(());
+            }
+        }
     }
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("wl-copy exited with status {}", status))
-    }
+
+    Err(anyhow!(
+        "wl-copy/xclip not available (install wl-clipboard or xclip)"
+    ))
 }

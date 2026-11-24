@@ -93,7 +93,7 @@ def digitize_image(
     else:
         row_med = np.median(crop_fg, axis=1, keepdims=True)
         col_med = np.median(crop_fg, axis=0, keepdims=True)
-        trace_map = np.clip(crop_fg - 0.85 * np.minimum(row_med, col_med), 0.0, 1.0)
+        trace_map = np.clip(crop_fg - 0.85 * np.maximum(row_med, col_med), 0.0, 1.0)
 
     peak_ref = float(np.percentile(trace_map, 98.8))
     thresh = max(0.14, peak_ref * 0.42)

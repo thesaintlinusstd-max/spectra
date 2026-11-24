@@ -255,6 +255,18 @@ pub fn find_python_and_script() -> Result<(PathBuf, PathBuf)> {
     find_python_script("export_plot.py")
 }
 
+pub fn run_export(payload: &ExportPayload, output_path: &Path) -> Result<PathBuf> {
+    let is_svg = output_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("svg"))
+        .unwrap_or(false);
+    if is_svg {
+        return crate::svg_export::write_publication_svg(payload, output_path);
+    }
+    run_python_export(payload, output_path)
+}
+
 pub fn run_python_export(payload: &ExportPayload, output_path: &Path) -> Result<PathBuf> {
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -319,7 +331,7 @@ pub fn run_library_downloads(items: &[(&str, &str)]) -> Result<String> {
     use std::process::Command;
 
     let mut summary_lines: Vec<String> = Vec::new();
-    let mut total_files = 0;
+    let before = crate::io::library_index().len();
 
     for (script_name, args_str) in items {
         let (python, script) = find_python_script(script_name)?;
@@ -348,39 +360,15 @@ pub fn run_library_downloads(items: &[(&str, &str)]) -> Result<String> {
             continue;
         }
 
-        // Extract "Total ... downloaded: N" or similar from stdout
-        let mut pack_total = 0;
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.starts_with("Total ") && line.contains("downloaded:") {
-                if let Some(num_str) = line.split("downloaded:").nth(1) {
-                    if let Ok(n) = num_str.trim().parse::<usize>() {
-                        pack_total = n;
-                    }
-                }
-            } else if line.contains("summary:") && line.contains("downloaded") {
-                // PhotochemCAD/NIST UV-Vis summary lines
-                if let Some(idx) = line.find("downloaded") {
-                    let before = &line[..idx];
-                    if let Some(num_str) = before.split_whitespace().last() {
-                        if let Ok(n) = num_str.parse::<usize>() {
-                            pack_total = n;
-                        }
-                    }
-                }
-            }
-        }
-        if pack_total > 0 {
-            summary_lines.push(format!("✓ {}: {} spectra", script_name, pack_total));
-            total_files += pack_total;
-        } else if !stdout.trim().is_empty() {
-            // Fallback: show last few lines
-            let last_lines: Vec<&str> = stdout.lines().rev().take(3).collect();
-            for l in last_lines.iter().rev() {
-                if !l.trim().is_empty() {
-                    summary_lines.push(format!("  {}", l.trim()));
-                }
-            }
+        // Scripts may print an itemised summary, but the authoritative count is
+        // the on-disk library index refreshed after all packs finish.
+        let tail = stdout
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string());
+        if let Some(line) = tail {
+            summary_lines.push(format!("  {}", line));
         } else {
             summary_lines.push(format!("✓ {}: completed", script_name));
         }
@@ -390,12 +378,20 @@ pub fn run_library_downloads(items: &[(&str, &str)]) -> Result<String> {
         return Ok("No packs selected or all failed.".into());
     }
 
+    crate::io::refresh_library_index();
+    let after = crate::io::library_index().len();
+    let added = after.saturating_sub(before);
+
     let mut out = String::new();
-    out.push_str(&format!("Downloaded {} reference spectra total.\n", total_files));
+    out.push_str(&format!(
+        "Library updated: +{} new spectra ({} total indexed).\n",
+        added, after
+    ));
     out.push_str(&summary_lines.join("\n"));
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn run_python_digitize(
     img_path: &Path,
     kind: crate::data::SpectrumKind,

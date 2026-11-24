@@ -1,11 +1,13 @@
 mod app;
 mod clipboard;
 mod data;
+mod digitize;
 mod export;
 mod io;
 mod kitty_plot;
 mod matcher;
 mod processing;
+mod svg_export;
 mod theme;
 mod ui;
 
@@ -28,12 +30,14 @@ use ratatui::Terminal;
 
 use crate::app::App;
 use crate::data::{SpectrumKind, YUnit};
-use crate::export::{find_python_script, run_python_export, ExportPayload, ExportPeak, ExportStyle, ExportTrace};
+use crate::export::{find_python_script, run_export, ExportPayload, ExportPeak, ExportStyle, ExportTrace};
 use crate::io::{
     load_spectrum_file, resolve_library_query, search_library_for_kind, write_sample_files,
     LibraryEntry,
 };
-use crate::processing::{detect_peaks, process_trace, ProcessConfig, SmoothLevel};
+use crate::processing::{
+    detect_peaks, process_trace, BaselineMode, ProcessConfig, SmoothLevel, YAxisPreference,
+};
 
 /// Positional CLI arguments are usually file paths, but `spectra butane` is a
 /// natural thing to type. Bare words that name a technique (`nmr`, `ftir`,
@@ -225,7 +229,12 @@ fn install_panic_hook() {
         let _ = disable_raw_mode();
         let mut stdout = stdio::stdout();
         kitty_plot::clear_kitty_image(&mut stdout);
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         orig(info);
     }));
 }
@@ -253,13 +262,14 @@ fn print_help() {
     println!(
         "SPECTRA {} — FTIR & NMR Spectroscopy Explorer & Polymer Chemistry Toolkit\n\n\
          USAGE:\n  \
-           spectra [FILES...] [--mode ftir|hnmr|cnmr]\n  \
-           spectra [ftir|nmr|cnmr] [QUERY...]     (e.g. spectra ftir butane)\n  \
+           spectra [FILES...] [--mode ftir|hnmr|cnmr|uvvis]\n  \
+           spectra [ftir|nmr|cnmr|uvvis] [QUERY...]     (e.g. spectra ftir butane)\n  \
            spectra init-samples [--dir samples]\n  \
            spectra fetch <nist|nmr|nmr-search|import|list|pack> [ARGS...]\n  \
-           spectra export <FILES...> -o <OUT.png|svg|pdf> [--style acs|rsc|everforest]\n                 \
-                   [--stacked] [--absorbance] [--baseline] [--smooth 0|5|9|15]\n                 \
-                   [--title \"...\"] [--dpi 600]\n",
+           spectra export <FILES...> -o <OUT.svg|png|pdf> [--style acs|rsc|everforest]\n                 \
+                   [--stacked] [--absorbance] [--baseline (AsLS) | --rubberband]\n                 \
+                   [--smooth 0|5|9|15] [--title \"...\"] [--dpi 600]\n\n\
+         SVG figures are rendered natively in Rust; PNG/PDF use the Python helper.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -272,6 +282,7 @@ fn run_headless_export(
     stacked: bool,
     absorbance: bool,
     baseline: bool,
+    rubberband: bool,
     smooth: usize,
     title: String,
     dpi: u32,
@@ -286,8 +297,18 @@ fn run_headless_export(
         _ => SmoothLevel::Off,
     };
     let cfg = ProcessConfig {
-        ftir_absorbance: absorbance,
-        baseline,
+        y_pref: if absorbance {
+            YAxisPreference::Swapped
+        } else {
+            YAxisPreference::Native
+        },
+        baseline: if rubberband {
+            BaselineMode::Rubberband
+        } else if baseline {
+            BaselineMode::Asls
+        } else {
+            BaselineMode::Off
+        },
         smooth: smooth_lvl,
         normalize: false,
     };
@@ -338,7 +359,7 @@ fn run_headless_export(
         peaks: peaks_out,
     };
 
-    let saved = run_python_export(&payload, &output)?;
+    let saved = run_export(&payload, &output)?;
     println!("Exported publication figure: {}", saved.display());
     Ok(())
 }
@@ -447,6 +468,7 @@ fn main() -> Result<()> {
         let mut stacked = false;
         let mut absorbance = false;
         let mut baseline = false;
+        let mut rubberband = false;
         let mut smooth: usize = 0;
         let mut title = String::new();
         let mut dpi: u32 = 600;
@@ -471,6 +493,7 @@ fn main() -> Result<()> {
                 "--stacked" => stacked = true,
                 "--absorbance" => absorbance = true,
                 "--baseline" => baseline = true,
+                "--rubberband" => rubberband = true,
                 "--smooth" => {
                     i += 1;
                     if i >= args.len() {
@@ -499,7 +522,7 @@ fn main() -> Result<()> {
         }
 
         return run_headless_export(
-            files, output, style, stacked, absorbance, baseline, smooth, title, dpi,
+            files, output, style, stacked, absorbance, baseline, rubberband, smooth, title, dpi,
         );
     }
 
@@ -539,8 +562,8 @@ mod tests {
     use super::*;
     use crate::data::{
         match_ftir, match_solvent_impurities, match_uvvis, mma_monomer_spectrum,
-        pmma_polymer_spectrum, polystyrene_ftir_spectrum, SolventId, SpectrumKind, Spectrum,
-        YUnit,
+        pmma_polymer_spectrum, polystyrene_ftir_spectrum, DemoPreset, SolventId,
+        SpectrumKind, Spectrum, YUnit,
     };
     use crate::io::{encode_jcamp_difdup, parse_delimited, parse_jcamp_dx};
     use crate::processing::{
@@ -676,17 +699,18 @@ mod tests {
             "broad carboxylic O–H must not rank first at 2916 cm⁻¹"
         );
 
-        let pvdf = match_ftir(840.0);
+        let pvdf = crate::data::match_ftir_with_context(840.0, &[1402.0, 1275.0, 1175.0, 840.0, 510.0]);
         assert!(
-            pvdf.iter().any(|b| b.group.contains("PVDF β-phase")),
+            pvdf.iter().any(|b| b.band.group.contains("PVDF β-phase")),
             "expected PVDF β-phase assignment at 840 cm⁻¹, got {:?}",
-            pvdf.iter().map(|b| b.group).collect::<Vec<_>>()
+            pvdf.iter().map(|b| b.band.group).collect::<Vec<_>>()
         );
         assert!(
-            pvdf[0].group.contains("PVDF β-phase"),
-            "PVDF β-phase should rank first at 840 cm⁻¹, got: {}",
-            pvdf[0].group
+            pvdf[0].band.group.contains("PVDF β-phase"),
+            "PVDF β-phase should rank first at 840 cm⁻¹ with PVDF context, got: {}",
+            pvdf[0].band.group
         );
+        assert!(pvdf[0].confirmed, "PVDF β-phase should be confirmed in PVDF context");
     }
 
     #[test]
@@ -1012,7 +1036,6 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/demo").join(name),
             display: format!("  {name}"),
             is_dir,
-            is_image: false,
         };
         let entries = vec![
             mk("../ (parent directory)", true),
@@ -1062,8 +1085,68 @@ mod tests {
     }
 
     #[test]
-    fn test_version_is_0_5() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.1");
+    fn test_version_is_0_6() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
+    }
+
+    #[test]
+    fn test_uvvis_key_a_and_baseline_cycle_and_pinned_y_refresh() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(vec![], Some(SpectrumKind::UvVis));
+        assert_eq!(app.processed[0].y_unit, YUnit::Absorbance);
+
+        let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(key_a);
+        assert_eq!(app.processed[0].y_unit, YUnit::Transmittance);
+
+        let key_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        app.handle_key(key_b);
+        assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Rubberband);
+        app.handle_key(key_b);
+        assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Asls);
+        app.handle_key(key_b);
+        assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Off);
+
+        // FTIR: pinned %T y-value must be refreshed to absorbance after [a].
+        let mut ftir = App::new(vec![], Some(SpectrumKind::Ftir));
+        ftir.load_demo(DemoPreset::MmaVsPmmaFtir);
+        ftir.cursor_x = 1722.0;
+        ftir.toggle_pin_at_cursor();
+        assert!(
+            ftir.pinned_peaks[0].y > 1.0,
+            "expected %T-scale pinned y > 1.0, got {}",
+            ftir.pinned_peaks[0].y
+        );
+        ftir.handle_key(key_a);
+        assert!(
+            ftir.pinned_peaks[0].y < 2.0,
+            "expected absorbance-scale refreshed pinned y < 2.0, got {}",
+            ftir.pinned_peaks[0].y
+        );
+    }
+
+    #[test]
+    fn test_dropped_image_opens_import_config() {
+        let tmp = std::env::temp_dir().join(format!(
+            "spectra-dropped-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let img = image::RgbaImage::from_pixel(80, 60, image::Rgba([255, 255, 255, 255]));
+        img.save(&tmp).expect("write tiny PNG");
+
+        let mut app = App::new(vec![], Some(SpectrumKind::UvVis));
+        app.handle_paste(&tmp.display().to_string());
+        assert!(
+            matches!(app.modal, crate::app::Modal::ImportConfig(ref st) if st.is_image),
+            "dropped PNG should open the ImportConfig image dialog"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -1196,6 +1279,500 @@ mod tests {
         let (abs_region, sol_color) = crate::data::uvvis_color_info(500.0);
         assert!(abs_region.contains("Green"));
         assert!(sol_color.contains("Purple") || sol_color.contains("Magenta"));
+    }
+
+    #[test]
+    fn test_mma_monomer_context_aware_labels_no_false_positives() {
+        let mma = crate::data::mma_monomer_spectrum();
+        let (xs, ys, yu) = process_trace(&mma, ProcessConfig::default());
+        let peaks = detect_peaks(&xs, &ys, mma.kind, yu, 0.08, 16);
+        assert!(!peaks.is_empty(), "MMA monomer should yield detected peaks");
+
+        for p in &peaks {
+            for bad in ["Polyimide", "Calcium", "CaCO", "Sulfone", "POM", "Si–CH₃"] {
+                assert!(
+                    !p.label.contains(bad),
+                    "MMA peak {} should not be mislabeled with '{}'",
+                    p.label,
+                    bad
+                );
+            }
+        }
+
+        let p1722 = peaks
+            .iter()
+            .min_by(|a, b| (a.x - 1722.0).abs().total_cmp(&(b.x - 1722.0).abs()))
+            .expect("expected ~1722 peak");
+        assert!(
+            p1722.label.contains("C=O"),
+            "~1722 cm⁻¹ peak should be labeled with C=O, got: {}",
+            p1722.label
+        );
+
+        let p1443 = peaks
+            .iter()
+            .min_by(|a, b| (a.x - 1443.0).abs().total_cmp(&(b.x - 1443.0).abs()))
+            .expect("expected ~1443 peak");
+        assert!(
+            p1443.label.contains("CH"),
+            "~1443 cm⁻¹ peak should be labeled with CH, got: {}",
+            p1443.label
+        );
+    }
+
+    #[test]
+    fn test_confirmed_specific_materials_still_identify() {
+        let pi = crate::data::match_ftir_with_context(1720.0, &[1778.0, 1720.0, 1375.0, 725.0]);
+        assert!(
+            pi[0].confirmed && pi[0].band.group.contains("Polyimide"),
+            "Polyimide should be confirmed at 1720 cm⁻¹ with PI context, got: {} (confirmed={})",
+            pi[0].band.group,
+            pi[0].confirmed
+        );
+
+        let caco3 = crate::data::match_ftir_with_context(1425.0, &[1425.0, 875.0, 712.0]);
+        assert!(
+            caco3[0].confirmed && caco3[0].band.group.contains("Calcium Carbonate"),
+            "CaCO₃ should be confirmed at 1425 cm⁻¹ with calcite context, got: {} (confirmed={})",
+            caco3[0].band.group,
+            caco3[0].confirmed
+        );
+
+        let pdms_795 = crate::data::match_ftir_with_context(795.0, &[2962.0, 1260.0, 1080.0, 1015.0, 795.0]);
+        assert!(
+            pdms_795[0].confirmed && pdms_795[0].band.group.contains("Si–CH₃"),
+            "PDMS Si–CH₃ should be confirmed at 795 cm⁻¹, got: {} (confirmed={})",
+            pdms_795[0].band.group,
+            pdms_795[0].confirmed
+        );
+
+        let pdms_1260 = crate::data::match_ftir_with_context(1260.0, &[2962.0, 1260.0, 1080.0, 1015.0, 795.0]);
+        assert!(
+            pdms_1260[0].confirmed && pdms_1260[0].band.group.contains("Si–CH₃"),
+            "PDMS Si–CH₃ should be confirmed at 1260 cm⁻¹, got: {} (confirmed={})",
+            pdms_1260[0].band.group,
+            pdms_1260[0].confirmed
+        );
+    }
+
+    #[test]
+    fn test_asls_recovers_curved_baseline() {
+        let n = 1000;
+        let mut baseline = Vec::with_capacity(n);
+        let mut signal = Vec::with_capacity(n);
+        let mut raw = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64;
+            let b = 0.25 + 0.45 * (t - 0.5).powi(2) + 0.10 * t;
+            let p1 = 0.90 / (1.0 + ((i as f64 - 300.0) / 8.0).powi(2));
+            let p2 = 0.70 / (1.0 + ((i as f64 - 700.0) / 10.0).powi(2));
+            let s = p1 + p2;
+            baseline.push(b);
+            signal.push(s);
+            raw.push(b + s);
+        }
+
+        let corr = crate::processing::asls_baseline(&raw, 1e6, 0.01, 10);
+        let mut max_off_err = 0.0_f64;
+        for (i, &c) in corr.iter().enumerate().take(n) {
+            if (i as f64 - 300.0).abs() > 45.0 && (i as f64 - 700.0).abs() > 55.0 {
+                max_off_err = max_off_err.max(c.abs());
+            }
+        }
+        assert!(
+            max_off_err < 0.025,
+            "AsLS off-peak residual should be < 0.025, got {:.4}",
+            max_off_err
+        );
+        assert!(
+            corr[300] > 0.90 * signal[300],
+            "AsLS should preserve >90% of peak 1 height: {:.4} vs {:.4}",
+            corr[300],
+            signal[300]
+        );
+        assert!(
+            corr[700] > 0.90 * signal[700],
+            "AsLS should preserve >90% of peak 2 height: {:.4} vs {:.4}",
+            corr[700],
+            signal[700]
+        );
+    }
+
+    #[test]
+    fn test_tauc_ignores_deep_uv_second_band() {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        let eg_true = 3.20_f64;
+        for nm in (200..=600).step_by(2) {
+            let nm_f = nm as f64;
+            let hv = 1239.84193 / nm_f;
+            // Direct-allowed TiO2 onset around 3.20 eV + strong 220 nm deep-UV Gaussian band
+            let edge = if hv > eg_true {
+                0.75 * ((hv - eg_true) / 0.35).sqrt().min(1.3)
+            } else {
+                0.01 * ((hv - eg_true) / 0.12).exp()
+            };
+            let deep_uv = 2.4 * (-0.5 * ((nm_f - 220.0) / 14.0).powi(2)).exp();
+            x.push(nm_f);
+            y.push(0.02 + edge + deep_uv);
+        }
+
+        let spec = Spectrum {
+            name: "tio2_deep_uv".into(),
+            source_path: None,
+            kind: SpectrumKind::UvVis,
+            raw_y_unit: YUnit::Absorbance,
+            x,
+            y,
+            visible: true,
+            color_idx: 0,
+            metadata: vec![],
+        };
+
+        let res = crate::processing::compute_tauc_band_gap(
+            &spec,
+            crate::processing::TaucMode::Direct,
+        )
+        .expect("should compute Tauc band gap");
+        assert!(
+            (3.10..=3.30).contains(&res.band_gap_ev),
+            "Tauc Eg should be in [3.10, 3.30] eV, got {:.3} eV",
+            res.band_gap_ev
+        );
+        assert!(
+            res.r_squared > 0.95,
+            "Tauc R² should be > 0.95, got {:.4}",
+            res.r_squared
+        );
+    }
+
+    #[test]
+    fn test_detect_peaks_plateau_and_fwhm() {
+        let xs: Vec<f64> = (0..9).map(|i| 100.0 + i as f64 * 10.0).collect();
+        let ys = vec![0.0, 0.2, 0.5, 1.0, 1.0, 1.0, 0.5, 0.2, 0.0];
+        let peaks = detect_peaks(&xs, &ys, SpectrumKind::UvVis, YUnit::Absorbance, 0.1, 5);
+        assert_eq!(peaks.len(), 1, "expected 1 plateau peak, got {:?}", peaks);
+        assert!(
+            (peaks[0].x - 140.0).abs() < 1e-6,
+            "plateau peak should center on midpoint 140.0, got {}",
+            peaks[0].x
+        );
+        let fwhm = peaks[0].fwhm.expect("expected finite FWHM");
+        assert!(fwhm.is_finite() && fwhm > 0.0, "expected positive finite FWHM, got {}", fwhm);
+    }
+
+    #[test]
+    fn test_jcamp_micrometers_ir_and_hz_nmr() {
+        let ir_um = "\
+##TITLE=IR Micrometers Test
+##JCAMP-DX=4.24
+##DATA TYPE=INFRARED SPECTRUM
+##XUNITS=MICROMETERS
+##YUNITS=TRANSMITTANCE
+##XYPOINTS=(XY..XY)
+2.5 95.0; 5.0 80.0; 10.0 30.0; 15.0 90.0
+##END=
+";
+        let ir_spec = parse_jcamp_dx(ir_um, "ir_um".into(), None).unwrap();
+        assert_eq!(ir_spec.kind, SpectrumKind::Ftir);
+        assert!(ir_spec.x.windows(2).all(|w| w[0] <= w[1]));
+        assert!(
+            (ir_spec.x[0] - 666.666667).abs() < 0.05,
+            "expected ~666.67 cm⁻¹, got {}",
+            ir_spec.x[0]
+        );
+        assert!(
+            (*ir_spec.x.last().unwrap() - 4000.0).abs() < 0.05,
+            "expected ~4000.0 cm⁻¹, got {}",
+            ir_spec.x.last().unwrap()
+        );
+
+        let nmr_hz = "\
+##TITLE=1H NMR Hz Test
+##JCAMP-DX=5.00
+##DATA TYPE=NMR SPECTRUM
+##XUNITS=HZ
+##YUNITS=ARBITRARY UNITS
+##.OBSERVE FREQUENCY=400.0
+##XYPOINTS=(XY..XY)
+0.0 10.0; 1440.0 85.0; 4000.0 5.0
+##END=
+";
+        let nmr_spec = parse_jcamp_dx(nmr_hz, "nmr_hz".into(), None).unwrap();
+        assert_eq!(nmr_spec.kind, SpectrumKind::Hnmr);
+        assert!(nmr_spec.x.windows(2).all(|w| w[0] <= w[1]));
+        assert!(
+            (nmr_spec.x[0] - 0.0).abs() < 1e-6,
+            "expected 0.0 ppm, got {}",
+            nmr_spec.x[0]
+        );
+        assert!(
+            (*nmr_spec.x.last().unwrap() - 10.0).abs() < 1e-6,
+            "expected 10.0 ppm, got {}",
+            nmr_spec.x.last().unwrap()
+        );
+
+        let uv_wn = "\
+##TITLE=UV-Vis Wavenumber Test
+##JCAMP-DX=4.24
+##DATA TYPE=UV/VIS SPECTRUM
+##XUNITS=1/CM
+##YUNITS=ABSORBANCE
+##XYPOINTS=(XY..XY)
+20000.0 0.10; 35000.0 0.80; 50000.0 0.25
+##END=
+";
+        let uv_spec = parse_jcamp_dx(uv_wn, "uv_wn".into(), None).unwrap();
+        assert_eq!(uv_spec.kind, SpectrumKind::UvVis);
+        assert!(uv_spec.x.windows(2).all(|w| w[0] <= w[1]));
+        assert!(
+            (uv_spec.x[0] - 200.0).abs() < 1e-6,
+            "expected 200.0 nm, got {}",
+            uv_spec.x[0]
+        );
+        assert!(
+            (*uv_spec.x.last().unwrap() - 500.0).abs() < 1e-6,
+            "expected 500.0 nm, got {}",
+            uv_spec.x.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_jcamp_multiblock_link_parses() {
+        let jdx = "\
+##TITLE=Compound Link Container
+##JCAMP-DX=5.01
+##DATA TYPE=LINK
+##BLOCKS=2
+##END=
+##TITLE=Real Spectrum
+##JCAMP-DX=5.01
+##DATA TYPE=INFRARED SPECTRUM
+##XUNITS=1/CM
+##YUNITS=ABSORBANCE
+##XYPOINTS=(XY..XY) 500.0 0.05; 1725.0 0.90; 4000.0 0.02
+##END=
+";
+        let spec = parse_jcamp_dx(jdx, "fallback".into(), None)
+            .expect("LINK container should parse the inner spectrum block");
+        assert_eq!(spec.name, "Real Spectrum");
+        assert_eq!(spec.kind, SpectrumKind::Ftir);
+        assert_eq!(spec.x.len(), 3);
+        assert!((spec.x[1] - 1725.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_nmr_library_matcher_identifies_pmma_hnmr() {
+        let pmma = crate::data::pmma_hnmr_spectrum();
+        let matches = crate::matcher::match_nmr_library(
+            &pmma,
+            ProcessConfig::default(),
+            SolventId::Cdcl3,
+        );
+        assert!(!matches.is_empty(), "NMR matcher returned no candidates");
+        assert!(
+            matches
+                .iter()
+                .take(3)
+                .any(|m| (m.short.eq_ignore_ascii_case("PMMA") || m.name.contains("PMMA"))
+                    && m.hqi_pct > 70.0),
+            "Expected PMMA in top 3 NMR matches with HQI > 70%, got: {:?}",
+            matches
+                .iter()
+                .take(3)
+                .map(|m| (&m.short, m.hqi_pct))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_native_rust_digitizer_recovers_curve() {
+        let w = 400u32;
+        let h = 240u32;
+        let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
+
+        // Light-gray horizontal & vertical gridlines inside box (x=40..380, y=20..200)
+        for gy in [50u32, 90, 130, 170] {
+            for x in 40..=380 {
+                img.put_pixel(x, gy, image::Rgb([210, 210, 210]));
+            }
+        }
+        for gx in [100u32, 170, 240, 310] {
+            for y in 20..=200 {
+                img.put_pixel(gx, y, image::Rgb([210, 210, 210]));
+            }
+        }
+
+        // Black axis box (x=40..380, y=20..200)
+        for x in 40..=380 {
+            img.put_pixel(x, 20, image::Rgb([0, 0, 0]));
+            img.put_pixel(x, 200, image::Rgb([0, 0, 0]));
+        }
+        for y in 20..=200 {
+            img.put_pixel(40, y, image::Rgb([0, 0, 0]));
+            img.put_pixel(380, y, image::Rgb([0, 0, 0]));
+        }
+
+        // Small black text/legend rectangle (x=310..360, y=30..45)
+        for y in 30..=45 {
+            for x in 310..=360 {
+                img.put_pixel(x, y, image::Rgb([0, 0, 0]));
+            }
+        }
+
+        // Solid blue spectrum curve (25, 80, 180), 3px thick:
+        // flat 95%T baseline with Lorentzian trough down to 15%T centered at 1725 cm^-1
+        // inside the crop box (x=43..377, y=23..197).
+        let x0 = 43.0_f64;
+        let x1 = 377.0_f64;
+        let y0 = 23.0_f64;
+        let y1 = 197.0_f64;
+        for px in 43u32..=377 {
+            let u = (px as f64 - x0) / (x1 - x0);
+            let wn = 4000.0 + u * (400.0 - 4000.0);
+            let dx = (wn - 1725.0) / 45.0;
+            let t_pct = 95.0 - 80.0 / (1.0 + dx * dx);
+            let py_f = y0 + (100.0 - t_pct) / 100.0 * (y1 - y0);
+            let py = py_f.round() as i32;
+            for dy in -1..=1 {
+                let yy = py + dy;
+                if (21..=199).contains(&yy) {
+                    img.put_pixel(px, yy as u32, image::Rgb([25, 80, 180]));
+                }
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "spectra_test_digitize_{}.png",
+            std::process::id()
+        ));
+        img.save(&tmp).expect("save synthetic PNG");
+
+        let spec = crate::digitize::digitize_spectrum_image(
+            &tmp,
+            SpectrumKind::Ftir,
+            YUnit::Transmittance,
+            4000.0,
+            400.0,
+            "auto",
+        )
+        .expect("digitize synthetic spectrum");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(spec.kind, SpectrumKind::Ftir);
+        assert!(spec.x.len() >= 300, "expected >= 300 points, got {}", spec.x.len());
+        assert!(spec.x.windows(2).all(|w| w[0] < w[1]), "x must be strictly ascending");
+
+        let (min_idx, _) = spec
+            .y
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap();
+        let min_x = spec.x[min_idx];
+        assert!(
+            (min_x - 1725.0).abs() <= 40.0,
+            "expected trough near 1725 cm^-1, got {}",
+            min_x
+        );
+    }
+
+    #[test]
+    fn test_native_svg_export_ftir_and_uvvis() {
+        let tmp_ftir = std::env::temp_dir().join(format!(
+            "spectra_test_ftir_{}.svg",
+            std::process::id()
+        ));
+        let tmp_uv = std::env::temp_dir().join(format!(
+            "spectra_test_uvvis_{}.svg",
+            std::process::id()
+        ));
+
+        let x_ir: Vec<f64> = (0..100).map(|i| 400.0 + i as f64 * 36.0).collect();
+        let y_ir1: Vec<f64> = x_ir
+            .iter()
+            .map(|&x| 95.0 - 60.0 / (1.0 + ((x - 1725.0) / 40.0).powi(2)))
+            .collect();
+        let y_ir2: Vec<f64> = x_ir
+            .iter()
+            .map(|&x| 92.0 - 50.0 / (1.0 + ((x - 2950.0) / 60.0).powi(2)))
+            .collect();
+
+        let ftir_payload = ExportPayload {
+            mode: "ftir".into(),
+            y_unit: "transmittance".into(),
+            style: "acs".into(),
+            stacked: true,
+            dpi: 600,
+            title: "MMA <vs> PMMA & Co.".into(),
+            x_bounds: [400.0, 4000.0],
+            active_trace: 0,
+            traces: vec![
+                ExportTrace {
+                    name: "PMMA".into(),
+                    x: x_ir.clone(),
+                    y: y_ir1,
+                },
+                ExportTrace {
+                    name: "MMA".into(),
+                    x: x_ir,
+                    y: y_ir2,
+                },
+            ],
+            peaks: vec![
+                ExportPeak { x: 1725.0, y: 35.0, label: "C=O 1725".into(), pinned: true },
+                ExportPeak { x: 2950.0, y: 78.0, label: "C-H 2950".into(), pinned: false },
+                ExportPeak { x: 1450.0, y: 82.0, label: "CH2 1450".into(), pinned: false },
+                ExportPeak { x: 1150.0, y: 80.0, label: "C-O 1150".into(), pinned: false },
+            ],
+        };
+
+        let saved_ftir = crate::export::run_export(&ftir_payload, &tmp_ftir)
+            .expect("export FTIR SVG");
+        assert!(saved_ftir.is_file());
+        let ftir_svg = std::fs::read_to_string(&saved_ftir).expect("read FTIR SVG");
+        assert!(ftir_svg.starts_with("<svg"));
+        assert!(ftir_svg.ends_with("</svg>"));
+        assert!(ftir_svg.contains("&amp;"));
+        assert!(ftir_svg.contains("&lt;"));
+        assert!(ftir_svg.contains("peak-leaders"));
+        assert!(ftir_svg.contains("peak-labels"));
+
+        let x_uv: Vec<f64> = (200..=800).step_by(5).map(|v| v as f64).collect();
+        let y_uv: Vec<f64> = x_uv
+            .iter()
+            .map(|&x| 0.05 + 0.9 * (-((x - 450.0) / 40.0).powi(2)).exp())
+            .collect();
+        let uv_payload = ExportPayload {
+            mode: "uvvis".into(),
+            y_unit: "absorbance".into(),
+            style: "everforest".into(),
+            stacked: false,
+            dpi: 600,
+            title: "UV-Vis Dye".into(),
+            x_bounds: [200.0, 800.0],
+            active_trace: 0,
+            traces: vec![ExportTrace {
+                name: "Dye".into(),
+                x: x_uv,
+                y: y_uv,
+            }],
+            peaks: vec![ExportPeak {
+                x: 450.0,
+                y: 0.95,
+                label: "λmax 450 nm".into(),
+                pinned: true,
+            }],
+        };
+
+        let saved_uv = crate::export::run_export(&uv_payload, &tmp_uv)
+            .expect("export UV-Vis SVG");
+        let uv_svg = std::fs::read_to_string(&saved_uv).expect("read UV-Vis SVG");
+        assert!(uv_svg.contains("vis-rainbow"));
+        assert!(uv_svg.contains("Wavelength"));
+
+        let _ = std::fs::remove_file(&tmp_ftir);
+        let _ = std::fs::remove_file(&tmp_uv);
     }
 }
 

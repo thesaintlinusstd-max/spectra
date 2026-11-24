@@ -343,12 +343,13 @@ pub const FTIR_DB: &[FtirBand] = &[
     FtirBand { min: 1580.0, max: 1620.0, group: "C=C (aromatic ring skeletal)", mode: "ν(C=C) ring", intensity: "Med, Sharp", note: "PS (1601), PET (1578/1612), Epoxy/PC (1608)", confirm: "Confirm ring 1485–1520 cm⁻¹" },
     FtirBand { min: 1515.0, max: 1570.0, group: "N–H bend + C–N (Amide II)", mode: "δ(N–H) + ν(C–N)", intensity: "Strong", note: "Nylon-6,6 (~1540), Polyurethane (~1530), PNIPAM (~1545)", confirm: "Confirm Amide I 1630–1685 cm⁻¹" },
     FtirBand { min: 1485.0, max: 1520.0, group: "C=C (aromatic ring skeletal)", mode: "ν(C=C) ring", intensity: "Strong, Sharp", note: "Polystyrene (1493), Bisphenol-A Epoxy/PC (1508)", confirm: "Confirm 1580–1620 cm⁻¹" },
-    FtirBand { min: 1445.0, max: 1480.0, group: "CH₂ scissor / CH₃ asym bend", mode: "δ(CH₂) / δ_as(CH₃)", intensity: "Med–Strong", note: "PE (1462/1472 crystalline doublet), PS (1452), PP (1456), PMMA (1448)", confirm: "Confirm CH₂ rock 720–730 cm⁻¹" },
+    FtirBand { min: 1430.0, max: 1480.0, group: "CH₂ scissor / CH₃ asym bend", mode: "δ(CH₂) / δ_as(CH₃)", intensity: "Med–Strong", note: "PE (1462/1472 crystalline doublet), PS (1452), PP (1456), PMMA (1448)", confirm: "Confirm CH₂ rock 720–730 cm⁻¹" },
     FtirBand { min: 1400.0, max: 1435.0, group: "=CH₂ in-plane scissor / C–H α-C=O", mode: "δ(=CH₂)", intensity: "Medium", note: "Acrylate/vinyl monomers (~1408), PVC (~1427)", confirm: "Confirm =C–H out-of-plane 905–990 cm⁻¹" },
     FtirBand { min: 1365.0, max: 1395.0, group: "CH₃ symmetric bend (umbrella)", mode: "δ_s(CH₃)", intensity: "Medium", note: "PP (1376 sharp), PMMA (1388), PVAc (1372), t-Bu doublet (1395/1365)", confirm: "Confirm CH₃ asym 2945–2995 cm⁻¹" },
     FtirBand { min: 1300.0, max: 1360.0, group: "C–N (aromatic amine) / SO₂ asym / CH wag", mode: "ν(C–N) / ν_as(SO₂)", intensity: "Med–Strong", note: "PET (1340 trans), PSU/PES sulfone (~1320), PVC (1330)", confirm: "Confirm ν_s(SO₂) 1145–1165 cm⁻¹" },
     FtirBand { min: 1250.0, max: 1275.0, group: "Si–CH₃ symmetric deformation", mode: "δ_s(Si–CH₃)", intensity: "Very Strong, Sharp", note: "Diagnostic PDMS/silicone peak at 1260 cm⁻¹!", confirm: "Confirm Si–CH₃ rock 795 cm⁻¹" },
     FtirBand { min: 1215.0, max: 1290.0, group: "C–O (ester / aryl ether / epoxy)", mode: "ν_as(C–O–C)", intensity: "Very Strong", note: "PET (1245), PMMA (1242/1270), Epoxy (1245), PVAc (1235), PC (1225)", confirm: "Confirm 1130–1210 cm⁻¹" },
+    FtirBand { min: 1285.0, max: 1335.0, group: "C–O (α,β-unsaturated ester / acrylate)", mode: "ν(C–O) conj.", intensity: "Strong", note: "MMA/acrylate conjugated C–O stretch (1300/1324 cm⁻¹)", confirm: "Confirm ester C=O 1715–1738 & C=C 1620–1660 cm⁻¹" },
     FtirBand { min: 1140.0, max: 1220.0, group: "C–F / CF₂ stretch (fluoropolymer)", mode: "ν(CF₂)", intensity: "Very Strong", note: "PTFE doublet at 1200 & 1146 cm⁻¹, PVDF (1175)", confirm: "Confirm CF₂ wag 500–645 cm⁻¹" },
     FtirBand { min: 1130.0, max: 1210.0, group: "C–O–C (ester / aliphatic ether)", mode: "ν(C–O)", intensity: "Very Strong", note: "PMMA (1148/1192), PCL (1175), PLA (1182), Polyurethane", confirm: "Confirm 1215–1290 cm⁻¹" },
     FtirBand { min: 1050.0, max: 1150.0, group: "C–O–C (aliphatic ether / PEG / PVA)", mode: "ν_as(C–O–C)", intensity: "Very Strong", note: "PEG/PEO (1105), PET (1096), PVA (1092), cellulose (1055)", confirm: "Confirm strong PEG 1105 cm⁻¹" },
@@ -357,6 +358,7 @@ pub const FTIR_DB: &[FtirBand] = &[
     FtirBand { min: 905.0, max: 950.0, group: "Epoxide oxirane ring / =CH₂ wag", mode: "ν(C–O) ring / γ(=CH₂)", intensity: "Medium", note: "DGEBA Epoxy uncured ring (915 cm⁻¹ — tracks epoxy cure!); MMA =CH₂ (940)", confirm: "Confirm oxirane 830–850 cm⁻¹" },
     FtirBand { min: 820.0, max: 880.0, group: "para-Aromatic C–H OOP / Si–C / =CH₂", mode: "γ(Ar–H)", intensity: "Strong", note: "PET (872), Epoxy/PC (830 para-disubstituted), PMMA (842), MMA (814)", confirm: "Confirm ring 1500–1610 cm⁻¹" },
     FtirBand { min: 780.0, max: 820.0, group: "Si–CH₃ rock / trisubstituted C=CH", mode: "ρ(Si–CH₃)", intensity: "Very Strong", note: "PDMS (795 cm⁻¹), MMA monomer (814), PMMA (750)", confirm: "Confirm Si–O–Si 1000–1100 cm⁻¹" },
+    FtirBand { min: 800.0, max: 825.0, group: "=CH₂ twist (vinyl / acrylate monomer)", mode: "τ(=CH₂)", intensity: "Med–Strong", note: "Vinylidene =CH₂ out-of-plane twist (MMA 814 cm⁻¹)", confirm: "Confirm C=C 1620–1660 & =CH₂ wag 935–950 cm⁻¹" },
     FtirBand { min: 735.0, max: 775.0, group: "Mono-/ortho-Aromatic C–H OOP", mode: "γ(Ar–H)", intensity: "Strong", note: "Polystyrene (756 cm⁻¹), PMMA (750), PET (725)", confirm: "Confirm ring bend 685–710 cm⁻¹" },
     FtirBand { min: 710.0, max: 735.0, group: "–(CH₂)_n– long-chain rocking (n≥4)", mode: "ρ(CH₂)", intensity: "Med–Strong", note: "PE crystalline doublet (720/730 cm⁻¹), Nylon-6,6 (725), PCL (732)", confirm: "Confirm CH₂ scissor 1465–1475 cm⁻¹" },
     FtirBand { min: 685.0, max: 710.0, group: "Mono-substituted phenyl ring bend", mode: "φ(ring)", intensity: "Very Strong", note: "Polystyrene hallmark peak at 698 cm⁻¹!", confirm: "Confirm Ar out-of-plane 735–775 cm⁻¹" },
@@ -1265,33 +1267,307 @@ pub const POLYMERS_DB: &[PolymerRef] = &[
 // DATABASE LOOKUP HELPERS
 // ============================================================================
 
-pub fn match_ftir(wn: f64) -> Vec<&'static FtirBand> {
-    let mut exact: Vec<&'static FtirBand> = FTIR_DB
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandTier {
+    /// Universal functional-group vibrational mode (C=O ester, δ(CH₂/CH₃), C–O–C, etc.)
+    Generic,
+    /// Material/polymer/mineral-specific marker (Polyimide, CaCO₃, PVDF, Sulfone, POM, Si–CH₃, GO, etc.)
+    Specific,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FtirBandRule {
+    pub tier: BandTier,
+    pub short_label: &'static str,
+    /// Companion wavenumber windows that confirm this band in a full spectrum.
+    pub requires: &'static [(f64, f64)],
+    /// Contradicting wavenumber windows that suppress this assignment if present.
+    pub forbids: &'static [(f64, f64)],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScoredFtirBand {
+    pub band: &'static FtirBand,
+    pub short_label: &'static str,
+    pub tier: BandTier,
+    pub confirmed: bool,
+    pub score: f64,
+}
+
+pub fn ftir_band_rule(band: &FtirBand) -> FtirBandRule {
+    let g = band.group;
+    // --- Material / polymer / mineral specific markers with co-occurrence rules ---
+    if g.starts_with("Polyimide Imide I ") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PI Imide I", requires: &[(1710.0, 1732.0), (1362.0, 1390.0)], forbids: &[] };
+    }
+    if g.starts_with("Polyimide Imide II") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PI Imide II", requires: &[(1768.0, 1790.0), (1362.0, 1390.0)], forbids: &[] };
+    }
+    if g.starts_with("Polyimide Imide III") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PI Imide III", requires: &[(1768.0, 1790.0), (1710.0, 1732.0)], forbids: &[] };
+    }
+    if g.starts_with("Polyimide Imide IV") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PI Imide IV", requires: &[(1768.0, 1790.0), (1362.0, 1390.0)], forbids: &[] };
+    }
+    if g.starts_with("Calcium Carbonate") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "CaCO₃ (CO₃²⁻)", requires: &[(868.0, 885.0), (705.0, 722.0)], forbids: &[] };
+    }
+    if g.starts_with("CaCO₃ out-of-plane") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "CaCO₃ ν₂", requires: &[(1400.0, 1465.0), (705.0, 722.0)], forbids: &[] };
+    }
+    if g.starts_with("CaCO₃ in-plane") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "CaCO₃ ν₄", requires: &[(1400.0, 1465.0), (868.0, 885.0)], forbids: &[] };
+    }
+    if g.starts_with("Sulfone ν_as") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "SO₂ asym", requires: &[(1140.0, 1172.0), (1480.0, 1615.0)], forbids: &[] };
+    }
+    if g.starts_with("Sulfone ν_s") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "SO₂ sym", requires: &[(1288.0, 1338.0), (1480.0, 1615.0)], forbids: &[] };
+    }
+    if g.starts_with("Diaryl ether") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "Ar–O–Ar", requires: &[(1480.0, 1615.0)], forbids: &[] };
+    }
+    if g.starts_with("POM C–O–C") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "POM C–O–C", requires: &[(925.0, 955.0)], forbids: &[(1695.0, 1775.0)] };
+    }
+    if g.starts_with("POM CH₂ rock") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "POM CH₂ rock", requires: &[(1080.0, 1120.0)], forbids: &[(1695.0, 1775.0)] };
+    }
+    if g.starts_with("Si–CH₃ symmetric") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "Si–CH₃", requires: &[(1000.0, 1105.0), (780.0, 820.0)], forbids: &[] };
+    }
+    if g.starts_with("Si–CH₃ rock") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "Si–CH₃ rock", requires: &[(1248.0, 1278.0), (1000.0, 1105.0)], forbids: &[] };
+    }
+    if g.starts_with("Si–O–Si") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "Si–O–Si", requires: &[(1248.0, 1278.0)], forbids: &[] };
+    }
+    if g.starts_with("PVDF β-phase (piezo") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PVDF β-phase", requires: &[(1140.0, 1225.0), (1265.0, 1290.0)], forbids: &[] };
+    }
+    if g.starts_with("PVDF β-phase CF₂") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PVDF β CF₂", requires: &[(830.0, 850.0), (1140.0, 1225.0)], forbids: &[] };
+    }
+    if g.starts_with("PVDF α-phase") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PVDF α-phase", requires: &[(1140.0, 1225.0), (965.0, 990.0)], forbids: &[] };
+    }
+    if g.starts_with("Graphene Oxide (GO) C=O") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "GO C=O", requires: &[(3200.0, 3560.0), (1605.0, 1638.0), (1035.0, 1068.0)], forbids: &[] };
+    }
+    if g.starts_with("Graphene Oxide") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "GO", requires: &[(3200.0, 3560.0), (1715.0, 1745.0)], forbids: &[] };
+    }
+    if g.starts_with("PHEMA") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PHEMA", requires: &[(3250.0, 3550.0), (1710.0, 1740.0), (1060.0, 1105.0)], forbids: &[] };
+    }
+    if g.starts_with("PHB ") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PHB ester", requires: &[(1715.0, 1735.0), (1215.0, 1240.0), (1270.0, 1295.0)], forbids: &[] };
+    }
+    if g.starts_with("Silica (SiO₂)") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "SiO₂", requires: &[(1055.0, 1135.0), (785.0, 820.0)], forbids: &[] };
+    }
+    if g.starts_with("Montmorillonite") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "MMT clay", requires: &[(3610.0, 3645.0), (1020.0, 1060.0)], forbids: &[] };
+    }
+    if g.starts_with("Polyaniline") || g.starts_with("PANI ") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PANI ring", requires: &[(1570.0, 1605.0), (1485.0, 1515.0)], forbids: &[] };
+    }
+    if g.starts_with("PBT/PET p-Ar") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "p-Ar OOP", requires: &[(1700.0, 1730.0), (1235.0, 1280.0), (718.0, 738.0)], forbids: &[] };
+    }
+    if g.starts_with("PA6 ") || g.starts_with("PNIPAM ") || g.starts_with("Nylon ") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "Amide (PA/PNIPAM)", requires: &[(1628.0, 1665.0), (1525.0, 1565.0), (3250.0, 3420.0)], forbids: &[] };
+    }
+    if g.starts_with("PEEK ") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PEEK", requires: &[(1645.0, 1665.0), (1220.0, 1255.0), (1480.0, 1605.0)], forbids: &[] };
+    }
+    if g.starts_with("PVP ") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PVP lactam", requires: &[(1655.0, 1685.0), (1270.0, 1300.0)], forbids: &[] };
+    }
+    if g.starts_with("PVA ") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PVA", requires: &[(3200.0, 3520.0), (1080.0, 1120.0)], forbids: &[(1700.0, 1765.0)] };
+    }
+    if g.starts_with("Chitosan") || g.starts_with("Cellulose") || g.starts_with("β-glycosidic") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "Polysaccharide", requires: &[(1020.0, 1080.0), (3200.0, 3550.0), (885.0, 908.0)], forbids: &[] };
+    }
+    if g.starts_with("Maleimide") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "Maleimide", requires: &[(1702.0, 1722.0), (688.0, 704.0)], forbids: &[] };
+    }
+    if g.starts_with("Free Urethane") || g.starts_with("H-bonded Urethane") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "Urethane C=O", requires: &[(3280.0, 3465.0), (1515.0, 1565.0)], forbids: &[] };
+    }
+    if g.starts_with("Free N–H") || g.starts_with("H-bonded N–H") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "ν(N–H)", requires: &[(1515.0, 1570.0)], forbids: &[] };
+    }
+    if g.starts_with("PE crystalline") || g.starts_with("LDPE ") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "PE CH₂", requires: &[(2905.0, 2935.0), (2840.0, 2865.0), (715.0, 735.0)], forbids: &[(1680.0, 1775.0)] };
+    }
+    if g.starts_with("ABS") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "ABS/SAN", requires: &[(2230.0, 2255.0), (690.0, 710.0)], forbids: &[] };
+    }
+    if g.starts_with("PBT ") || g.starts_with("PAA ") || g.starts_with("PBA ") || g.starts_with("PLGA")
+        || g.starts_with("PBD ") || g.starts_with("Polyisoprene") || g.starts_with("Cured epoxy")
+        || g.starts_with("Epoxy oxirane") || g.starts_with("TiO₂") || g.starts_with("ZnO")
+        || g.starts_with("Thiocarbonylthio") || g.starts_with("Aliphatic C–Br") || g.starts_with("Azide ")
+    {
+        let short = g.split('(').next().unwrap_or(g).trim();
+        return FtirBandRule { tier: BandTier::Specific, short_label: short, requires: &[], forbids: &[] };
+    }
+
+    // --- Universal functional-group bands (Generic tier) ---
+    if g.starts_with("–(CH₂)_n–") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "ρ(CH₂) rock", requires: &[(2840.0, 2945.0)], forbids: &[] };
+    }
+    if g.starts_with("CH₂ scissor") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "δ(CH₂/CH₃)", requires: &[(2835.0, 3005.0)], forbids: &[] };
+    }
+    if g.starts_with("CH₃ symmetric") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "δ_s(CH₃)", requires: &[(2940.0, 3005.0)], forbids: &[] };
+    }
+    if g.starts_with("C=O (ester / methacrylate") || g.starts_with("C=O (saturated aliphatic ester)") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "C=O (ester)", requires: &[(1120.0, 1320.0)], forbids: &[] };
+    }
+    if g.starts_with("C=O (Amide I)") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "Amide I C=O", requires: &[(1515.0, 1575.0)], forbids: &[] };
+    }
+    if g.starts_with("N–H bend + C–N (Amide II)") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "Amide II", requires: &[(1625.0, 1685.0)], forbids: &[] };
+    }
+    if g.starts_with("C=C (vinyl / acrylate") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "C=C (vinyl)", requires: &[(800.0, 995.0)], forbids: &[] };
+    }
+    if g.starts_with("C–O (α,β-unsaturated ester") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "C–O (conj. ester)", requires: &[(1700.0, 1745.0), (1615.0, 1660.0)], forbids: &[] };
+    }
+    if g.starts_with("C–O (ester / aryl ether") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "C–O (ester)", requires: &[(1700.0, 1785.0)], forbids: &[] };
+    }
+    if g.starts_with("C–O–C (ester / aliphatic ether)") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "C–O–C (ester)", requires: &[(1700.0, 1785.0)], forbids: &[] };
+    }
+    if g.starts_with("C–O–C (aliphatic ether") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "C–O–C (ether)", requires: &[], forbids: &[] };
+    }
+    if g.starts_with("Epoxide oxirane ring / =CH₂ wag") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "=CH₂ wag / epoxide", requires: &[(1620.0, 1660.0)], forbids: &[] };
+    }
+    if g.starts_with("=CH₂ twist") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "=CH₂ twist", requires: &[(1620.0, 1660.0)], forbids: &[] };
+    }
+    if g.starts_with("C–H (CH₃ asym") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "ν_as(CH₃)", requires: &[(1360.0, 1480.0)], forbids: &[] };
+    }
+    if g.starts_with("C–H (CH₂ asym") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "ν_as(CH₂)", requires: &[(1430.0, 1480.0)], forbids: &[] };
+    }
+    if g.starts_with("C–H (CH₃ sym") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "ν_s(CH₃)", requires: &[(2940.0, 3000.0)], forbids: &[] };
+    }
+    if g.starts_with("C–H (CH₂ sym") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "ν_s(CH₂)", requires: &[(2900.0, 2948.0)], forbids: &[] };
+    }
+    if g.starts_with("Mono-substituted phenyl") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "Ar ring bend", requires: &[(735.0, 775.0), (1480.0, 1615.0)], forbids: &[] };
+    }
+    if g.starts_with("Mono-/ortho-Aromatic") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "γ(Ar–H) OOP", requires: &[(1480.0, 1615.0)], forbids: &[] };
+    }
+    if g.starts_with("CO₂ (atmospheric") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "CO₂ (atm)", requires: &[], forbids: &[] };
+    }
+
+    let short = g.split('(').next().unwrap_or(g).trim();
+    let short_label = if short.is_empty() || short == "–" { g } else { short };
+    FtirBandRule { tier: BandTier::Generic, short_label, requires: &[], forbids: &[] }
+}
+
+pub fn match_ftir_with_context(wn: f64, spectrum_peaks: &[f64]) -> Vec<ScoredFtirBand> {
+    let has_peak = |lo: f64, hi: f64| spectrum_peaks.iter().any(|&p| p >= lo && p <= hi);
+    let mut exact: Vec<ScoredFtirBand> = FTIR_DB
         .iter()
         .filter(|b| wn >= b.min && wn <= b.max)
+        .map(|b| {
+            let rule = ftir_band_rule(b);
+            let width = (b.max - b.min).max(10.0);
+            let center_dist = (wn - 0.5 * (b.min + b.max)).abs() / (0.5 * width);
+            let base = center_dist + 0.0012 * width;
+
+            let (confirmed, score) = if !spectrum_peaks.is_empty() {
+                match rule.tier {
+                    BandTier::Specific => {
+                        let forb_hit = rule.forbids.iter().any(|&(lo, hi)| has_peak(lo, hi));
+                        let all_req = !rule.requires.is_empty()
+                            && rule.requires.iter().all(|&(lo, hi)| has_peak(lo, hi));
+                        if !forb_hit && all_req {
+                            (true, base - 0.45)
+                        } else {
+                            (false, base + 2.50)
+                        }
+                    }
+                    BandTier::Generic => {
+                        let n_supp = rule
+                            .requires
+                            .iter()
+                            .filter(|&&(lo, hi)| has_peak(lo, hi))
+                            .count();
+                        (true, base - 0.30 * (n_supp as f64))
+                    }
+                }
+            } else {
+                // Context-free lookup: slightly prefer universal functional groups
+                match rule.tier {
+                    BandTier::Generic => (true, base),
+                    BandTier::Specific => (false, base + 0.35),
+                }
+            };
+
+            ScoredFtirBand {
+                band: b,
+                short_label: rule.short_label,
+                tier: rule.tier,
+                confirmed,
+                score,
+            }
+        })
         .collect();
-    exact.sort_by(|a, b| {
-        // Normalized distance from band centre plus a width penalty: narrow,
-        // specific diagnostic bands always outrank broad umbrella absorptions.
-        let width_a = (a.max - a.min).max(10.0);
-        let width_b = (b.max - b.min).max(10.0);
-        let score_a = (wn - 0.5 * (a.min + a.max)).abs() / (0.5 * width_a) + 0.003 * width_a;
-        let score_b = (wn - 0.5 * (b.min + b.max)).abs() / (0.5 * width_b) + 0.003 * width_b;
-        score_a.total_cmp(&score_b)
-    });
+
+    exact.sort_by(|a, b| a.score.total_cmp(&b.score));
     if !exact.is_empty() {
         return exact;
     }
+
     // Nearest within ±45 cm⁻¹
-    let mut near: Vec<(&'static FtirBand, f64)> = FTIR_DB
+    let mut near: Vec<(ScoredFtirBand, f64)> = FTIR_DB
         .iter()
         .filter_map(|b| {
             let d = if wn < b.min { b.min - wn } else { wn - b.max };
-            if d <= 45.0 { Some((b, d)) } else { None }
+            if d <= 45.0 {
+                let rule = ftir_band_rule(b);
+                let penalty = if rule.tier == BandTier::Specific { 15.0 } else { 0.0 };
+                Some((
+                    ScoredFtirBand {
+                        band: b,
+                        short_label: rule.short_label,
+                        tier: rule.tier,
+                        confirmed: rule.tier == BandTier::Generic,
+                        score: d + penalty,
+                    },
+                    d + penalty,
+                ))
+            } else {
+                None
+            }
         })
         .collect();
     near.sort_by(|a, b| a.1.total_cmp(&b.1));
-    near.into_iter().take(3).map(|(b, _)| b).collect()
+    near.into_iter().take(3).map(|(s, _)| s).collect()
+}
+
+pub fn match_ftir(wn: f64) -> Vec<&'static FtirBand> {
+    match_ftir_with_context(wn, &[])
+        .into_iter()
+        .map(|s| s.band)
+        .collect()
 }
 
 pub fn match_hnmr(ppm: f64) -> Vec<&'static NmrBand> {
@@ -1414,7 +1690,7 @@ pub fn match_polymers(kind: SpectrumKind, x: f64) -> Vec<(&'static PolymerRef, f
         let mut best: Option<(f64, &'static str)> = None;
         for &(px, desc) in peaks {
             let d = (x - px).abs();
-            if d <= tol && best.map_or(true, |(bd, _)| d < bd) {
+            if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, desc));
             }
         }
@@ -1464,10 +1740,6 @@ pub fn spectral_zone_name(kind: SpectrumKind, x: f64) -> &'static str {
     }
 }
 
-pub fn best_short_peak_label(kind: SpectrumKind, x: f64) -> String {
-    best_short_peak_label_with_solvent(kind, x, SolventId::Cdcl3)
-}
-
 fn silicone_grease_shift(solvent: SolventId, is_carbon: bool) -> Option<f64> {
     SOLVENT_IMPURITIES
         .iter()
@@ -1481,6 +1753,35 @@ fn silicone_grease_shift(solvent: SolventId, is_carbon: bool) -> Option<f64> {
         })
 }
 
+pub fn best_peak_label_in_context(
+    kind: SpectrumKind,
+    x: f64,
+    spectrum_peaks: &[f64],
+    solvent: SolventId,
+) -> String {
+    match kind {
+        SpectrumKind::Ftir => {
+            if let Some(hit) = match_ftir_with_context(x, spectrum_peaks).first() {
+                let label = if hit.short_label == "=CH₂ wag / epoxide" {
+                    if spectrum_peaks.iter().any(|&p| (1618.0..=1662.0).contains(&p)) {
+                        "=CH₂ wag"
+                    } else {
+                        "Epoxide / =CH₂"
+                    }
+                } else {
+                    hit.short_label
+                };
+                format!("{:.0} {}", x, label)
+            } else {
+                format!("{:.0}", x)
+            }
+        }
+        SpectrumKind::Hnmr | SpectrumKind::Cnmr | SpectrumKind::UvVis => {
+            best_short_peak_label_with_solvent(kind, x, solvent)
+        }
+    }
+}
+
 /// Short peak label that recognizes the active NMR solvent and the most
 /// common trace impurities before falling back to functional-group assignment.
 pub fn best_short_peak_label_with_solvent(
@@ -1489,14 +1790,7 @@ pub fn best_short_peak_label_with_solvent(
     solvent: SolventId,
 ) -> String {
     match kind {
-        SpectrumKind::Ftir => {
-            if let Some(b) = match_ftir(x).first() {
-                let short = b.group.split('(').next().unwrap_or(b.group).trim();
-                format!("{:.0} {}", x, short)
-            } else {
-                format!("{:.0}", x)
-            }
-        }
+        SpectrumKind::Ftir => best_peak_label_in_context(SpectrumKind::Ftir, x, &[], solvent),
         SpectrumKind::Hnmr | SpectrumKind::Cnmr => {
             let is_carbon = kind == SpectrumKind::Cnmr;
             let (decimals, tol) = if is_carbon { (1usize, 0.55) } else { (2usize, 0.035) };
@@ -1556,9 +1850,19 @@ fn lorentz(x: f64, x0: f64, h: f64, gamma: f64) -> f64 {
     h / (1.0 + d * d)
 }
 
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 fn pseudo_noise(i: usize, amp: f64) -> f64 {
-    let v = ((i as f64 * 12.9898).sin() * 43_758.5453).fract();
-    (v - 0.5) * 2.0 * amp
+    let h1 = splitmix64((i as u64).wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(1));
+    let h2 = splitmix64(h1.wrapping_add(0x94D0_49BB_1331_11EB));
+    let u1 = ((h1 >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)) - 0.5;
+    let u2 = ((h2 >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)) - 0.5;
+    (u1 + u2) * amp
 }
 
 fn synth_ftir(
@@ -1596,6 +1900,7 @@ fn synth_ftir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synth_nmr(
     name: &str,
     kind: SpectrumKind,
