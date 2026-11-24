@@ -137,8 +137,13 @@ fn smooth_and_deriv_finite(vals: &[f64], smooth: SmoothLevel) -> (Vec<f64>, Vec<
                 let y0 = seg[last_good];
                 let y1 = seg[i];
                 let span = (i - last_good) as f64;
-                for k in (last_good + 1)..i {
-                    seg[k] = y0 + (y1 - y0) * ((k - last_good) as f64 / span);
+                for (k, slot) in seg
+                    .iter_mut()
+                    .enumerate()
+                    .take(i)
+                    .skip(last_good + 1)
+                {
+                    *slot = y0 + (y1 - y0) * ((k - last_good) as f64 / span);
                 }
             }
             last_good = i;
@@ -427,8 +432,8 @@ fn read_f32_vec(data: &[u8], pos: &mut usize, len: usize) -> Option<Vec<f32>> {
     let slice = data.get(*pos..end)?;
     *pos = end;
     let mut out = Vec::with_capacity(len);
-    for chunk in slice.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in slice.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Some(out)
 }
@@ -625,7 +630,7 @@ fn score_ftir_pair(
 
     for i in 0..n {
         let x = g[i];
-        if x >= CO2_LO && x <= CO2_HI {
+        if (CO2_LO..=CO2_HI).contains(&x) {
             continue;
         }
         let qv = q_val[i];

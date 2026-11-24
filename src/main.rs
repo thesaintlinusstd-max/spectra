@@ -229,7 +229,12 @@ fn install_panic_hook() {
         let _ = disable_raw_mode();
         let mut stdout = stdio::stdout();
         kitty_plot::clear_kitty_image(&mut stdout);
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         orig(info);
     }));
 }
@@ -257,13 +262,14 @@ fn print_help() {
     println!(
         "SPECTRA {} — FTIR & NMR Spectroscopy Explorer & Polymer Chemistry Toolkit\n\n\
          USAGE:\n  \
-           spectra [FILES...] [--mode ftir|hnmr|cnmr]\n  \
-           spectra [ftir|nmr|cnmr] [QUERY...]     (e.g. spectra ftir butane)\n  \
+           spectra [FILES...] [--mode ftir|hnmr|cnmr|uvvis]\n  \
+           spectra [ftir|nmr|cnmr|uvvis] [QUERY...]     (e.g. spectra ftir butane)\n  \
            spectra init-samples [--dir samples]\n  \
            spectra fetch <nist|nmr|nmr-search|import|list|pack> [ARGS...]\n  \
-           spectra export <FILES...> -o <OUT.png|svg|pdf> [--style acs|rsc|everforest]\n                 \
-                   [--stacked] [--absorbance] [--baseline] [--smooth 0|5|9|15]\n                 \
-                   [--title \"...\"] [--dpi 600]\n",
+           spectra export <FILES...> -o <OUT.svg|png|pdf> [--style acs|rsc|everforest]\n                 \
+                   [--stacked] [--absorbance] [--baseline (AsLS) | --rubberband]\n                 \
+                   [--smooth 0|5|9|15] [--title \"...\"] [--dpi 600]\n\n\
+         SVG figures are rendered natively in Rust; PNG/PDF use the Python helper.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -276,6 +282,7 @@ fn run_headless_export(
     stacked: bool,
     absorbance: bool,
     baseline: bool,
+    rubberband: bool,
     smooth: usize,
     title: String,
     dpi: u32,
@@ -295,8 +302,10 @@ fn run_headless_export(
         } else {
             YAxisPreference::Native
         },
-        baseline: if baseline {
+        baseline: if rubberband {
             BaselineMode::Rubberband
+        } else if baseline {
+            BaselineMode::Asls
         } else {
             BaselineMode::Off
         },
@@ -459,6 +468,7 @@ fn main() -> Result<()> {
         let mut stacked = false;
         let mut absorbance = false;
         let mut baseline = false;
+        let mut rubberband = false;
         let mut smooth: usize = 0;
         let mut title = String::new();
         let mut dpi: u32 = 600;
@@ -483,6 +493,7 @@ fn main() -> Result<()> {
                 "--stacked" => stacked = true,
                 "--absorbance" => absorbance = true,
                 "--baseline" => baseline = true,
+                "--rubberband" => rubberband = true,
                 "--smooth" => {
                     i += 1;
                     if i >= args.len() {
@@ -511,7 +522,7 @@ fn main() -> Result<()> {
         }
 
         return run_headless_export(
-            files, output, style, stacked, absorbance, baseline, smooth, title, dpi,
+            files, output, style, stacked, absorbance, baseline, rubberband, smooth, title, dpi,
         );
     }
 
@@ -551,8 +562,8 @@ mod tests {
     use super::*;
     use crate::data::{
         match_ftir, match_solvent_impurities, match_uvvis, mma_monomer_spectrum,
-        pmma_polymer_spectrum, polystyrene_ftir_spectrum, SolventId, SpectrumKind, Spectrum,
-        YUnit,
+        pmma_polymer_spectrum, polystyrene_ftir_spectrum, DemoPreset, SolventId,
+        SpectrumKind, Spectrum, YUnit,
     };
     use crate::io::{encode_jcamp_difdup, parse_delimited, parse_jcamp_dx};
     use crate::processing::{
@@ -1025,7 +1036,6 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/demo").join(name),
             display: format!("  {name}"),
             is_dir,
-            is_image: false,
         };
         let entries = vec![
             mk("../ (parent directory)", true),
@@ -1075,8 +1085,68 @@ mod tests {
     }
 
     #[test]
-    fn test_version_is_0_5() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.1");
+    fn test_version_is_0_6() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
+    }
+
+    #[test]
+    fn test_uvvis_key_a_and_baseline_cycle_and_pinned_y_refresh() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(vec![], Some(SpectrumKind::UvVis));
+        assert_eq!(app.processed[0].y_unit, YUnit::Absorbance);
+
+        let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(key_a);
+        assert_eq!(app.processed[0].y_unit, YUnit::Transmittance);
+
+        let key_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        app.handle_key(key_b);
+        assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Rubberband);
+        app.handle_key(key_b);
+        assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Asls);
+        app.handle_key(key_b);
+        assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Off);
+
+        // FTIR: pinned %T y-value must be refreshed to absorbance after [a].
+        let mut ftir = App::new(vec![], Some(SpectrumKind::Ftir));
+        ftir.load_demo(DemoPreset::MmaVsPmmaFtir);
+        ftir.cursor_x = 1722.0;
+        ftir.toggle_pin_at_cursor();
+        assert!(
+            ftir.pinned_peaks[0].y > 1.0,
+            "expected %T-scale pinned y > 1.0, got {}",
+            ftir.pinned_peaks[0].y
+        );
+        ftir.handle_key(key_a);
+        assert!(
+            ftir.pinned_peaks[0].y < 2.0,
+            "expected absorbance-scale refreshed pinned y < 2.0, got {}",
+            ftir.pinned_peaks[0].y
+        );
+    }
+
+    #[test]
+    fn test_dropped_image_opens_import_config() {
+        let tmp = std::env::temp_dir().join(format!(
+            "spectra-dropped-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let img = image::RgbaImage::from_pixel(80, 60, image::Rgba([255, 255, 255, 255]));
+        img.save(&tmp).expect("write tiny PNG");
+
+        let mut app = App::new(vec![], Some(SpectrumKind::UvVis));
+        app.handle_paste(&tmp.display().to_string());
+        assert!(
+            matches!(app.modal, crate::app::Modal::ImportConfig(ref st) if st.is_image),
+            "dropped PNG should open the ImportConfig image dialog"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -1304,9 +1374,9 @@ mod tests {
 
         let corr = crate::processing::asls_baseline(&raw, 1e6, 0.01, 10);
         let mut max_off_err = 0.0_f64;
-        for i in 0..n {
+        for (i, &c) in corr.iter().enumerate().take(n) {
             if (i as f64 - 300.0).abs() > 45.0 && (i as f64 - 700.0).abs() > 55.0 {
-                max_off_err = max_off_err.max(corr[i].abs());
+                max_off_err = max_off_err.max(c.abs());
             }
         }
         assert!(

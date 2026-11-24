@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 
 use crate::clipboard::{copy_png_file, copy_text};
 use crate::data::{
-    best_peak_label_in_context, best_short_peak_label_with_solvent, find_polymer_by_short,
+    best_peak_label_in_context, find_polymer_by_short,
     generate_demo_preset, match_cnmr, match_ftir, match_hnmr, match_solvent_impurities,
     match_uvvis, synthesize_polymer_reference, uvvis_color_info, DemoPreset, SolventId, Spectrum,
     SpectrumKind, YUnit, CNMR_DB, FTIR_DB, HNMR_DB, POLYMERS_DB, SOLVENT_IMPURITIES, UVVIS_DB,
@@ -98,7 +98,6 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub display: String,
     pub is_dir: bool,
-    pub is_image: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +130,7 @@ fn filter_rank(name: &str, tokens: &[&str]) -> Option<u8> {
     for token in tokens {
         let rank = if name.starts_with(token) {
             0
-        } else if words.iter().any(|w| *w == *token) {
+        } else if words.contains(token) {
             1
         } else if words.iter().any(|w| w.starts_with(token)) {
             2
@@ -493,6 +492,7 @@ pub struct App {
 
     // Cached layout geometry for accurate mouse interactions
     pub topbar_rect: Rect,
+    pub tab_hitboxes: Vec<(u16, u16, ActiveTab)>,
     pub plot_rect: Rect,
     pub drag_start_x: Option<f64>,
     pub drag_curr_x: Option<f64>,
@@ -606,6 +606,7 @@ impl App {
             pending: None,
             pending_export: None,
             topbar_rect: Rect::default(),
+            tab_hitboxes: Vec::new(),
             plot_rect: Rect::default(),
             drag_start_x: None,
             drag_curr_x: None,
@@ -704,6 +705,11 @@ impl App {
                     }
                 }
             }
+            for p in &mut self.pinned_peaks {
+                if let Some(new_y) = interpolate_y(&proc_t.x, &proc_t.y, p.x) {
+                    p.y = new_y;
+                }
+            }
         }
         if self.selected_peak >= self.auto_peaks.len() {
             self.selected_peak = 0;
@@ -780,6 +786,10 @@ impl App {
         label: impl Into<String>,
         work: impl FnOnce() -> TaskOutcome + Send + 'static,
     ) {
+        if self.pending.is_some() {
+            self.status_msg = "A background task is still running — please wait…".into();
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(work());
@@ -1174,6 +1184,18 @@ impl App {
             }
         }
 
+        if files.len() == 1 {
+            if let Some(ext) = files[0].extension().and_then(|s| s.to_str()) {
+                if matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff"
+                ) {
+                    self.modal = Self::import_state_for(files[0].clone(), false);
+                    return;
+                }
+            }
+        }
+
         // Dropping a file that is already open should focus it, not reload it.
         if files.len() == 1 {
             let target = files[0].as_path();
@@ -1308,7 +1330,8 @@ impl App {
             .get(self.active_trace)
             .and_then(|pt| interpolate_y(&pt.x, &pt.y, self.cursor_x))
             .unwrap_or(0.0);
-        let label = best_short_peak_label_with_solvent(kind, self.cursor_x, self.nmr_solvent);
+        let peak_xs: Vec<f64> = self.auto_peaks.iter().map(|p| p.x).collect();
+        let label = best_peak_label_in_context(kind, self.cursor_x, &peak_xs, self.nmr_solvent);
         self.pinned_peaks.push(Peak {
             x: self.cursor_x,
             y,
@@ -1316,7 +1339,6 @@ impl App {
             fwhm: None,
             snr: 0.0,
             label: label.clone(),
-            pinned: true,
         });
         if kind.is_x_reversed() {
             self.pinned_peaks.sort_by(|a, b| b.x.total_cmp(&a.x));
@@ -1530,7 +1552,10 @@ impl App {
     }
 
     pub fn compute_live_conversion(&self) -> Option<ConversionResult> {
-        if self.traces.len() < 2 {
+        if self.traces.len() < 2
+            || self.traces[0].kind != SpectrumKind::Ftir
+            || self.traces[1].kind != SpectrumKind::Ftir
+        {
             return None;
         }
         let rxn_c: f64 = self.polymer_lab.rxn_center.parse().ok()?;
@@ -1571,9 +1596,12 @@ impl App {
     /// Baseline-corrected maximum absorbance within `center ± half` on the active trace.
     fn pull_peak_absorbance(&self, center: f64, half: f64) -> Option<f64> {
         let spec = self.traces.get(self.active_trace)?;
+        if spec.kind != SpectrumKind::Ftir {
+            return None;
+        }
         let cfg = ProcessConfig {
             y_pref: YAxisPreference::Swapped,
-            baseline: BaselineMode::Rubberband,
+            baseline: BaselineMode::Asls,
             smooth: SmoothLevel::Off,
             normalize: false,
         };
@@ -1665,6 +1693,7 @@ impl App {
 
         let mut traces_out = Vec::new();
         let mut y_unit = YUnit::Transmittance;
+        let mut exported_active = 0usize;
         for (idx, spec) in self.traces.iter().enumerate() {
             if !spec.visible {
                 continue;
@@ -1672,6 +1701,9 @@ impl App {
             if let Some(pt) = self.processed.get(idx) {
                 if traces_out.is_empty() {
                     y_unit = pt.y_unit;
+                }
+                if idx == self.active_trace {
+                    exported_active = traces_out.len();
                 }
                 traces_out.push(ExportTrace {
                     name: spec.name.clone(),
@@ -1745,7 +1777,7 @@ impl App {
             dpi: 600,
             title: state.title.clone(),
             x_bounds: bounds,
-            active_trace: self.active_trace.min(traces_out.len().saturating_sub(1)),
+            active_trace: exported_active.min(traces_out.len().saturating_sub(1)),
             traces: traces_out,
             peaks: peaks_out,
         };
@@ -1907,20 +1939,29 @@ impl App {
                 self.status_msg = "Reset zoom to full spectrum".into();
             }
             KeyCode::Char('a') => {
-                if self.current_kind() == SpectrumKind::Ftir {
+                if matches!(
+                    self.current_kind(),
+                    SpectrumKind::Ftir | SpectrumKind::UvVis
+                ) {
                     self.process_cfg.y_pref = match self.process_cfg.y_pref {
                         YAxisPreference::Native => YAxisPreference::Swapped,
                         YAxisPreference::Swapped => YAxisPreference::Native,
                     };
                     self.recompute_processing();
-                    self.status_msg = format!(
-                        "FTIR Y-Axis: {}",
-                        if self.process_cfg.y_pref == YAxisPreference::Swapped {
-                            "Absorbance (A)"
-                        } else {
-                            "Transmittance (%T)"
+                    self.status_msg = match (self.current_kind(), self.process_cfg.y_pref) {
+                        (SpectrumKind::Ftir, YAxisPreference::Swapped) => {
+                            "FTIR Y-Axis: Absorbance (A)".into()
                         }
-                    );
+                        (SpectrumKind::Ftir, YAxisPreference::Native) => {
+                            "FTIR Y-Axis: Transmittance (%T)".into()
+                        }
+                        (_, YAxisPreference::Swapped) => {
+                            "UV-Vis Y-Axis: Transmittance (%T)".into()
+                        }
+                        (_, YAxisPreference::Native) => {
+                            "UV-Vis Y-Axis: Absorbance (A)".into()
+                        }
+                    };
                 }
             }
             KeyCode::Char('b') => {
@@ -2951,9 +2992,7 @@ impl App {
                     }
                     KeyCode::Char('a') => {
                         let all_checked = st.checks.iter().all(|&c| c);
-                        for c in &mut st.checks {
-                            *c = !all_checked;
-                        }
+                        st.checks.fill(!all_checked);
                         st.feedback = None;
                         self.modal = Modal::LibrarySetup(st);
                     }
@@ -2978,15 +3017,10 @@ impl App {
                             self.modal = Modal::LibrarySetup(st);
                             return;
                         }
-                        // Launch background download task
+                        // `start_task` already opens the Busy modal.
                         self.start_task("Downloading open reference libraries…", move || {
                             let result = crate::export::run_library_downloads(&selected);
                             TaskOutcome::LibraryDownload(result.map_err(|e| e.to_string()))
-                        });
-                        // Show busy modal immediately; feedback will update when task completes
-                        self.modal = Modal::Busy(BusyState {
-                            label: "Downloading open reference libraries…".into(),
-                            started: Instant::now(),
                         });
                     }
                     _ => {
@@ -3019,24 +3053,13 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && row == self.topbar_rect.y
         {
-            // Tab strip starts after " ✦ SPECTRA vX.Y · FTIR · NMR · UV-Vis ".
-            if col >= 38 && col < 44 {
-                self.switch_tab(ActiveTab::Ftir);
-                return;
-            } else if col >= 45 && col < 53 {
-                self.switch_tab(ActiveTab::Hnmr);
-                return;
-            } else if col >= 54 && col < 63 {
-                self.switch_tab(ActiveTab::Cnmr);
-                return;
-            } else if col >= 64 && col < 72 {
-                self.switch_tab(ActiveTab::UvVis);
-                return;
-            } else if col >= 73 && col < 83 {
-                self.switch_tab(ActiveTab::Solvents);
-                return;
-            } else if col >= 84 && col < 97 {
-                self.switch_tab(ActiveTab::PolymerLab);
+            // Tab strip shown by `draw_topbar`; hitboxes are computed there.
+            if let Some(&(_, _, tab)) = self
+                .tab_hitboxes
+                .iter()
+                .find(|&&(x0, x1, _)| col >= x0 && col < x1)
+            {
+                self.switch_tab(tab);
                 return;
             }
         }
@@ -3084,10 +3107,15 @@ impl App {
                         self.view_x_min = x1.min(x2);
                         self.view_x_max = x1.max(x2);
                         self.cursor_x = 0.5 * (x1 + x2);
+                        let (left_lbl, right_lbl) = if self.current_kind().is_x_reversed() {
+                            (self.view_x_max, self.view_x_min)
+                        } else {
+                            (self.view_x_min, self.view_x_max)
+                        };
                         self.status_msg = format!(
                             "Zoomed: {:.1} – {:.1} {}",
-                            self.view_x_max,
-                            self.view_x_min,
+                            left_lbl,
+                            right_lbl,
                             self.current_kind().x_unit()
                         );
                     }
@@ -3117,7 +3145,6 @@ fn scan_directory(dir: &Path) -> Vec<FileEntry> {
             path: parent.to_path_buf(),
             display: "../ (parent directory)".into(),
             is_dir: true,
-            is_image: false,
         });
     }
     if let Ok(rd) = fs::read_dir(dir) {
@@ -3142,7 +3169,6 @@ fn scan_directory(dir: &Path) -> Vec<FileEntry> {
                     path,
                     display: format!("📁 {}/", name),
                     is_dir: true,
-                    is_image: false,
                 });
             } else {
                 let ext = path
@@ -3155,14 +3181,12 @@ fn scan_directory(dir: &Path) -> Vec<FileEntry> {
                         path,
                         display: format!("📈 {}", name),
                         is_dir: false,
-                        is_image: false,
                     });
                 } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff") {
                     files.push(FileEntry {
                         path,
                         display: format!("🖼 {}", name),
                         is_dir: false,
-                        is_image: true,
                     });
                 }
             }
