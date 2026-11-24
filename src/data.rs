@@ -1690,7 +1690,7 @@ pub fn match_polymers(kind: SpectrumKind, x: f64) -> Vec<(&'static PolymerRef, f
         let mut best: Option<(f64, &'static str)> = None;
         for &(px, desc) in peaks {
             let d = (x - px).abs();
-            if d <= tol && best.map_or(true, |(bd, _)| d < bd) {
+            if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, desc));
             }
         }
@@ -1738,10 +1738,6 @@ pub fn spectral_zone_name(kind: SpectrumKind, x: f64) -> &'static str {
             else { "Near-Infrared / Polaron NIR (>750 nm)" }
         }
     }
-}
-
-pub fn best_short_peak_label(kind: SpectrumKind, x: f64) -> String {
-    best_short_peak_label_with_solvent(kind, x, SolventId::Cdcl3)
 }
 
 fn silicone_grease_shift(solvent: SolventId, is_carbon: bool) -> Option<f64> {
@@ -1904,6 +1900,7 @@ fn synth_ftir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synth_nmr(
     name: &str,
     kind: SpectrumKind,

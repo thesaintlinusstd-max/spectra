@@ -77,7 +77,7 @@ fn infer_kind(x_min: f64, x_max: f64, hint: Option<&str>) -> SpectrumKind {
     }
     if x_max > 1300.0 {
         SpectrumKind::Ftir
-    } else if x_min >= 100.0 && x_max >= 260.0 && x_max <= 1300.0 {
+    } else if x_min >= 100.0 && (260.0..=1300.0).contains(&x_max) {
         SpectrumKind::UvVis
     } else if x_max > 24.0 {
         SpectrumKind::Cnmr
@@ -525,11 +525,7 @@ pub fn parse_jcamp_dx(
                             }
                         }
                     }
-                    "END" => {
-                        if !xydata_lines.is_empty() || !xypoints_pairs.is_empty() {
-                            break;
-                        }
-                    }
+                    "END" if !xydata_lines.is_empty() || !xypoints_pairs.is_empty() => break,
                     _ => {}
                 }
             }
@@ -656,7 +652,7 @@ pub fn parse_jcamp_dx(
         } else {
             // Infrared spectrum in µm (e.g. 2.5..15 µm) -> cm⁻¹ = 10_000 / µm
             let mut converted = Vec::with_capacity(xs.len());
-            for (x, y) in xs.into_iter().zip(ys.into_iter()) {
+            for (x, y) in xs.into_iter().zip(ys) {
                 if x > 1e-6 {
                     converted.push((10_000.0 / x, y));
                 }
@@ -669,7 +665,7 @@ pub fn parse_jcamp_dx(
     } else if is_wavenumber && is_uv_hint {
         // UV-Vis stored in 1/cm -> nm = 1e7 / wn
         let mut converted = Vec::with_capacity(xs.len());
-        for (x, y) in xs.into_iter().zip(ys.into_iter()) {
+        for (x, y) in xs.into_iter().zip(ys) {
             if x > 1e-6 {
                 converted.push((1.0e7 / x, y));
             }
@@ -716,14 +712,9 @@ pub fn parse_jcamp_dx(
                 *v /= y_max;
             }
         }
-    } else if kind == SpectrumKind::UvVis && raw_y_unit == YUnit::Transmittance {
-        let y_max = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        if y_max <= 1.05 {
-            for v in &mut ys {
-                *v *= 100.0;
-            }
-        }
-    } else if kind == SpectrumKind::Ftir && raw_y_unit == YUnit::Transmittance {
+    } else if (kind == SpectrumKind::UvVis || kind == SpectrumKind::Ftir)
+        && raw_y_unit == YUnit::Transmittance
+    {
         let y_max = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         if y_max <= 1.05 {
             for v in &mut ys {
@@ -940,9 +931,7 @@ fn infer_file_kind(path: &Path, stem: &str) -> SpectrumKind {
         SpectrumKind::UvVis
     } else if carbon {
         SpectrumKind::Cnmr
-    } else if proton {
-        SpectrumKind::Hnmr
-    } else if dir.contains("nmr") {
+    } else if proton || dir.contains("nmr") {
         SpectrumKind::Hnmr
     } else {
         SpectrumKind::Ftir

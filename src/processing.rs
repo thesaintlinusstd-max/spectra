@@ -51,10 +51,6 @@ impl BaselineMode {
             Self::Asls => "AsLS",
         }
     }
-
-    pub fn is_on(self) -> bool {
-        !matches!(self, Self::Off)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,7 +97,6 @@ pub struct Peak {
     pub fwhm: Option<f64>,
     pub snr: f64,
     pub label: String,
-    pub pinned: bool,
 }
 
 pub fn transmittance_to_absorbance(pct_t: f64) -> f64 {
@@ -133,7 +128,7 @@ pub fn savitzky_golay(ys: &[f64], level: SmoothLevel) -> Vec<f64> {
     }
 
     let mut out = vec![0.0; n];
-    for i in 0..n {
+    for (i, slot) in out.iter_mut().enumerate() {
         let mut acc = 0.0;
         for (k, &w) in coeffs.iter().enumerate() {
             let offset = k as isize - half as isize;
@@ -147,7 +142,7 @@ pub fn savitzky_golay(ys: &[f64], level: SmoothLevel) -> Vec<f64> {
             let clamped = idx.clamp(0, (n - 1) as isize) as usize;
             acc += w * ys[clamped];
         }
-        out[i] = acc / norm;
+        *slot = acc / norm;
     }
     out
 }
@@ -162,7 +157,7 @@ pub fn savitzky_golay_deriv1(ys: &[f64]) -> Vec<f64> {
     }
     let half = 3isize;
     let mut out = vec![0.0; n];
-    for i in 0..n {
+    for (i, slot) in out.iter_mut().enumerate() {
         let mut acc = 0.0;
         for (k, &w) in COEFFS.iter().enumerate() {
             let mut idx = i as isize + (k as isize - half);
@@ -175,7 +170,7 @@ pub fn savitzky_golay_deriv1(ys: &[f64]) -> Vec<f64> {
             let c = idx.clamp(0, (n - 1) as isize) as usize;
             acc += w * ys[c];
         }
-        out[i] = acc / NORM;
+        *slot = acc / NORM;
     }
     out
 }
@@ -576,7 +571,6 @@ pub fn detect_peaks(
             fwhm,
             snr,
             label: String::new(),
-            pinned: false,
         });
         if chosen.len() >= max_peaks {
             break;
@@ -967,7 +961,7 @@ pub fn compute_tauc_band_gap(spec: &Spectrum, mode: TaucMode) -> Option<TaucResu
             continue;
         }
         let score = r2.powi(6) * (slope / (edge_max_tauc + 1e-12));
-        if best.map_or(true, |(bs, _, _, _, _, _)| score > bs) {
+        if best.is_none_or(|(bs, _, _, _, _, _)| score > bs) {
             best = Some((score, eg, r2, se[0], se[win - 1], slope));
         }
     }

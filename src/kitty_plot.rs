@@ -105,18 +105,20 @@ pub fn wavelength_to_rgb(nm: f64) -> (u8, u8, u8) {
     (conv(r), conv(g), conv(b))
 }
 
+#[derive(Default)]
 pub struct KittyPlotState {
     pub active_shown: bool,
     pub last_hash: u64,
     pub seq: u64,
+    pub prev_tmp: Option<PathBuf>,
 }
 
-impl Default for KittyPlotState {
-    fn default() -> Self {
-        Self {
-            active_shown: false,
-            last_hash: 0,
-            seq: 0,
+impl Drop for KittyPlotState {
+    fn drop(&mut self) {
+        if let Some(path) = self.prev_tmp.take() {
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
         }
     }
 }
@@ -224,7 +226,7 @@ struct PixelCanvas {
 impl PixelCanvas {
     fn new(w: usize, h: usize) -> Self {
         let mut buf = vec![0u8; w * h * 4];
-        for px in buf.chunks_exact_mut(4) {
+        for px in buf.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&BG_RGBA);
         }
         Self { w, h, buf }
@@ -275,6 +277,7 @@ impl PixelCanvas {
     }
 
     /// Smooth anti-aliased continuous line with optional subtle glow
+    #[allow(clippy::too_many_arguments)]
     fn draw_line_aa(&mut self, x0: f64, y0: f64, x1: f64, y1: f64, col: (u8, u8, u8), alpha: f32, thick: bool) {
         let dx = x1 - x0;
         let dy = y1 - y0;
@@ -373,6 +376,9 @@ fn compute_plot_hash(app: &App) -> u64 {
     for p in &app.pinned_peaks {
         p.x.to_bits().hash(&mut h);
     }
+    app.peak_threshold.to_bits().hash(&mut h);
+    app.auto_peaks.len().hash(&mut h);
+    (app.tab as u8).hash(&mut h);
     app.traces.len().hash(&mut h);
     for (i, t) in app.traces.iter().enumerate() {
         t.visible.hash(&mut h);
@@ -441,7 +447,7 @@ pub fn sync_hd_plot(
                 && app
                     .processed
                     .get(*idx)
-                    .map_or(false, |p| !p.x.is_empty())
+                    .is_some_and(|p| !p.x.is_empty())
         })
         .map(|(idx, _)| idx)
         .collect();
@@ -566,7 +572,7 @@ pub fn sync_hd_plot(
         let i0 = pt.x.partition_point(|&v| v < x_lo).saturating_sub(1);
         let i1 = (pt.x.partition_point(|&v| v <= x_hi) + 1).min(pt.x.len());
 
-        for k in i0..i1 {
+        let mut push_pt = |k: usize| {
             let px = (map_x(pt.x[k]).round() as usize).min(w - 1);
             let py = map_y(pt.y[k] + offset);
             match &mut bucket[px] {
@@ -576,6 +582,15 @@ pub fn sync_hd_plot(
                     if py > *mx { *mx = py; }
                     *last = py;
                 }
+            }
+        };
+        if kind.is_x_reversed() {
+            for k in (i0..i1).rev() {
+                push_pt(k);
+            }
+        } else {
+            for k in i0..i1 {
+                push_pt(k);
             }
         }
 
@@ -645,7 +660,7 @@ pub fn sync_hd_plot(
             let stagger = if attempt == 0 {
                 0
             } else {
-                let step = ((attempt + 1) / 2) as i32 * 18;
+                let step = ((attempt + 1) / 2) * 18;
                 let dir = if attempt % 2 == 1 { away } else { -away };
                 step * dir
             };
@@ -691,12 +706,16 @@ pub fn sync_hd_plot(
 
     // 7. Transmit via Kitty Graphics Protocol temp-file transport (auto-cleaned by Kitty!)
     state.seq = state.seq.wrapping_add(1);
+    if let Some(old) = state.prev_tmp.take() {
+        let _ = fs::remove_file(old);
+    }
     let tmp_path: PathBuf = env::temp_dir().join(format!(
         "spectra-tty-graphics-protocol-{}-{}.rgba",
         std::process::id(),
         state.seq
     ));
     fs::write(&tmp_path, &img.buf)?;
+    state.prev_tmp = Some(tmp_path.clone());
     let b64_path = base64_encode(tmp_path.to_string_lossy().as_bytes());
 
     write!(

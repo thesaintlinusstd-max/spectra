@@ -3,13 +3,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
-use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use crate::app::{ActiveTab, App, Modal, PolymerSubTab, MONOMER_PRESETS};
 use crate::data::{
-    match_cnmr, match_ftir, match_hnmr, match_polymers, match_solvent_impurities,
-    match_uvvis, photon_energy_ev, spectral_zone_name, uvvis_color_info, DemoPreset, SolventId, SpectrumKind, YUnit, SOLVENT_IMPURITIES,
+    match_cnmr, match_ftir_with_context, match_hnmr, match_polymers,
+    match_solvent_impurities, match_uvvis, photon_energy_ev, spectral_zone_name,
+    uvvis_color_info, BandTier, DemoPreset, SolventId, SpectrumKind, YUnit,
+    SOLVENT_IMPURITIES,
 };
 use crate::processing::interpolate_y;
 use crate::theme::*;
@@ -51,7 +53,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_topbar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_topbar(frame: &mut Frame, app: &mut App, area: Rect) {
     let version = env!("CARGO_PKG_VERSION");
     let short_version = {
         let mut it = version.split('.');
@@ -60,42 +62,72 @@ fn draw_topbar(frame: &mut Frame, app: &App, area: Rect) {
             _ => format!("v{}", version),
         }
     };
-    let left_spans = vec![
-        Span::styled(
-            format!(" ✦ SPECTRA {} ", short_version),
-            Style::default()
-                .fg(ACCENT_GREEN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("· FTIR · NMR · UV-Vis ", Style::default().fg(TEXT_MUTED)),
-        tab_span("1:FTIR", app.tab == ActiveTab::Ftir),
-        Span::raw(" "),
-        tab_span("2:¹H NMR", app.tab == ActiveTab::Hnmr),
-        Span::raw(" "),
-        tab_span("3:¹³C NMR", app.tab == ActiveTab::Cnmr),
-        Span::raw(" "),
-        tab_span("4:UV-Vis", app.tab == ActiveTab::UvVis),
-        Span::raw(" "),
-        tab_span("5:Solvents", app.tab == ActiveTab::Solvents),
-        Span::raw(" "),
-        tab_span("6:Polymer Lab", app.tab == ActiveTab::PolymerLab),
-    ];
+    let compact = area.width < 165;
 
-    let right_spans = vec![
-        key_badge("[f] Open", ACCENT_AQUA),
-        Span::raw(" "),
-        key_badge("[e] Export", ACCENT_AMBER),
-        Span::raw(" "),
-        key_badge("[/] Search", ACCENT_YELLOW),
-        Span::raw(" "),
-        key_badge("[?] Help", ACCENT_GREEN),
-        Span::raw(" "),
-        key_badge("[q] Quit", ACCENT_CORAL),
+    let prefix = format!(" ✦ SPECTRA {} ", short_version);
+    let mut cursor_col = area.x + prefix.chars().count() as u16;
+    let mut left_spans = vec![Span::styled(
+        prefix,
+        Style::default()
+            .fg(ACCENT_GREEN)
+            .add_modifier(Modifier::BOLD),
+    )];
+
+    if !compact {
+        let subtitle = "· FTIR · NMR · UV-Vis ";
+        cursor_col += subtitle.chars().count() as u16;
+        left_spans.push(Span::styled(subtitle, Style::default().fg(TEXT_MUTED)));
+    }
+
+    app.tab_hitboxes.clear();
+    let tabs = [
+        ("1:FTIR", ActiveTab::Ftir),
+        ("2:¹H NMR", ActiveTab::Hnmr),
+        ("3:¹³C NMR", ActiveTab::Cnmr),
+        ("4:UV-Vis", ActiveTab::UvVis),
+        ("5:Solvents", ActiveTab::Solvents),
+        ("6:Polymer Lab", ActiveTab::PolymerLab),
     ];
+    for (label, tab) in tabs {
+        left_spans.push(tab_span(label, app.tab == tab));
+        let width = label.chars().count() as u16 + 2;
+        app.tab_hitboxes.push((cursor_col, cursor_col + width, tab));
+        cursor_col += width + 1;
+        left_spans.push(Span::raw(" "));
+    }
+
+    let right_spans = if compact {
+        vec![
+            key_badge("[f]", ACCENT_AQUA),
+            Span::raw(" "),
+            key_badge("[e]", ACCENT_AMBER),
+            Span::raw(" "),
+            key_badge("[/]", ACCENT_YELLOW),
+            Span::raw(" "),
+            key_badge("[?]", ACCENT_GREEN),
+            Span::raw(" "),
+            key_badge("[q]", ACCENT_CORAL),
+        ]
+    } else {
+        vec![
+            key_badge("[f] Open", ACCENT_AQUA),
+            Span::raw(" "),
+            key_badge("[e] Export", ACCENT_AMBER),
+            Span::raw(" "),
+            key_badge("[/] Search", ACCENT_YELLOW),
+            Span::raw(" "),
+            key_badge("[?] Help", ACCENT_GREEN),
+            Span::raw(" "),
+            key_badge("[q] Quit", ACCENT_CORAL),
+        ]
+    };
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(60)])
+        .constraints([
+            Constraint::Min(40),
+            Constraint::Length(if compact { 28 } else { 60 }),
+        ])
         .split(area);
 
     frame.render_widget(Paragraph::new(TextLine::from(left_spans)), cols[0]);
@@ -235,7 +267,7 @@ fn draw_spectrum_canvas(frame: &mut Frame, app: &mut App, area: Rect) {
         .traces
         .iter()
         .enumerate()
-        .filter(|(idx, t)| t.visible && app.processed.get(*idx).map_or(false, |p| !p.x.is_empty()))
+        .filter(|(idx, t)| t.visible && app.processed.get(*idx).is_some_and(|p| !p.x.is_empty()))
         .map(|(idx, _)| idx)
         .collect();
 
@@ -284,7 +316,7 @@ fn draw_spectrum_canvas(frame: &mut Frame, app: &mut App, area: Rect) {
         let i0 = pt.x.partition_point(|&v| v < x_lo).saturating_sub(1);
         let i1 = (pt.x.partition_point(|&v| v <= x_hi) + 1).min(pt.x.len());
 
-        for k in i0..i1 {
+        let mut push_pt = |k: usize| {
             let x = pt.x[k];
             let y = pt.y[k] + offset;
             let u = u_from_x(x);
@@ -297,6 +329,11 @@ fn draw_spectrum_canvas(frame: &mut Frame, app: &mut App, area: Rect) {
                     *last = y;
                 }
             }
+        };
+        if x_reversed {
+            for k in (i0..i1).rev() { push_pt(k); }
+        } else {
+            for k in i0..i1 { push_pt(k); }
         }
 
         let mut prev: Option<(f64, f64)> = None;
@@ -505,6 +542,7 @@ fn draw_spectrum_canvas(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &App, area: Rect) {
+    let kind = app.current_kind();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
@@ -586,6 +624,12 @@ fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &App, area: Rect) {
     };
     for (i, pk) in app.auto_peaks.iter().enumerate().skip(start).take(avail) {
         let sel = i == app.selected_peak;
+        let meta = match pk.fwhm {
+            Some(w) if kind == SpectrumKind::Hnmr => format!("  (prom {:.0}% · FWHM {:.2})", pk.prominence * 100.0, w),
+            Some(w) if kind == SpectrumKind::Cnmr => format!("  (prom {:.0}% · FWHM {:.1})", pk.prominence * 100.0, w),
+            Some(w) => format!("  (prom {:.0}% · FWHM {:.0})", pk.prominence * 100.0, w),
+            None => format!("  (prom {:.0}% · SNR {:.0})", pk.prominence * 100.0, pk.snr.min(999.0)),
+        };
         p_lines.push(TextLine::from(vec![
             Span::styled(
                 if sel { " ▸ " } else { " · " },
@@ -596,7 +640,7 @@ fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(if sel { ACCENT_GREEN } else { TEXT_PRIMARY }),
             ),
             Span::styled(
-                format!("  (prom {:.0}%)", pk.prominence * 100.0),
+                meta,
                 Style::default().fg(TEXT_MUTED),
             ),
         ]));
@@ -729,18 +773,46 @@ fn draw_inspector(frame: &mut Frame, app: &App, area: Rect) {
 
     match kind {
         SpectrumKind::Ftir => {
-            let matches = match_ftir(app.cursor_x);
+            let peak_xs: Vec<f64> = app.auto_peaks.iter().map(|p| p.x).collect();
+            let matches = match_ftir_with_context(app.cursor_x, &peak_xs);
             if matches.is_empty() {
                 info.push(TextLine::from(Span::styled(
                     "  No primary band in immediate window.",
                     Style::default().fg(TEXT_MUTED),
                 )));
             } else {
-                for b in matches.iter().take(4) {
-                    info.push(TextLine::from(vec![
+                for hit in matches.iter().take(4) {
+                    let b = hit.band;
+                    let (group_style, suffix) = match (hit.tier, hit.confirmed) {
+                        (BandTier::Specific, true) => (
+                            Style::default().fg(TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+                            Some(Span::styled(
+                                " ✓ confirmed",
+                                Style::default()
+                                    .fg(ACCENT_GREEN)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                        ),
+                        (BandTier::Specific, false) => (
+                            Style::default().fg(TEXT_MUTED),
+                            Some(Span::styled(
+                                " (companion bands absent)",
+                                Style::default().fg(TEXT_MUTED),
+                            )),
+                        ),
+                        (BandTier::Generic, _) => (
+                            Style::default().fg(TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+                            None,
+                        ),
+                    };
+                    let mut title_spans = vec![
                         Span::styled("  ▸ ", Style::default().fg(ACCENT_AMBER)),
-                        Span::styled(b.group, Style::default().fg(TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
-                    ]));
+                        Span::styled(b.group, group_style),
+                    ];
+                    if let Some(suffix) = suffix {
+                        title_spans.push(suffix);
+                    }
+                    info.push(TextLine::from(title_spans));
                     info.push(TextLine::from(Span::styled(
                         format!("    {:.0}–{:.0} cm⁻¹ · {} · {}", b.min, b.max, b.intensity, b.mode),
                         Style::default().fg(ACCENT_YELLOW),
@@ -887,7 +959,8 @@ fn draw_inspector(frame: &mut Frame, app: &App, area: Rect) {
 // ============================================================================
 // TAB 4: FULMER 2010 NMR SOLVENTS & IMPURITIES EXPLORER
 // ============================================================================
-fn draw_solvents_tab(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_solvents_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    type ImpurityRow<'a> = (&'a str, &'a str, &'a str, f64, Option<f64>, &'a str);
     let outer = panel_block(
         "NMR Trace Impurities & Residual Solvents (Fulmer 2010 / Gottlieb 1997)",
         BORDER_LEFT,
@@ -951,7 +1024,7 @@ fn draw_solvents_tab(frame: &mut Frame, app: &App, area: Rect) {
     let q_low = q_trim.to_ascii_lowercase();
     let tol = st.tolerance();
 
-    let mut items: Vec<(&str, &str, &str, f64, Option<f64>, &str)> = Vec::new();
+    let mut items: Vec<ImpurityRow> = Vec::new();
     for imp in SOLVENT_IMPURITIES {
         let Some(shift) = (if st.is_carbon { imp.c_shifts[solv_idx] } else { imp.h_shifts[solv_idx] }) else {
             continue;
@@ -976,6 +1049,7 @@ fn draw_solvents_tab(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let sel = st.selected.min(items.len().saturating_sub(1));
+    app.solvents_tab.selected = sel;
     let table_rows: Vec<Row> = items
         .iter()
         .enumerate()
@@ -1018,7 +1092,8 @@ fn draw_solvents_tab(frame: &mut Frame, app: &App, area: Rect) {
     )
     .header(header);
 
-    frame.render_widget(table, rows[2]);
+    let mut state = TableState::default().with_selected(if items.is_empty() { None } else { Some(sel) });
+    frame.render_stateful_widget(table, rows[2], &mut state);
 }
 
 // ============================================================================
@@ -1465,8 +1540,13 @@ fn draw_polymer_lab_tab(frame: &mut Frame, app: &App, area: Rect) {
                 right.push(TextLine::from(""));
                 right.push(TextLine::from(Span::styled(
                     format!(
-                        "  Tauc band gap: {:.3} eV  (edge ≈ {:.0} nm, R² = {:.3})",
-                        tauc.band_gap_ev, tauc.edge_nm, tauc.r_squared
+                        "  Tauc ({}) band gap: {:.3} eV  (edge ≈ {:.0} nm, R² = {:.3}, fit {:.2}–{:.2} eV)",
+                        tauc.mode.label(),
+                        tauc.band_gap_ev,
+                        tauc.edge_nm,
+                        tauc.r_squared,
+                        tauc.fit_e_min,
+                        tauc.fit_e_max
                     ),
                     Style::default().fg(ACCENT_AMBER).add_modifier(Modifier::BOLD),
                 )));
@@ -1750,26 +1830,21 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                 .and_then(|s| s.to_str())
                 .unwrap_or("file");
 
-            let kind_labels: &[(&str, usize)] = &[
+            let kind_labels_row1: &[(&str, usize)] = &[
                 ("[1] FTIR %T", 0),
                 ("[2] FTIR Abs", 1),
                 ("[3] ¹H NMR", 2),
                 ("[4] ¹³C NMR", 3),
                 ("[5] Auto", 4),
+            ];
+            let kind_labels_row2: &[(&str, usize)] = &[
                 ("[6] UV-Vis Abs", 5),
                 ("[7] UV-Vis %T", 6),
             ];
 
-            let mut kind_spans = vec![
-                Span::styled(
-                    if st.field_idx == 0 { "  ▶ " } else { "    " },
-                    Style::default().fg(ACCENT_GREEN),
-                ),
-                Span::styled(format!("{:<16}", "Spectrum Type:"), Style::default().fg(TEXT_MUTED)),
-            ];
-            for &(lbl, idx) in kind_labels {
+            let pill_span = |lbl: &str, idx: usize| {
                 let sel = st.kind_choice == idx;
-                kind_spans.push(Span::styled(
+                Span::styled(
                     format!(" {} ", lbl),
                     if sel {
                         Style::default()
@@ -1779,8 +1854,25 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                     } else {
                         Style::default().fg(TEXT_PRIMARY).bg(SURFACE_ALT)
                     },
-                ));
-                kind_spans.push(Span::raw(" "));
+                )
+            };
+
+            let mut kind_spans_1 = vec![
+                Span::styled(
+                    if st.field_idx == 0 { "  ▶ " } else { "    " },
+                    Style::default().fg(ACCENT_GREEN),
+                ),
+                Span::styled(format!("{:<16}", "Spectrum Type:"), Style::default().fg(TEXT_MUTED)),
+            ];
+            for &(lbl, idx) in kind_labels_row1 {
+                kind_spans_1.push(pill_span(lbl, idx));
+                kind_spans_1.push(Span::raw(" "));
+            }
+
+            let mut kind_spans_2 = vec![Span::raw("                    ")];
+            for &(lbl, idx) in kind_labels_row2 {
+                kind_spans_2.push(pill_span(lbl, idx));
+                kind_spans_2.push(Span::raw(" "));
             }
 
             let row_line = |idx: usize, label: &str, val: String, editable: bool| -> TextLine {
@@ -1819,7 +1911,8 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                     ),
                 ]),
                 TextLine::from(""),
-                TextLine::from(kind_spans),
+                TextLine::from(kind_spans_1),
+                TextLine::from(kind_spans_2),
                 row_line(
                     1,
                     "Load Mode:",
@@ -1954,17 +2047,23 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
         Modal::LibraryMatch(st) => {
             let rect = centered_rect(86, 74, area);
             frame.render_widget(Clear, rect);
-            let is_uv = app.current_kind() == SpectrumKind::UvVis;
-            let (sub1, sub2) = if is_uv {
-                (
+            let (sub1, sub2) = match app.current_kind() {
+                SpectrumKind::UvVis => (
                     "  UV-Vis Hit Quality Index (HQI) — absorbance + derivative correlation",
-                    "  200–800 nm grid (2 nm step) · Built-in + library/uvvis/ references",
-                )
-            } else {
-                (
+                    "  200–800 nm · AsLS + SG deriv · Built-in + library/uvvis/ references",
+                ),
+                SpectrumKind::Hnmr => (
+                    "  ¹H NMR Peak-Overlap Matcher — solvent & H₂O masked",
+                    "  0–12 ppm · active solvent & H₂O masked · Built-in + library/nmr/ references",
+                ),
+                SpectrumKind::Cnmr => (
+                    "  ¹³C NMR Peak-Overlap Matcher — solvent masked",
+                    "  0–220 ppm · active solvent masked · Built-in + library/nmr/ references",
+                ),
+                SpectrumKind::Ftir => (
                     "  FTIR Hit Quality Index (HQI) — absorbance + derivative correlation",
-                    "  CO₂ purge region 2280–2410 cm⁻¹ excluded · 811-point grid 520–3760 cm⁻¹",
-                )
+                    "  520–3760 cm⁻¹ · AsLS + SG deriv + fingerprint (CO₂ 2280–2410 cm⁻¹ masked)",
+                ),
             };
             let mut lines = vec![
                 TextLine::from(Span::styled(sub1, Style::default().fg(ACCENT_AQUA))),
@@ -2396,8 +2495,8 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   ?                This guide — ↑/↓ or PgUp/PgDn scroll, Esc closes"),
         TextLine::from(""),
         section("  SIGNAL PROCESSING (SPECTRUM TABS)"),
-        TextLine::from("   a                FTIR %Transmittance ↔ Absorbance (Beer-Lambert)"),
-        TextLine::from("   b                Rubberband baseline correction"),
+        TextLine::from("   a                FTIR & UV-Vis: %Transmittance ↔ Absorbance (Beer-Lambert)"),
+        TextLine::from("   b                Baseline correction: OFF → Rubberband → AsLS"),
         TextLine::from("   m                Savitzky-Golay smoothing: OFF → 5 → 9 → 15 points"),
         TextLine::from("   w                Min-max normalization (helps when overlaying traces)"),
         TextLine::from("   s                Overlay ↔ stacked-offset layout"),
@@ -2440,12 +2539,13 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   /                Global search: files, library spectra, polymers,"),
         TextLine::from("                    solvents and tools in one place."),
         TextLine::from("   M                Library matcher: ranks references by Hit Quality"),
-        TextLine::from("                    Index (HQI). FTIR: 520–3760 cm⁻¹; UV-Vis: 200–800 nm."),
+        TextLine::from("                    Index (HQI) / peak-overlap on FTIR, ¹H/¹³C NMR & UV-Vis (cached)."),
         TextLine::from("                    Top 25 hits; Enter overlays the chosen one."),
         TextLine::from("   e                Publication export: ACS/RSC/Everforest, stacked or"),
-        TextLine::from("                    overlay, PNG/SVG/PDF up to 600 DPI (via Python)."),
+        TextLine::from("                    overlay; native Rust SVG export + PNG/PDF up to 600 DPI (Python)."),
         TextLine::from("                    UV-Vis export includes visible-light rainbow strip."),
-        TextLine::from("   Import image     Pick a PNG/JPG scan to digitize a printed spectrum:"),
+        TextLine::from("   Import image     Pick a PNG/JPG scan to digitize a printed spectrum"),
+        TextLine::from("                    (pure-Rust Viterbi tracer; no Python required):"),
         TextLine::from("                    set the X-axis bounds and background, then Enter."),
         TextLine::from("                    --kind uvvis for UV-Vis scans (ascending λ output)."),
         TextLine::from(""),

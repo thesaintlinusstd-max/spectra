@@ -279,6 +279,9 @@ def parse_jcamp_dx(text: str) -> tuple[np.ndarray, np.ndarray] | None:
     x_factor = 1.0           # ##XFACTOR scale multiplier
     y_factor = 1.0           # ##YFACTOR scale multiplier
     y_is_log_epsilon = False
+    first_x = None           # ##FIRSTX
+    last_x = None            # ##LASTX
+    delta_x = None           # ##DELTAX
 
     for line in lines:
         line = line.strip()
@@ -302,27 +305,56 @@ def parse_jcamp_dx(text: str) -> tuple[np.ndarray, np.ndarray] | None:
                 y_factor = float(line.split("=", 1)[1].strip())
             except ValueError:
                 pass
+        elif line.startswith("##FIRSTX="):
+            try:
+                first_x = float(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("##LASTX="):
+            try:
+                last_x = float(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("##DELTAX="):
+            try:
+                delta_x = float(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
 
     def to_nm(raw_x: float) -> float | None:
         """Convert a raw X value to nanometres, or None if invalid."""
         if x_is_wavenumber:
-            return 1e7 / raw_x if raw_x > 0 else None
+            scaled = raw_x * x_factor
+            return 1e7 / scaled if scaled > 0 else None
         return raw_x * x_factor * x_unit_scale
 
-    # Extract XYDATA or XYPOINTS
+    # Extract XYDATA or XYPOINTS; track the block format explicitly.
     xydata_lines = []
     in_xydata = False
+    is_xypoints = False
     for line in lines:
-        if line.startswith("##XYDATA") or line.startswith("##XYPOINTS"):
+        if line.startswith("##XYPOINTS") or line.startswith("##XYDATA"):
             in_xydata = True
+            header_upper = line.upper()
+            is_xypoints = line.startswith("##XYPOINTS") or "(XY..XY)" in header_upper
             # Might have data on same line; strip format specifier like (XY..XY) or (X++(Y..Y))
             parts = line.split("=", 1)
             if len(parts) > 1:
                 data_part = parts[1].strip()
                 # Remove leading format specifier
                 if data_part.startswith("("):
-                    # Find closing paren and take everything after
-                    close_idx = data_part.find(")")
+                    # Find the matching closing paren; formats nest, e.g.
+                    # (X++(Y..Y)), so a naive first ')' would leave "(Y..Y))".
+                    depth = 0
+                    close_idx = -1
+                    for ci, ch in enumerate(data_part):
+                        if ch == '(':
+                            depth += 1
+                        elif ch == ')':
+                            depth -= 1
+                            if depth == 0:
+                                close_idx = ci
+                                break
                     if close_idx != -1:
                         data_part = data_part[close_idx + 1:].strip()
                 if data_part:
@@ -351,12 +383,13 @@ def parse_jcamp_dx(text: str) -> tuple[np.ndarray, np.ndarray] | None:
     xs = []
     ys = []
 
-    # Parse as simple pairs (x, y, x, y, ...)
+    # Parse as simple pairs (x, y, x, y, ...) for XYPOINTS, or reconstruct
+    # X++(Y..Y) using ##FIRSTX / ##DELTAX instead of guessing from token parity.
     try:
         vals = [float(t) for t in tokens]
-        
-        if len(vals) % 2 == 0:
-            for i in range(0, len(vals), 2):
+
+        if is_xypoints:
+            for i in range(0, len(vals) - 1, 2):
                 raw_x = vals[i]
                 y = vals[i + 1] * y_factor
                 if math.isfinite(raw_x) and math.isfinite(y):
@@ -365,19 +398,24 @@ def parse_jcamp_dx(text: str) -> tuple[np.ndarray, np.ndarray] | None:
                         xs.append(x_nm)
                         ys.append(y)
         else:
-            # Try X++(Y..Y) format: x_start, dx, then y values
-            x_start = to_nm(vals[0])
-            dx = vals[1] * x_factor * x_unit_scale
-            if x_is_wavenumber:
-                # Can't easily handle X++(Y..Y) for wavenumber
-                return None
-            y_vals = [v * y_factor for v in vals[2:]]
-            if x_start is not None:
-                for i, y in enumerate(y_vals):
-                    x = x_start + i * dx
-                    if math.isfinite(x) and math.isfinite(y):
-                        xs.append(x)
-                        ys.append(y)
+            # X++(Y..Y): the first token is the starting X, then one Y per step.
+            x_start_raw = first_x if first_x is not None else vals[0]
+            if delta_x is not None:
+                dx_raw = delta_x
+                y_vals = vals[1:]
+            elif first_x is not None and last_x is not None and len(vals) > 2:
+                dx_raw = (last_x - first_x) / max(len(vals) - 2, 1)
+                y_vals = vals[1:]
+            else:
+                # Legacy fallback: x_start, dx, then Y values.
+                dx_raw = vals[1] if len(vals) > 1 else 1.0
+                y_vals = vals[2:]
+            for i, y_raw in enumerate(y_vals):
+                x_nm = to_nm(x_start_raw + i * dx_raw)
+                y = y_raw * y_factor
+                if x_nm is not None and math.isfinite(x_nm) and math.isfinite(y):
+                    xs.append(x_nm)
+                    ys.append(y)
 
     except ValueError:
         return None

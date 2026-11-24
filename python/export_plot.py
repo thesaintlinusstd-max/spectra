@@ -85,6 +85,42 @@ Y_LABELS = {
 }
 
 
+def wavelength_to_rgb(nm: float) -> tuple[float, float, float]:
+    """Dan Bruton's piecewise-linear CIE wavelength -> linear RGB (380-750 nm).
+
+    Mirrors ``src/kitty_plot.rs::wavelength_to_rgb`` so the TUI HD preview and the
+    publication export agree on the visible-light rainbow strip.
+    """
+    if nm < 380.0 or nm > 750.0:
+        return (0.0, 0.0, 0.0)
+
+    w = float(nm)
+    if w < 440.0:
+        r, g, b = -(w - 440.0) / (440.0 - 380.0), 0.0, 1.0
+    elif w < 490.0:
+        r, g, b = 0.0, (w - 440.0) / (490.0 - 440.0), 1.0
+    elif w < 510.0:
+        r, g, b = 0.0, 1.0, -(w - 510.0) / (510.0 - 490.0)
+    elif w < 580.0:
+        r, g, b = (w - 510.0) / (580.0 - 510.0), 1.0, 0.0
+    elif w < 645.0:
+        r, g, b = 1.0, -(w - 645.0) / (645.0 - 580.0), 0.0
+    else:
+        r, g, b = 1.0, 0.0, 0.0
+
+    if w < 420.0:
+        factor = 0.3 + 0.7 * (w - 380.0) / (420.0 - 380.0)
+    elif w > 700.0:
+        factor = 0.3 + 0.7 * (750.0 - w) / (750.0 - 700.0)
+    else:
+        factor = 1.0
+
+    gamma = 0.8
+    return tuple(
+        float(np.clip(c, 0.0, 1.0) * factor) ** gamma for c in (r, g, b)
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Render a SPECTRA JSON payload as a publication figure."
@@ -315,35 +351,6 @@ def render(payload):
     if mode != "ftir" or y_unit == "absorbance":
         ax.axhline(0.0, color=cfg["grid"], linewidth=0.8, alpha=0.65, zorder=1)
 
-    # UV-Vis: subtle 380-750 nm visible-light rainbow strip along bottom
-    if mode == "uvvis":
-        # Create a gradient from 380 nm (violet) to 750 nm (red)
-        vis_lo, vis_hi = 380.0, 750.0
-        # Clip to actual axis limits
-        clip_lo = max(x_lo, vis_lo)
-        clip_hi = min(x_hi, vis_hi)
-        if clip_lo < clip_hi:
-            n_colors = 400
-            # HSV: hue goes from ~0.75 (violet/380nm) to ~0.0 (red/750nm)
-            # We'll map wavelength to hue approximately
-            wavelengths = np.linspace(clip_lo, clip_hi, n_colors)
-            # Approximate wavelength -> hue mapping (380nm=0.75, 750nm=0.0)
-            hues = np.clip(0.75 - (wavelengths - 380.0) / (750.0 - 380.0) * 0.85, 0.0, 0.75)
-            import matplotlib.colors as mcolors
-            rgb_colors = mcolors.hsv_to_rgb(np.column_stack([hues, np.full(n_colors, 0.55), np.ones(n_colors)]))
-            # Draw as imshow strip at bottom of axes (single alpha, no double-alpha)
-            y_bottom = y_min - pad * 0.45
-            y_top = y_bottom + (shifted_max - y_min) * 0.035
-            extent = [clip_lo, clip_hi, y_bottom, y_top]
-            ax.imshow(
-                rgb_colors[np.newaxis, :, :],
-                aspect="auto",
-                extent=extent,
-                zorder=1,
-                alpha=0.28,
-                origin="lower",
-            )
-
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune=None))
     ax.xaxis.set_major_locator(MaxNLocator(nbins=7, prune=None))
     ax.yaxis.set_minor_locator(AutoMinorLocator(2))
@@ -476,25 +483,57 @@ def render(payload):
             if pinned:
                 color = "#b8860b" if cfg["figure_facecolor"] == "#ffffff" else "#dbbc7f"
 
-            ax.annotate(
+            # Pass 1: all leader lines first, at a low zorder, so they can never
+            # slice through the opaque text pills drawn in pass 2.
+            ax.plot(
+                [px, x_text],
+                [py, y_text],
+                color=color,
+                linewidth=0.60,
+                alpha=0.88,
+                zorder=14,
+                clip_on=True,
+            )
+
+            # Pass 2: every text label on top with an opaque background pill.
+            ax.text(
+                x_text,
+                y_text,
                 wrapped,
-                xy=(px, py),
-                xytext=(x_text, y_text),
                 ha="center",
                 va=va,
                 fontsize=6.2,
                 color=color,
                 fontweight="bold" if pinned else "normal",
-                arrowprops={
-                    "arrowstyle": "-",
-                    "color": color,
-                    "linewidth": 0.55,
-                    "shrinkA": 1.5,
-                    "shrinkB": 2.0,
+                bbox={
+                    "boxstyle": "round,pad=0.18",
+                    "facecolor": cfg["axes_facecolor"],
+                    "edgecolor": "none",
+                    "alpha": 0.94,
                 },
-                annotation_clip=False,
                 clip_on=True,
-                zorder=20,
+                zorder=22,
+            )
+
+    # UV-Vis: subtle 380-750 nm visible-light rainbow strip flush along the
+    # bottom axis. Rendered AFTER the final set_ylim so it never drifts away
+    # from the axis when the annotation lanes expand the plot.
+    if mode == "uvvis":
+        cur_lo, cur_hi = ax.get_ylim()
+        y_bottom = cur_lo
+        y_top = cur_lo + (cur_hi - cur_lo) * 0.032
+        clip_lo = max(x_lo, 380.0)
+        clip_hi = min(x_hi, 750.0)
+        if clip_lo < clip_hi:
+            wavelengths = np.linspace(clip_lo, clip_hi, 400)
+            rgb_colors = np.array([wavelength_to_rgb(float(w)) for w in wavelengths])
+            ax.imshow(
+                rgb_colors[np.newaxis, :, :],
+                aspect="auto",
+                extent=[clip_lo, clip_hi, y_bottom, y_top],
+                zorder=1,
+                alpha=0.32,
+                origin="lower",
             )
 
     if mode == "ftir" and y_unit == "transmittance" and not stacked_multi:
