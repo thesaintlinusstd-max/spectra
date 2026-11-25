@@ -1792,6 +1792,9 @@ pub fn best_peak_label_in_context(
 
 /// Short peak label that recognizes the active NMR solvent and the most
 /// common trace impurities before falling back to functional-group assignment.
+/// Impurity labels are only used when the impurity is closer than any polymer
+/// or functional-group match (avoids false positives on PMMA O–CH₃ at 3.60 ppm
+/// and PMMA C=O at ~177 ppm).
 pub fn best_short_peak_label_with_solvent(
     kind: SpectrumKind,
     x: f64,
@@ -1803,24 +1806,55 @@ pub fn best_short_peak_label_with_solvent(
             let is_carbon = kind == SpectrumKind::Cnmr;
             let (decimals, tol) = if is_carbon { (1usize, 0.55) } else { (2usize, 0.035) };
 
+            // Compute closest polymer peak distance (from POLYMERS_DB)
+            let poly_dist = POLYMERS_DB
+                .iter()
+                .flat_map(|p| {
+                    let peaks = if is_carbon { p.cnmr_peaks } else { p.hnmr_peaks };
+                    peaks.iter().map(|(px, _)| (x - *px).abs())
+                })
+                .fold(f64::INFINITY, f64::min);
+
+            // Compute closest functional-group match distance (from NMR_DB)
+            let fg_dist = if is_carbon {
+                match_cnmr(x)
+            } else {
+                match_hnmr(x)
+            }
+            .first()
+            .map(|b| (x - 0.5 * (b.min + b.max)).abs())
+            .unwrap_or(f64::INFINITY);
+
+            let min_signal_dist = poly_dist.min(fg_dist);
+
             // 1) Residual solvent signal (e.g. CDCl₃ at 7.26 ppm)
             let residual = if is_carbon {
                 solvent.residual_c()
             } else {
                 solvent.residual_h()
             };
-            if residual.iter().any(|&s| (x - s).abs() <= tol) {
-                return format!("{:.*} {} (solvent)", decimals, x, solvent.label());
+            if let Some(&s) = residual.iter().min_by(|a, b| {
+                (x - **a).abs().total_cmp(&(x - **b).abs())
+            }) {
+                let imp_dist = (x - s).abs();
+                if imp_dist <= tol && imp_dist <= min_signal_dist {
+                    return format!("{:.*} {} (solvent)", decimals, x, solvent.label());
+                }
             }
 
             // 2) Water / HDO impurity (¹H only)
-            if !is_carbon && (x - solvent.water_h()).abs() <= tol {
-                return format!("{:.*} H₂O (impurity)", decimals, x);
+            if !is_carbon {
+                let water_shift = solvent.water_h();
+                let imp_dist = (x - water_shift).abs();
+                if imp_dist <= tol && imp_dist <= min_signal_dist {
+                    return format!("{:.*} H₂O (impurity)", decimals, x);
+                }
             }
 
             // 3) Silicone grease (PDMS) impurity
             if let Some(shift) = silicone_grease_shift(solvent, is_carbon) {
-                if (x - shift).abs() <= tol {
+                let imp_dist = (x - shift).abs();
+                if imp_dist <= tol && imp_dist <= min_signal_dist {
                     return format!("{:.*} Silicone grease (impurity)", decimals, x);
                 }
             }

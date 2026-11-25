@@ -582,6 +582,7 @@ pub fn sync_hd_plot(
         let py_top = band_y_top.min(band_y_bottom).round().max(0.0) as i32;
         let py_bot = band_y_top.max(band_y_bottom).round().max(0.0) as i32;
         let band_col = (78u8, 168u8, 144u8);
+        let mut placed_int_labels: Vec<(i32, i32, i32, i32)> = Vec::new();
         for (ri, r) in app.integration_regions.iter().enumerate() {
             let r_lo = r.x_lo.min(r.x_hi);
             let r_hi = r.x_lo.max(r.x_hi);
@@ -606,17 +607,29 @@ pub fn sync_hd_plot(
             );
             // Relative integral value centred just above the teal cap.
             let lbl = match app.integration_relative(ri) {
-                Some(v) => {
-                    if ri == app.integration_ref_idx {
-                        format!("*{:.2}", v)
-                    } else {
-                        format!("{:.2}", v)
-                    }
-                }
+                Some(v) if ri == app.integration_ref_idx => format!("*{:.2}", v),
+                Some(v) => format!("{:.2}", v),
                 None => format!("{:.3}", r.area),
             };
             let cx = (pxa + pxb) / 2;
-            let cy = (py_top - 11).max(12);
+            let mut cy = (py_top - 11).max(12);
+            let lw = (lbl.chars().count() as i32) * 6 + 6;
+            let lh = 11;
+            let mut final_rect = (cx - lw / 2, cy - lh / 2, cx + lw / 2, cy + lh / 2);
+            for _ in 0..4 {
+                let collides = placed_int_labels.iter().any(|&(x0, y0, x1, y1)| {
+                    final_rect.0 <= x1 + 2
+                        && final_rect.2 >= x0 - 2
+                        && final_rect.1 <= y1 + 1
+                        && final_rect.3 >= y0 - 1
+                });
+                if !collides {
+                    break;
+                }
+                cy = (cy - 12).max(12);
+                final_rect = (cx - lw / 2, cy - lh / 2, cx + lw / 2, cy + lh / 2);
+            }
+            placed_int_labels.push(final_rect);
             let lbl_col = if ri == app.integration_ref_idx {
                 PEAK_PIN_RGB
             } else {

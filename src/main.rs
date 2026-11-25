@@ -1419,7 +1419,7 @@ mod tests {
 
     #[test]
     fn test_version_is_0_7() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.7.1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.7.2");
     }
 
     #[test]

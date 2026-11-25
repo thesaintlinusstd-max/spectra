@@ -1,4 +1,4 @@
-# SPECTRA v0.7.1
+# SPECTRA v0.7.2
 
 **Offline Terminal Workbench for FTIR, ¹H NMR, ¹³C NMR & UV-Vis Spectroscopy and Polymer Chemistry**
 

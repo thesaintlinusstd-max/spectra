@@ -2460,7 +2460,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                 // Column header
                 lines.push(TextLine::from(Span::styled(
                     format!(
-                        " {} {:<20} {:>6} {:<11} {}",
+                        "   {} {:<20} {:>6} {:<11} {}",
                         fit_col("Name", name_w),
                         "Score",
                         "HQI",
