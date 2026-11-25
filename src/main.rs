@@ -3080,5 +3080,29 @@ mod tests {
         assert!(md.contains("Processing Pipeline"));
         assert!(md.contains("Detected Peaks"));
     }
+
+    #[test]
+    fn test_pin_close_peaks_when_zoomed_does_not_unpin_neighbor() {
+        let mut app = App::new(vec![], Some(SpectrumKind::Ftir));
+        app.load_demo(DemoPreset::MmaVsPmmaFtir);
+        // Zoom to a narrow window around the ester C=O region
+        app.view_x_min = 1600.0;
+        app.view_x_max = 1780.0;
+        // Pin at 1722 cm⁻¹
+        app.cursor_x = 1722.0;
+        app.toggle_pin_at_cursor();
+        assert_eq!(app.pinned_peaks.len(), 1);
+        // Move cursor 6 cm⁻¹ away (within the same zoom but outside zoom-aware tolerance)
+        app.cursor_x = 1728.0;
+        app.toggle_pin_at_cursor();
+        // Should add a second pin, NOT unpin the first
+        assert_eq!(app.pinned_peaks.len(), 2, "expected two pinned peaks, got {:?}", app.pinned_peaks.iter().map(|p| p.x).collect::<Vec<_>>());
+        // Now move cursor back near 1722 (within zoom-aware tolerance ≈1.08) and unpin
+        app.cursor_x = 1722.2;
+        app.toggle_pin_at_cursor();
+        assert_eq!(app.pinned_peaks.len(), 1);
+        // The remaining pin should be the one at ~1728
+        assert!((app.pinned_peaks[0].x - 1728.0).abs() < 0.5, "expected remaining pin at 1728, got {}", app.pinned_peaks[0].x);
+    }
 }
 

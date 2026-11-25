@@ -1509,13 +1509,29 @@ impl App {
 
     pub fn toggle_pin_at_cursor(&mut self) {
         let kind = self.current_kind();
-        let tol = match kind {
-            SpectrumKind::Ftir => 12.0,
-            SpectrumKind::Hnmr => 0.08,
-            SpectrumKind::Cnmr => 1.0,
-            SpectrumKind::UvVis => 8.0,
+        // A fixed tolerance is too coarse when zoomed in: `x` next to a pinned
+        // peak would silently unpin its neighbour. Scale with the visible width
+        // (~1 cursor column) and clamp to crisp per-technique bounds.
+        let view_span = (self.view_x_max - self.view_x_min).abs().max(1e-6);
+        let (min_tol, max_tol) = match kind {
+            SpectrumKind::Ftir => (0.25, 5.0),
+            SpectrumKind::Hnmr => (0.002, 0.025),
+            SpectrumKind::Cnmr => (0.02, 0.4),
+            SpectrumKind::UvVis => (0.2, 3.0),
         };
-        if let Some(pos) = self.pinned_peaks.iter().position(|p| (p.x - self.cursor_x).abs() <= tol) {
+        let tol = (view_span * 0.006).clamp(min_tol, max_tol);
+        let nearest = self
+            .pinned_peaks
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| (p.x - self.cursor_x).abs() <= tol)
+            .min_by(|(_, a), (_, b)| {
+                (a.x - self.cursor_x)
+                    .abs()
+                    .total_cmp(&(b.x - self.cursor_x).abs())
+            })
+            .map(|(pos, _)| pos);
+        if let Some(pos) = nearest {
             let removed = self.pinned_peaks.remove(pos);
             self.status_msg = format!("Unpinned peak at {:.2} {}", removed.x, kind.x_unit());
             return;

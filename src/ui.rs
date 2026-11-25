@@ -717,15 +717,21 @@ fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(t_lines).block(t_block), cols[0]);
 
     // Right box: Detected & Pinned Peaks
+    let pinned_suffix = if app.pinned_peaks.is_empty() {
+        String::new()
+    } else {
+        format!(" · ★ {}", app.pinned_peaks.len())
+    };
     let p_title = format!(
-        "Peaks [n/N:Jump · x:Pin · [/]:Thresh {:.0}%] {}/{}",
+        "Peaks [n/N:Jump · x:Pin · [/]:Thresh {:.0}%] {}/{}{}",
         app.peak_threshold * 100.0,
         if app.auto_peaks.is_empty() {
             0
         } else {
             app.selected_peak + 1
         },
-        app.auto_peaks.len()
+        app.auto_peaks.len(),
+        pinned_suffix
     );
     let p_block = panel_block(p_title, BORDER_LEFT);
     let inner_h = p_block.inner(cols[1]).height as usize;
@@ -737,10 +743,19 @@ fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(pin.label.clone(), Style::default().fg(TEXT_PRIMARY)),
         ]));
     }
+    // Never let a 5th+ pin look like an earlier one was erased.
+    let pinned_hidden = app.pinned_peaks.len().saturating_sub(pinned_shown);
+    if pinned_hidden > 0 {
+        p_lines.push(TextLine::from(Span::styled(
+            format!("   … +{} more pinned ★", pinned_hidden),
+            Style::default().fg(TEXT_MUTED),
+        )));
+    }
 
     // Scroll the list so the peak selected with [n]/[N] is always visible.
     let total = app.auto_peaks.len();
-    let avail = inner_h.saturating_sub(pinned_shown).max(1);
+    let used_rows = pinned_shown + usize::from(pinned_hidden > 0);
+    let avail = inner_h.saturating_sub(used_rows).max(1);
     let start = if total <= avail {
         0
     } else {
