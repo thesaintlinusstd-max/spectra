@@ -7,7 +7,8 @@ use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use crate::app::{
-    ActiveTab, App, DeconvModalState, Modal, PolymerSubTab, SpectralMathState, MONOMER_PRESETS,
+    ActiveTab, App, CalibrationModalState, DeconvModalState, IntegrationModalState, Modal,
+    PolymerSubTab, SpectralMathState, MONOMER_PRESETS,
 };
 use crate::data::{
     match_cnmr, match_ftir_with_context, match_hnmr, match_polymers,
@@ -15,7 +16,9 @@ use crate::data::{
     uvvis_color_info, BandTier, DemoPreset, SolventId, SpectrumKind, YUnit,
     SOLVENT_IMPURITIES,
 };
-use crate::processing::interpolate_y;
+use crate::processing::{
+    analyze_hnmr_multiplet, interpolate_y, spectrum_nmr_freq_mhz,
+};
 use crate::theme::*;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -475,6 +478,39 @@ fn draw_spectrum_canvas(frame: &mut Frame, app: &mut App, area: Rect) {
                 );
             }
 
+            // Quantitative integration region brackets (bottom edge)
+            let bracket_h = y_total_span * 0.055;
+            for r in &app.integration_regions {
+                if r.x_hi < x_lo || r.x_lo > x_hi {
+                    continue;
+                }
+                let u1 = u_from_x(r.x_lo.max(x_lo));
+                let u2 = u_from_x(r.x_hi.min(x_hi));
+                let (ul, ur) = if u1 <= u2 { (u1, u2) } else { (u2, u1) };
+                let col = Color::Rgb(78, 168, 144);
+                ctx.draw(&CanvasLine {
+                    x1: ul,
+                    y1: plot_y_min,
+                    x2: ul,
+                    y2: plot_y_min + bracket_h,
+                    color: col,
+                });
+                ctx.draw(&CanvasLine {
+                    x1: ur,
+                    y1: plot_y_min,
+                    x2: ur,
+                    y2: plot_y_min + bracket_h,
+                    color: col,
+                });
+                ctx.draw(&CanvasLine {
+                    x1: ul,
+                    y1: plot_y_min + bracket_h,
+                    x2: ur,
+                    y2: plot_y_min + bracket_h,
+                    color: col,
+                });
+            }
+
             // Plot spectrum traces
             for &(x1, y1, x2, y2, color) in &segments {
                 ctx.draw(&CanvasLine { x1, y1, x2, y2, color });
@@ -801,6 +837,38 @@ fn draw_inspector(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(ACCENT_AQUA),
         )),
     ];
+
+    // ¹H NMR: live multiplet / J-coupling readout from the detected peak cluster
+    if kind == SpectrumKind::Hnmr {
+        let freq = app
+            .traces
+            .get(app.active_trace)
+            .map(spectrum_nmr_freq_mhz)
+            .unwrap_or(400.0);
+        if let Some(mi) = analyze_hnmr_multiplet(&app.auto_peaks, app.cursor_x, freq) {
+            let j_txt = if mi.j_hz.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · J = {} Hz",
+                    mi.j_hz
+                        .iter()
+                        .map(|v| format!("{:.1}", v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            card_lines.push(TextLine::from(Span::styled(
+                format!(
+                    " Multiplet: {} ({} lines){} @ {:.0} MHz",
+                    mi.multiplicity, mi.line_count, j_txt, mi.freq_mhz
+                ),
+                Style::default()
+                    .fg(ACCENT_GREEN)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
 
     // UV-Vis: add photon energy (eV) and absorbed/observed color info on 2 clean lines
     if kind == SpectrumKind::UvVis {
@@ -1695,7 +1763,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     ]);
 
     let hints = TextLine::from(Span::styled(
-        " Click/Drag:Cursor/Zoom | h/l:Move | a:%T↔Abs | b:Base | w:Norm | A:ATR/KM | t:Deriv | C:CO₂ | P:Deconv | o:Math | m:Smooth | s:Stack | p:Peaks | x:Pin | c:Copy",
+        " Click/Drag:Cursor/Zoom | h/l:Move | a:%T↔Abs | b:Base | w:Norm | A:ATR/KM | t:Deriv | C:CO₂ | P:Deconv | o:Math | I:Integ | X:Calib | M:Match/Mix | m:Smooth | s:Stack | p:Peaks | x:Pin | c:Copy",
         Style::default().fg(TEXT_MUTED),
     ));
 
@@ -2153,7 +2221,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         Modal::LibraryMatch(st) => {
-            let rect = centered_rect(86, 74, area);
+            let rect = centered_rect(90, 78, area);
             frame.render_widget(Clear, rect);
             let (sub1, sub2) = match app.current_kind() {
                 SpectrumKind::UvVis => (
@@ -2173,102 +2241,253 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                     "  520–3760 cm⁻¹ · AsLS + SG deriv + fingerprint (CO₂ 2280–2410 cm⁻¹ masked)",
                 ),
             };
+            let mode_banner = if st.mixture_mode {
+                TextLine::from(vec![
+                    Span::styled(
+                        "  [ Single-Component HQI ]",
+                        Style::default().fg(TEXT_MUTED),
+                    ),
+                    Span::styled(
+                        "   ▶ [ Multi-Component Mixture NNLS ]  ",
+                        Style::default()
+                            .fg(DARK_TEXT)
+                            .bg(ACCENT_GREEN)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" [m] switch mode", Style::default().fg(ACCENT_YELLOW)),
+                ])
+            } else {
+                TextLine::from(vec![
+                    Span::styled(
+                        "  ▶ [ Single-Component HQI ]  ",
+                        Style::default()
+                            .fg(DARK_TEXT)
+                            .bg(ACCENT_GREEN)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "   [ Multi-Component Mixture NNLS ]",
+                        Style::default().fg(TEXT_MUTED),
+                    ),
+                    Span::styled("  [m] switch mode", Style::default().fg(ACCENT_YELLOW)),
+                ])
+            };
             let mut lines = vec![
+                mode_banner,
                 TextLine::from(Span::styled(sub1, Style::default().fg(ACCENT_AQUA))),
                 TextLine::from(Span::styled(sub2, Style::default().fg(TEXT_MUTED))),
-                TextLine::from(Span::styled(
-                    "  Press [/] to search all library files by name",
-                    Style::default().fg(ACCENT_YELLOW),
-                )),
                 TextLine::from(""),
             ];
 
-            if st.results.is_empty() {
-                lines.push(TextLine::from(Span::styled(
-                    "  No matches found. Load an FTIR or UV-Vis trace and try again.",
-                    Style::default().fg(ACCENT_CORAL),
-                )));
-            }
-
-            // Two rendered lines per hit (score row + name row): scroll the
-            // window so the j/k selection is always visible.
-            let max_vis = (rect.height.saturating_sub(10) as usize / 2).max(1);
-            let start = st.selected.saturating_sub(max_vis.saturating_sub(1));
-            for (i, m) in st
-                .results
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(max_vis)
-            {
-                let active = i == st.selected;
-                let bar_w = 20usize;
-                let filled = ((m.hqi_pct / 100.0) * bar_w as f64).round() as usize;
-                let color = if m.hqi_pct >= 88.0 {
-                    ACCENT_GREEN
-                } else if m.hqi_pct >= 70.0 {
-                    ACCENT_YELLOW
+            if st.mixture_mode {
+                if st.mixture_results.is_empty() {
+                    lines.push(TextLine::from(Span::styled(
+                        "  No mixture results yet — press [m] to run the NNLS solver.",
+                        Style::default().fg(ACCENT_CORAL),
+                    )));
                 } else {
-                    ACCENT_CORAL
-                };
+                    let max_vis = (rect.height.saturating_sub(11) as usize / 3).max(1);
+                    let start = st.mixture_selected.saturating_sub(max_vis.saturating_sub(1));
+                    for (i, m) in st
+                        .mixture_results
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(max_vis)
+                    {
+                        let active = i == st.mixture_selected;
+                        let bar_w = 18usize;
+                        let filled =
+                            ((m.composite_hqi_pct / 100.0) * bar_w as f64).round() as usize;
+                        let color = if m.composite_hqi_pct >= 92.0 {
+                            ACCENT_GREEN
+                        } else if m.composite_hqi_pct >= 75.0 {
+                            ACCENT_YELLOW
+                        } else {
+                            ACCENT_CORAL
+                        };
+                        let mut row = vec![
+                            Span::styled(
+                                if active { " ▶ " } else { "   " },
+                                Style::default().fg(ACCENT_GREEN),
+                            ),
+                            Span::styled(
+                                format!("{:>2}. ", i + 1),
+                                Style::default().fg(if active { ACCENT_GREEN } else { TEXT_MUTED }),
+                            ),
+                            Span::styled("█".repeat(filled.min(bar_w)), Style::default().fg(color)),
+                            Span::styled(
+                                "░".repeat(bar_w.saturating_sub(filled)),
+                                Style::default().fg(TEXT_MUTED),
+                            ),
+                            Span::styled(
+                                format!(" {:5.1}%", m.composite_hqi_pct),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("  ΔHQI {:+.1}%", m.improvement_pct),
+                                Style::default().fg(if m.improvement_pct > 0.0 {
+                                    ACCENT_GREEN
+                                } else {
+                                    TEXT_MUTED
+                                }),
+                            ),
+                        ];
+                        if active {
+                            row.push(Span::styled(
+                                "  ◀ selected",
+                                Style::default().fg(ACCENT_YELLOW),
+                            ));
+                        }
+                        lines.push(TextLine::from(row));
 
-                let mut spans = vec![
-                    Span::styled(
-                        if active { " ▶ " } else { "   " },
-                        Style::default().fg(ACCENT_GREEN),
-                    ),
-                    Span::styled(
-                        format!("{:<12}", m.short),
-                        Style::default()
-                            .fg(if active { DARK_TEXT } else { TEXT_PRIMARY })
-                            .bg(if active { ACCENT_GREEN } else { SURFACE_DARK })
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled("█".repeat(filled), Style::default().fg(color)),
-                    Span::styled("░".repeat(bar_w - filled), Style::default().fg(TEXT_MUTED)),
-                    Span::styled(
-                        format!(" {:5.1}%", m.hqi_pct),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("[{}]", m.source),
-                        Style::default()
-                            .fg(if m.is_builtin { ACCENT_AQUA } else { ACCENT_AMBER }),
-                    ),
-                ];
-                if active {
-                    spans.push(Span::styled(
-                        format!("  r_abs {:.3} · r_deriv {:.3}", m.r_abs, m.r_deriv),
-                        Style::default().fg(ACCENT_YELLOW),
-                    ));
+                        let mut comp_spans = vec![Span::styled(
+                            "       ",
+                            Style::default().fg(TEXT_MUTED),
+                        )];
+                        for (ci, c) in m.components.iter().enumerate() {
+                            if ci > 0 {
+                                comp_spans.push(Span::styled(
+                                    " + ",
+                                    Style::default().fg(TEXT_MUTED),
+                                ));
+                            }
+                            let ccol = match ci {
+                                0 => ACCENT_GREEN,
+                                1 => ACCENT_AQUA,
+                                _ => ACCENT_AMBER,
+                            };
+                            comp_spans.push(Span::styled(
+                                format!("{:.1}% {}", c.weight_pct, c.short),
+                                Style::default().fg(ccol).add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        lines.push(TextLine::from(comp_spans));
+
+                        let names = m
+                            .components
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(" + ");
+                        lines.push(TextLine::from(Span::styled(
+                            format!(
+                                "       r_abs {:.3} · r_deriv {:.3} · {}",
+                                m.r_abs, m.r_deriv, names
+                            ),
+                            Style::default().fg(TEXT_MUTED),
+                        )));
+                    }
+                    if st.mixture_results.len() > max_vis {
+                        lines.push(TextLine::from(Span::styled(
+                            format!(
+                                "  {}/{} blends shown — [j] to scroll",
+                                st.mixture_selected + 1,
+                                st.mixture_results.len()
+                            ),
+                            Style::default().fg(ACCENT_YELLOW),
+                        )));
+                    }
                 }
-                lines.push(TextLine::from(spans));
+                lines.push(TextLine::from(""));
                 lines.push(TextLine::from(Span::styled(
-                    format!("     {}", m.name),
+                    "  [j/k] Navigate   [Enter] Overlay Components   [c] Copy Report   [m] Single Mode   [Esc] Close",
+                    Style::default().fg(TEXT_MUTED),
+                )));
+            } else {
+                if st.results.is_empty() {
+                    lines.push(TextLine::from(Span::styled(
+                        "  No matches found. Load an FTIR or UV-Vis trace and try again.",
+                        Style::default().fg(ACCENT_CORAL),
+                    )));
+                }
+
+                // Two rendered lines per hit (score row + name row): scroll the
+                // window so the j/k selection is always visible.
+                let max_vis = (rect.height.saturating_sub(10) as usize / 2).max(1);
+                let start = st.selected.saturating_sub(max_vis.saturating_sub(1));
+                for (i, m) in st
+                    .results
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(max_vis)
+                {
+                    let active = i == st.selected;
+                    let bar_w = 20usize;
+                    let filled = ((m.hqi_pct / 100.0) * bar_w as f64).round() as usize;
+                    let color = if m.hqi_pct >= 88.0 {
+                        ACCENT_GREEN
+                    } else if m.hqi_pct >= 70.0 {
+                        ACCENT_YELLOW
+                    } else {
+                        ACCENT_CORAL
+                    };
+
+                    let mut spans = vec![
+                        Span::styled(
+                            if active { " ▶ " } else { "   " },
+                            Style::default().fg(ACCENT_GREEN),
+                        ),
+                        Span::styled(
+                            format!("{:<12}", m.short),
+                            Style::default()
+                                .fg(if active { DARK_TEXT } else { TEXT_PRIMARY })
+                                .bg(if active { ACCENT_GREEN } else { SURFACE_DARK })
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled("█".repeat(filled), Style::default().fg(color)),
+                        Span::styled(
+                            "░".repeat(bar_w - filled),
+                            Style::default().fg(TEXT_MUTED),
+                        ),
+                        Span::styled(
+                            format!(" {:5.1}%", m.hqi_pct),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("[{}]", m.source),
+                            Style::default()
+                                .fg(if m.is_builtin { ACCENT_AQUA } else { ACCENT_AMBER }),
+                        ),
+                    ];
+                    if active {
+                        spans.push(Span::styled(
+                            format!("  r_abs {:.3} · r_deriv {:.3}", m.r_abs, m.r_deriv),
+                            Style::default().fg(ACCENT_YELLOW),
+                        ));
+                    }
+                    lines.push(TextLine::from(spans));
+                    lines.push(TextLine::from(Span::styled(
+                        format!("     {}", m.name),
+                        Style::default().fg(TEXT_MUTED),
+                    )));
+                }
+
+                lines.push(TextLine::from(""));
+                if st.results.len() > max_vis {
+                    lines.push(TextLine::from(Span::styled(
+                        format!(
+                            "  {}/{} matches shown — keep pressing [j] to scroll",
+                            st.selected + 1,
+                            st.results.len()
+                        ),
+                        Style::default().fg(ACCENT_YELLOW),
+                    )));
+                }
+                lines.push(TextLine::from(Span::styled(
+                    "  [j/k] Navigate   [Enter] Overlay Reference   [m] Mixture NNLS   [/] Search   [Esc] Close",
                     Style::default().fg(TEXT_MUTED),
                 )));
             }
 
-            lines.push(TextLine::from(""));
-            if st.results.len() > max_vis {
-                lines.push(TextLine::from(Span::styled(
-                    format!(
-                        "  {}/{} matches shown — keep pressing [j] to scroll",
-                        st.selected + 1,
-                        st.results.len()
-                    ),
-                    Style::default().fg(ACCENT_YELLOW),
-                )));
-            }
-            lines.push(TextLine::from(Span::styled(
-                "  [j/k] Navigate   [Enter] Overlay Reference   [/] Search by name   [Esc] Close",
-                Style::default().fg(TEXT_MUTED),
-            )));
-
             frame.render_widget(
-                Paragraph::new(lines).block(modal_block("Spectral Library Matcher [M]", ACCENT_GREEN)),
+                Paragraph::new(lines).block(modal_block(
+                    "Spectral Library Matcher [M] — Single HQI / Mixture NNLS",
+                    ACCENT_GREEN,
+                )),
                 rect,
             );
         }
@@ -2498,6 +2717,8 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
         }
         Modal::Deconv(st) => draw_deconv_modal(frame, st, area),
         Modal::SpectralMath(st) => draw_spectral_math_modal(frame, app, st, area),
+        Modal::Integration(st) => draw_integration_modal(frame, app, st, area),
+        Modal::Calibration(st) => draw_calibration_modal(frame, app, st, area),
     }
 }
 
@@ -2770,6 +2991,232 @@ fn wrap_help_lines(lines: Vec<TextLine<'static>>, width: usize) -> Vec<TextLine<
 }
 
 /// Content of the `?` guide.
+fn draw_integration_modal(
+    frame: &mut Frame,
+    app: &App,
+    st: &IntegrationModalState,
+    area: Rect,
+) {
+    let rect = centered_rect(94, 76, area);
+    frame.render_widget(Clear, rect);
+    let block = modal_block(
+        "Quantitative Integration Studio [I] · Mnova-style relative integrals",
+        ACCENT_GREEN,
+    );
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height < 8 {
+        return;
+    }
+
+    let kind = app.current_kind();
+    let unit = kind.x_unit();
+    let ref_txt = if app.integration_regions.is_empty() {
+        "—".to_string()
+    } else {
+        format!(
+            "region #{} × {:.2}",
+            app.integration_ref_idx.min(app.integration_regions.len() - 1) + 1,
+            app.integration_ref_val
+        )
+    };
+    let mut lines = vec![
+        TextLine::from(Span::styled(
+            format!(
+                "  Reference: {}   ·   {} region(s)   ·   {}",
+                ref_txt,
+                app.integration_regions.len(),
+                kind.display_name()
+            ),
+            Style::default().fg(ACCENT_YELLOW).add_modifier(Modifier::BOLD),
+        )),
+        TextLine::from(Span::styled(
+            "  #   Region Range                Center      Abs Area    Rel Integral   Ref   Assignment",
+            Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
+        )),
+        TextLine::from(Span::styled(
+            "  ─────────────────────────────────────────────────────────────────────────────────────",
+            Style::default().fg(TEXT_MUTED),
+        )),
+    ];
+
+    if app.integration_regions.is_empty() {
+        lines.push(TextLine::from(Span::styled(
+            "  No regions yet — [z] adds the current zoom window, [a] adds around the cursor.",
+            Style::default().fg(ACCENT_CORAL),
+        )));
+    }
+
+    let max_vis = inner.height.saturating_sub(9) as usize;
+    let start = st.selected.saturating_sub(max_vis.saturating_sub(1));
+    for (i, r) in app
+        .integration_regions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_vis.max(1))
+    {
+        let active = i == st.selected;
+        let lo = r.x_lo.min(r.x_hi);
+        let hi = r.x_lo.max(r.x_hi);
+        let range = format!("{:.2} – {:.2} {}", lo, hi, unit);
+        let center = 0.5 * (r.x_lo + r.x_hi);
+        let rel = app
+            .integration_relative(i)
+            .map(|v| format!("{:.4}", v))
+            .unwrap_or_else(|| "—".into());
+        let mark = if i == app.integration_ref_idx { "★" } else { "" };
+        let label = if r.label.chars().count() > 28 {
+            r.label.chars().take(28).collect::<String>()
+        } else {
+            r.label.clone()
+        };
+        let row = format!(
+            "{:>2}  {:<26} {:>9.3}  {:>11.5}  {:>13}  {:^4}  {}",
+            i + 1,
+            range,
+            center,
+            r.area,
+            rel,
+            mark,
+            label
+        );
+        let style = if active {
+            Style::default()
+                .fg(DARK_TEXT)
+                .bg(ACCENT_GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT_PRIMARY)
+        };
+        lines.push(TextLine::from(Span::styled(format!("  {}", row), style)));
+    }
+
+    lines.push(TextLine::from(""));
+    lines.push(TextLine::from(Span::styled(
+        "  [z] Add Zoom Window   [a] Add Around Cursor   [j/k] Navigate   [r] Set Ref ★   [←/→] Ref Value",
+        Style::default().fg(TEXT_MUTED),
+    )));
+    lines.push(TextLine::from(Span::styled(
+        "  [p] Push to Polymer Lab   [d] Delete Region   [c] Copy Table   [x] Clear All   [Esc] Close",
+        Style::default().fg(TEXT_MUTED),
+    )));
+    if let Some(fb) = &st.feedback {
+        lines.push(TextLine::from(Span::styled(
+            format!("  ✦ {}", fb),
+            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_calibration_modal(
+    frame: &mut Frame,
+    app: &App,
+    st: &CalibrationModalState,
+    area: Rect,
+) {
+    let rect = centered_rect(74, 52, area);
+    frame.render_widget(Clear, rect);
+    let kind = app.current_kind();
+    let unit = kind.x_unit();
+    let delta = st
+        .target_buf
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|t| t - st.observed_x);
+    let (preset_t, preset_s, preset_w) = match kind {
+        SpectrumKind::Ftir => (
+            "[t] Polystyrene 1601.4",
+            "[s] Polystyrene 3026.0",
+            "[w] Atmospheric CO₂ 2349.0",
+        ),
+        SpectrumKind::UvVis => (
+            "[t] Holmium oxide 361.5",
+            "[s] Holmium oxide 536.3",
+            "[w] Reference 400.0",
+        ),
+        SpectrumKind::Hnmr => (
+            "[t] TMS 0.00",
+            "[s] Active solvent residual",
+            "[w] Residual H₂O",
+        ),
+        SpectrumKind::Cnmr => (
+            "[t] TMS 0.00",
+            "[s] Active solvent residual",
+            "[w] Solvent residual ¹³C",
+        ),
+    };
+    let delta_line = match delta {
+        Some(d) if d.is_finite() => TextLine::from(Span::styled(
+            format!("  ΔX = {:+.4} {}   (observed → target)", d, unit),
+            Style::default()
+                .fg(ACCENT_GREEN)
+                .add_modifier(Modifier::BOLD),
+        )),
+        _ => TextLine::from(Span::styled(
+            "  ΔX = —   (type a valid numeric target)",
+            Style::default().fg(TEXT_MUTED),
+        )),
+    };
+
+    let mut lines = vec![
+        TextLine::from(Span::styled(
+            format!("  Technique: {}   ·   axis unit: {}", kind.display_name(), unit),
+            Style::default().fg(ACCENT_AQUA),
+        )),
+        TextLine::from(""),
+        TextLine::from(Span::styled(
+            format!("  Observed cursor X : {:.4} {}", st.observed_x, unit),
+            Style::default().fg(TEXT_PRIMARY),
+        )),
+        TextLine::from(vec![
+            Span::styled(
+                "  Target true X     : ",
+                Style::default().fg(ACCENT_AMBER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}█", st.target_buf),
+                Style::default()
+                    .fg(ACCENT_GREEN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        TextLine::from(""),
+        delta_line,
+        TextLine::from(""),
+        TextLine::from(Span::styled(
+            "  Chemical standards / quick presets:",
+            Style::default().fg(TEXT_MUTED),
+        )),
+        TextLine::from(Span::styled(
+            format!("   {}    {}    {}", preset_t, preset_s, preset_w),
+            Style::default().fg(ACCENT_YELLOW),
+        )),
+        TextLine::from(""),
+        TextLine::from(Span::styled(
+            format!(
+                "  [Enter] Apply calibration   [⌫] Edit   [Esc] Cancel   ·   solvent: {}",
+                app.nmr_solvent.label()
+            ),
+            Style::default().fg(TEXT_MUTED),
+        )),
+    ];
+    if let Some(fb) = &st.feedback {
+        lines.push(TextLine::from(Span::styled(
+            format!("  ✦ {}", fb),
+            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(modal_block("X-Axis Calibration [X]", ACCENT_YELLOW)),
+        rect,
+    );
+}
+
 fn help_guide_lines() -> Vec<TextLine<'static>> {
     let section = |title: &'static str| {
         TextLine::from(Span::styled(
@@ -2841,6 +3288,10 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   C                Toggle FTIR atmospheric CO₂ suppression (2280–2410 cm⁻¹)"),
         TextLine::from("   P                Open Peak Deconvolution Studio (multi-peak LM fit)"),
         TextLine::from("   o                Open Interactive Spectral Math (subtract/add/ratio/average)"),
+        TextLine::from("   I                Quantitative Region Integration Studio (Mnova-style relative"),
+        TextLine::from("                    integrals; push ratios into Polymer Lab)"),
+        TextLine::from("   X                X-Axis Calibration / Referencing (TMS / solvent residual /"),
+        TextLine::from("                    polystyrene 1601.4 cm⁻¹ / holmium oxide)"),
         TextLine::from("   s                Overlay ↔ stacked-offset layout"),
         TextLine::from("   v                HD Kitty graphics ↔ portable Braille rendering"),
         TextLine::from("   p                Show/hide auto peak markers"),
@@ -2883,6 +3334,11 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   M                Library matcher: ranks references by Hit Quality"),
         TextLine::from("                    Index (HQI) / peak-overlap on FTIR, ¹H/¹³C NMR & UV-Vis (cached)."),
         TextLine::from("                    Top 25 hits; Enter overlays the chosen one."),
+        TextLine::from("                    In the matcher, [m] toggles Single-Component HQI ↔"),
+        TextLine::from("                    Multi-Component Mixture Analysis (NNLS, 1–3 components);"),
+        TextLine::from("                    Enter overlays every component, [c] copies the report."),
+        TextLine::from("   ¹H NMR Inspector  Automatic multiplet & J-coupling (Hz) readout for the"),
+        TextLine::from("                    peak cluster nearest the cursor."),
         TextLine::from("   e                Publication export: ACS/RSC/Everforest, stacked or"),
         TextLine::from("                    overlay; native Rust SVG export + PNG/PDF up to 600 DPI (Python)."),
         TextLine::from("                    UV-Vis export includes visible-light rainbow strip."),

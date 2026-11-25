@@ -388,6 +388,11 @@ fn compute_plot_hash(app: &App) -> u64 {
     }
     app.peak_threshold.to_bits().hash(&mut h);
     app.auto_peaks.len().hash(&mut h);
+    app.integration_regions.len().hash(&mut h);
+    for r in &app.integration_regions {
+        r.x_lo.to_bits().hash(&mut h);
+        r.x_hi.to_bits().hash(&mut h);
+    }
     (app.tab as u8).hash(&mut h);
     app.traces.len().hash(&mut h);
     for (i, t) in app.traces.iter().enumerate() {
@@ -564,6 +569,38 @@ pub fn sync_hd_plot(
                 let sx = map_x(s) as i32;
                 img.draw_vline_dashed(sx, (h as f64 * 0.65) as i32, h as i32 - 1, SOLVENT_RGB, 0.85, 3);
             }
+        }
+    }
+
+    // 3b. Quantitative integration region bands (bottom 20% of plot)
+    if !app.integration_regions.is_empty() {
+        let band_y_bottom = map_y(plot_y_min);
+        let band_y_top = map_y(plot_y_min + (plot_y_max - plot_y_min) * 0.20);
+        let py_top = band_y_top.min(band_y_bottom).round().max(0.0) as i32;
+        let py_bot = band_y_top.max(band_y_bottom).round().max(0.0) as i32;
+        let band_col = (78u8, 168u8, 144u8);
+        for (ri, r) in app.integration_regions.iter().enumerate() {
+            let r_lo = r.x_lo.min(r.x_hi);
+            let r_hi = r.x_lo.max(r.x_hi);
+            if r_hi < x_lo || r_lo > x_hi {
+                continue;
+            }
+            let px_l = map_x(r_lo.max(x_lo)).round().max(0.0) as i32;
+            let px_r = map_x(r_hi.min(x_hi)).round().max(0.0) as i32;
+            let (pxa, pxb) = (px_l.min(px_r), px_l.max(px_r));
+            img.fill_rect_alpha(pxa, py_top, pxb, py_bot, band_col, 0.14);
+            let alpha = if ri == app.integration_ref_idx { 0.95 } else { 0.72 };
+            img.draw_vline_dashed(px_l, py_top, py_bot, band_col, alpha, 4);
+            img.draw_vline_dashed(px_r, py_top, py_bot, band_col, alpha, 4);
+            img.draw_line_aa(
+                px_l as f64,
+                py_top as f64,
+                px_r as f64,
+                py_top as f64,
+                band_col,
+                0.55,
+                false,
+            );
         }
     }
 

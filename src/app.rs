@@ -24,12 +24,13 @@ use crate::export::{
 };
 use crate::io::{expand_tilde, load_spectrum_file, parse_pasted_paths, search_library};
 use crate::processing::{
-    auto_ftir_conversion, average_spectra, beer_lambert_conc, compute_spectral_math,
-    compute_tauc_band_gap_with_optics, detect_peaks, ftir_conversion_percent, interpolate_y,
-    nmr_mn_dpn, optimal_subtraction_factor, process_trace, pu_hydrogen_bond_index,
-    pvdf_beta_fraction, tacticity_stats, BaselineMode, ConversionResult, HydrogenBondIndex,
-    OpticsMode, Peak, ProcessConfig, SmoothLevel, SpectralOp,
-    TacticityResult, TaucMode, TaucResult, YAxisPreference,
+    apply_x_calibration, auto_ftir_conversion, average_spectra, beer_lambert_conc,
+    compute_spectral_math, compute_tauc_band_gap_with_optics, detect_peaks,
+    ftir_conversion_percent, integrate_spectrum_window, interpolate_y, nmr_mn_dpn,
+    optimal_subtraction_factor, process_trace, pu_hydrogen_bond_index, pvdf_beta_fraction,
+    tacticity_stats, BaselineMode, ConversionResult, HydrogenBondIndex, IntegrationRegion,
+    OpticsMode, Peak, ProcessConfig, SmoothLevel, SpectralOp, TacticityResult, TaucMode,
+    TaucResult, YAxisPreference,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +259,22 @@ pub struct ExportModalState {
 pub struct LibraryMatchState {
     pub results: Vec<crate::matcher::LibraryMatch>,
     pub selected: usize,
+    pub mixture_mode: bool,
+    pub mixture_results: Vec<crate::mixture::MixtureMatch>,
+    pub mixture_selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntegrationModalState {
+    pub selected: usize,
+    pub feedback: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CalibrationModalState {
+    pub observed_x: f64,
+    pub target_buf: String,
+    pub feedback: Option<String>,
 }
 
 /// Shown when a CLI query matches several reference spectra (e.g. `butane`
@@ -332,6 +349,7 @@ pub enum TaskOutcome {
         append: bool,
     },
     LibraryMatch(Vec<crate::matcher::LibraryMatch>),
+    MixtureMatch(Vec<crate::mixture::MixtureMatch>),
     Export(std::result::Result<PathBuf, String>),
     LibraryDownload(std::result::Result<String, String>),
     Deconv(std::result::Result<DeconvResult, String>),
@@ -353,6 +371,8 @@ pub enum Modal {
     LibrarySetup(LibrarySetupState),
     Deconv(DeconvModalState),
     SpectralMath(SpectralMathState),
+    Integration(IntegrationModalState),
+    Calibration(CalibrationModalState),
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +552,14 @@ pub struct App {
     pub deconv_overlay: Option<DeconvOverlay>,
     /// Deconvolution modal state preserved while LM fitting runs in background.
     pub pending_deconv: Option<DeconvModalState>,
+    /// Library-match modal state preserved while the NNLS mixture task runs.
+    pub pending_match_state: Option<LibraryMatchState>,
+
+    /// Quantitative integration regions (Mnova-style relative integrals).
+    pub integration_regions: Vec<IntegrationRegion>,
+    pub integration_ref_idx: usize,
+    pub integration_ref_val: f64,
+    pub next_region_id: usize,
 
     // Cached layout geometry for accurate mouse interactions
     pub topbar_rect: Rect,
@@ -650,6 +678,11 @@ impl App {
             pending_export: None,
             deconv_overlay: None,
             pending_deconv: None,
+            pending_match_state: None,
+            integration_regions: Vec::new(),
+            integration_ref_idx: 0,
+            integration_ref_val: 1.0,
+            next_region_id: 0,
             topbar_rect: Rect::default(),
             tab_hitboxes: Vec::new(),
             plot_rect: Rect::default(),
@@ -692,6 +725,33 @@ impl App {
             })
             .collect();
         self.recompute_peaks();
+        self.recompute_integrations();
+    }
+
+    /// Recompute every integration region against the active processed trace so
+    /// areas stay synchronized after baseline / ATR / smoothing / derivative changes.
+    pub fn recompute_integrations(&mut self) {        let Some(pt) = self.processed.get(self.active_trace).cloned() else {
+            return;
+        };
+        for r in &mut self.integration_regions {
+            match integrate_spectrum_window(&pt.x, &pt.y, pt.y_unit, r.x_lo, r.x_hi) {
+                Some((area, h)) => {
+                    r.area = area;
+                    r.peak_height = h;
+                }
+                None => {
+                    r.area = 0.0;
+                    r.peak_height = 0.0;
+                }
+            }
+        }
+    }
+
+    fn clear_integrations(&mut self) {
+        self.integration_regions.clear();
+        self.integration_ref_idx = 0;
+        self.integration_ref_val = 1.0;
+        self.next_region_id = 0;
     }
 
     pub fn recompute_peaks(&mut self) {
@@ -818,6 +878,7 @@ impl App {
         self.active_trace = 0;
         self.pinned_peaks.clear();
         self.deconv_overlay = None;
+        self.clear_integrations();
         self.tab = ActiveTab::from_kind(preset.kind());
         self.recompute_processing();
         self.reset_zoom();
@@ -902,6 +963,7 @@ impl App {
                 self.traces.clear();
                 self.pinned_peaks.clear();
                 self.deconv_overlay = None;
+                self.clear_integrations();
                 for (k, mut spec) in other
                     .into_iter()
                     .filter(|s| s.kind == new_kind)
@@ -964,6 +1026,7 @@ impl App {
             self.active_trace = 0;
             self.pinned_peaks.clear();
             self.deconv_overlay = None;
+            self.clear_integrations();
             if skipped > 0 {
                 notes.push(format!(
                     "skipped {} trace(s) of a different spectroscopy mode",
@@ -974,6 +1037,7 @@ impl App {
 
         if self.traces.is_empty() {
             self.auto_peaks.clear();
+            self.clear_integrations();
         } else {
             let active = self.active_trace.min(self.traces.len() - 1);
             self.active_trace = active;
@@ -1025,7 +1089,34 @@ impl App {
                 self.modal = Modal::LibraryMatch(LibraryMatchState {
                     results,
                     selected: 0,
+                    mixture_mode: false,
+                    mixture_results: Vec::new(),
+                    mixture_selected: 0,
                 });
+            }
+            TaskOutcome::MixtureMatch(mix) => {
+                let mut st = self.pending_match_state.take().unwrap_or(LibraryMatchState {
+                    results: Vec::new(),
+                    selected: 0,
+                    mixture_mode: true,
+                    mixture_results: Vec::new(),
+                    mixture_selected: 0,
+                });
+                if mix.is_empty() {
+                    self.modal = Modal::LibraryMatch(st);
+                    self.status_msg =
+                        "No multi-component mixture fit — try a wider spectral window".into();
+                    return;
+                }
+                self.status_msg = format!(
+                    "Mixture NNLS: {} candidate blend(s) — top {:.1}% composite HQI",
+                    mix.len(),
+                    mix[0].composite_hqi_pct
+                );
+                st.mixture_mode = true;
+                st.mixture_results = mix;
+                st.mixture_selected = 0;
+                self.modal = Modal::LibraryMatch(st);
             }
             TaskOutcome::Export(result) => {
                 let mut state = self.pending_export.take();
@@ -1228,7 +1319,9 @@ impl App {
                 }
                 return;
             }
-            Modal::Deconv(_) | Modal::SpectralMath(_) => return,
+            Modal::Deconv(_) | Modal::SpectralMath(_) | Modal::Integration(_) | Modal::Calibration(_) => {
+                return;
+            }
             Modal::FilePicker(_) => {
                 self.paste_into_file_picker(pasted);
                 return;
@@ -1637,6 +1730,192 @@ impl App {
         }
     }
 
+    /// Overlay every component of a multi-component NNLS mixture onto the workspace.
+    fn overlay_mixture_match(&mut self, m: &crate::mixture::MixtureMatch) {
+        let mut parts: Vec<String> = Vec::new();
+        for c in &m.components {
+            parts.push(format!("{:.0}% {}", c.weight_pct, c.short));
+            let lm = crate::matcher::LibraryMatch {
+                name: c.name.clone(),
+                short: c.short.clone(),
+                source: c.source.clone(),
+                hqi_pct: m.composite_hqi_pct,
+                r_abs: m.r_abs,
+                r_deriv: m.r_deriv,
+                is_builtin: c.is_builtin,
+                file_path: c.file_path.clone(),
+            };
+            self.apply_library_match(&lm);
+        }
+        self.status_msg = format!(
+            "Overlaid mixture: {} ({:.1}% HQI)",
+            parts.join(" + "),
+            m.composite_hqi_pct
+        );
+    }
+
+    fn integration_ref_area(&self) -> Option<f64> {
+        self.integration_regions
+            .get(self.integration_ref_idx)
+            .map(|r| r.area)
+            .filter(|a| a.is_finite() && *a > 1e-12)
+    }
+
+    pub fn integration_relative(&self, idx: usize) -> Option<f64> {
+        let area = self.integration_regions.get(idx)?.area;
+        let ref_area = self.integration_ref_area()?;
+        Some(area / ref_area * self.integration_ref_val)
+    }
+
+    fn add_integration_region(&mut self, x_lo: f64, x_hi: f64) -> Option<usize> {
+        let pt = self.processed.get(self.active_trace).cloned()?;
+        let lo = x_lo.min(x_hi);
+        let hi = x_lo.max(x_hi);
+        if !(hi - lo).is_finite() || hi - lo < 1e-9 {
+            return None;
+        }
+        let (area, peak_height) =
+            integrate_spectrum_window(&pt.x, &pt.y, pt.y_unit, lo, hi)?;
+        let kind = self.current_kind();
+        let center = 0.5 * (lo + hi);
+        let peak_xs: Vec<f64> = self.auto_peaks.iter().map(|p| p.x).collect();
+        let label = best_peak_label_in_context(kind, center, &peak_xs, self.nmr_solvent);
+        let id = self.next_region_id;
+        self.next_region_id += 1;
+        let was_empty = self.integration_regions.is_empty();
+        self.integration_regions.push(IntegrationRegion {
+            id,
+            x_lo: lo,
+            x_hi: hi,
+            area,
+            peak_height,
+            label,
+        });
+        let idx = self.integration_regions.len() - 1;
+        if was_empty {
+            self.integration_ref_idx = idx;
+            if kind == SpectrumKind::Hnmr {
+                self.integration_ref_val = 3.0;
+            }
+        }
+        Some(idx)
+    }
+
+    /// Push the current relative integrals into Polymer Lab. Returns a status
+    /// message when the active technique has a matching calculator.
+    fn push_integrations_to_polymer_lab(&mut self) -> Option<String> {
+        let kind = self.current_kind();
+        let len = self.integration_regions.len();
+        if len < 2 {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..len).collect();
+        order.sort_by(|&a, &b| {
+            let ca = 0.5 * (self.integration_regions[a].x_lo + self.integration_regions[a].x_hi);
+            let cb = 0.5 * (self.integration_regions[b].x_lo + self.integration_regions[b].x_hi);
+            cb.total_cmp(&ca)
+        });
+
+        match kind {
+            SpectrumKind::Hnmr if len >= 3 => {
+                let vals: Vec<f64> = order
+                    .iter()
+                    .take(3)
+                    .map(|&i| self.integration_relative(i).unwrap_or(0.0))
+                    .collect();
+                self.polymer_lab.i_mm = format!("{:.4}", vals[0]);
+                self.polymer_lab.i_mr = format!("{:.4}", vals[1]);
+                self.polymer_lab.i_rr = format!("{:.4}", vals[2]);
+                self.polymer_lab.sub_tab = PolymerSubTab::Tacticity;
+                self.tab = ActiveTab::PolymerLab;
+                Some(format!(
+                    "Pushed 3 integrals to Tacticity: mm={:.3}, mr={:.3}, rr={:.3}",
+                    vals[0], vals[1], vals[2]
+                ))
+            }
+            SpectrumKind::Hnmr => {
+                let a = self.integration_relative(order[0]).unwrap_or(0.0);
+                let b = self.integration_relative(order[1]).unwrap_or(0.0);
+                let (repeat, end) = if a >= b { (a, b) } else { (b, a) };
+                self.polymer_lab.i_repeat = format!("{:.4}", repeat);
+                self.polymer_lab.i_end = format!("{:.4}", end);
+                self.polymer_lab.sub_tab = PolymerSubTab::NmrMn;
+                self.tab = ActiveTab::PolymerLab;
+                Some(format!(
+                    "Pushed 2 integrals to NMR Mn: repeat={:.3}, end={:.3}",
+                    repeat, end
+                ))
+            }
+            SpectrumKind::Ftir => {
+                let a = self.integration_regions[order[0]].area;
+                let b = self.integration_regions[order[1]].area;
+                if b <= 1e-12 {
+                    return Some("FTIR ratio unavailable: second region area is zero".into());
+                }
+                self.polymer_lab.man_rxn_t = format!("{:.6}", a);
+                self.polymer_lab.man_ref_t = format!("{:.6}", b);
+                Some(format!("Area₁ / Area₂ = {:.6}", a / b))
+            }
+            _ => None,
+        }
+    }
+
+    fn integration_table_text(&self) -> String {
+        let kind = self.current_kind();
+        let mut out = format!(
+            "# SPECTRA Integration Regions — {}\n# Ref = region {} (×{:.2})\n\n",
+            kind.display_name(),
+            self.integration_ref_idx + 1,
+            self.integration_ref_val
+        );
+        out.push_str("| # | Range | Center | Abs Area | Rel Integral | Ref | Assignment |\n");
+        out.push_str("|--:|:------|-------:|---------:|-------------:|:---:|:-----------|\n");
+        for (i, r) in self.integration_regions.iter().enumerate() {
+            let rel = self
+                .integration_relative(i)
+                .map(|v| format!("{:.4}", v))
+                .unwrap_or_else(|| "—".into());
+            let mark = if i == self.integration_ref_idx { "★" } else { "" };
+            out.push_str(&format!(
+                "| {} | {:.3} – {:.3} {} | {:.3} | {:.5} | {} | {} | {} |\n",
+                i + 1,
+                r.x_lo.min(r.x_hi),
+                r.x_lo.max(r.x_hi),
+                kind.x_unit(),
+                0.5 * (r.x_lo + r.x_hi),
+                r.area,
+                rel,
+                mark,
+                r.label
+            ));
+        }
+        out
+    }
+
+    fn apply_calibration_target(&mut self, observed: f64, target: f64) -> String {
+        let delta = target - observed;
+        let kind = self.current_kind();
+        if !delta.is_finite() || delta.abs() < 1e-12 {
+            return "Target equals observed X — no calibration needed".into();
+        }
+        if let Some(spec) = self.traces.get_mut(self.active_trace) {
+            apply_x_calibration(spec, delta);
+        }
+        self.cursor_x += delta;
+        self.view_x_min += delta;
+        self.view_x_max += delta;
+        for p in &mut self.pinned_peaks {
+            p.x += delta;
+        }
+        for r in &mut self.integration_regions {
+            r.x_lo += delta;
+            r.x_hi += delta;
+        }
+        self.deconv_overlay = None;
+        self.recompute_processing();
+        format!("Calibrated X-axis by {:+.3} {}", delta, kind.x_unit())
+    }
+
     pub fn compute_live_conversion(&self) -> Option<ConversionResult> {
         if self.traces.len() < 2
             || self.traces[0].kind != SpectrumKind::Ftir
@@ -2000,6 +2279,7 @@ impl App {
             self.auto_peaks.clear();
             self.processed.clear();
             self.selected_peak = 0;
+            self.clear_integrations();
             self.reset_zoom();
         } else {
             self.recompute_processing();
@@ -2173,6 +2453,23 @@ impl App {
                     self.jump_to_x(px);
                 }
             }
+            KeyCode::Char('X') | KeyCode::Char('x') if shift || key.code == KeyCode::Char('X') => {
+                if self.traces.get(self.active_trace).is_some() {
+                    let observed = self.cursor_x;
+                    self.modal = Modal::Calibration(CalibrationModalState {
+                        observed_x: observed,
+                        target_buf: format!("{:.4}", observed),
+                        feedback: None,
+                    });
+                    self.status_msg = format!(
+                        "X-Axis Calibration — observed {:.3} {} · type target or use [t]/[s]/[w]",
+                        observed,
+                        self.current_kind().x_unit()
+                    );
+                } else {
+                    self.status_msg = "Load a spectrum before calibrating the X-axis".into();
+                }
+            }
             KeyCode::Char('x') => self.toggle_pin_at_cursor(),
             KeyCode::Char('C') | KeyCode::Char('c') if shift || key.code == KeyCode::Char('C') => {
                 if self.current_kind() == SpectrumKind::Ftir {
@@ -2215,6 +2512,20 @@ impl App {
                 self.solvents_tab.solvent = self.nmr_solvent;
                 self.recompute_peaks();
                 self.status_msg = format!("NMR Reference Solvent: {}", self.nmr_solvent.label());
+            }
+            KeyCode::Char('I') | KeyCode::Char('i') if shift || key.code == KeyCode::Char('I') => {
+                if self.traces.get(self.active_trace).is_some() {
+                    let selected = self.integration_regions.len().saturating_sub(1);
+                    self.modal = Modal::Integration(IntegrationModalState {
+                        selected,
+                        feedback: None,
+                    });
+                    self.status_msg =
+                        "Quantitative Integration Studio — [z] zoom window · [a] cursor · [j/k] navigate"
+                            .into();
+                } else {
+                    self.status_msg = "Load a spectrum before opening the Integration Studio".into();
+                }
             }
             KeyCode::Char('i') => {
                 self.show_solvent_markers = !self.show_solvent_markers;
@@ -2652,21 +2963,79 @@ impl App {
                 _ => self.modal = Modal::CandidatePicker(st),
             },
             Modal::LibraryMatch(mut st) => match key.code {
+                KeyCode::Char('m') => {
+                    st.mixture_mode = !st.mixture_mode;
+                    if st.mixture_mode && st.mixture_results.is_empty() {
+                        if let Some(spec) = self.traces.get(self.active_trace).cloned() {
+                            let cfg = self.process_cfg;
+                            let solvent = self.nmr_solvent;
+                            self.pending_match_state = Some(st);
+                            self.start_task(
+                                "Analyzing 2–3 component mixtures (NNLS)…",
+                                move || {
+                                    TaskOutcome::MixtureMatch(crate::mixture::analyze_mixture(
+                                        &spec, cfg, solvent, 3,
+                                    ))
+                                },
+                            );
+                        } else {
+                            self.status_msg =
+                                "Load a spectrum before mixture analysis".into();
+                            self.modal = Modal::LibraryMatch(st);
+                        }
+                    } else {
+                        self.modal = Modal::LibraryMatch(st);
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if !st.results.is_empty() {
+                    if st.mixture_mode {
+                        if !st.mixture_results.is_empty() {
+                            st.mixture_selected = (st.mixture_selected
+                                + st.mixture_results.len()
+                                - 1)
+                                % st.mixture_results.len();
+                        }
+                    } else if !st.results.is_empty() {
                         st.selected = (st.selected + st.results.len() - 1) % st.results.len();
                     }
                     self.modal = Modal::LibraryMatch(st);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if !st.results.is_empty() {
+                    if st.mixture_mode {
+                        if !st.mixture_results.is_empty() {
+                            st.mixture_selected =
+                                (st.mixture_selected + 1) % st.mixture_results.len();
+                        }
+                    } else if !st.results.is_empty() {
                         st.selected = (st.selected + 1) % st.results.len();
                     }
                     self.modal = Modal::LibraryMatch(st);
                 }
                 KeyCode::Char('/') => self.open_search_modal(),
+                KeyCode::Char('c') if st.mixture_mode => {
+                    if st.mixture_results.is_empty() {
+                        self.status_msg = "No mixture report to copy yet".into();
+                    } else {
+                        let report = crate::mixture::format_mixture_markdown(
+                            &st.mixture_results,
+                            self.current_kind(),
+                        );
+                        match copy_text(&report) {
+                            Ok(tool) => {
+                                self.status_msg =
+                                    format!("Copied mixture report via {}", tool);
+                            }
+                            Err(e) => self.status_msg = format!("Copy failed: {}", e),
+                        }
+                    }
+                    self.modal = Modal::LibraryMatch(st);
+                }
                 KeyCode::Enter => {
-                    if let Some(m) = st.results.get(st.selected).cloned() {
+                    if st.mixture_mode {
+                        if let Some(m) = st.mixture_results.get(st.mixture_selected).cloned() {
+                            self.overlay_mixture_match(&m);
+                        }
+                    } else if let Some(m) = st.results.get(st.selected).cloned() {
                         self.apply_library_match(&m);
                     }
                     self.modal = Modal::None;
@@ -3417,6 +3786,195 @@ impl App {
                         }
                     }
                     _ => self.modal = Modal::SpectralMath(st),
+                }
+            }
+            Modal::Integration(mut st) => {
+                match key.code {
+                    KeyCode::Char('z') => {
+                        let idx = self.add_integration_region(self.view_x_min, self.view_x_max);
+                        match idx {
+                            Some(i) => {
+                                st.selected = i;
+                                st.feedback = Some(format!("Added zoom-window region #{}", i + 1));
+                            }
+                            None => st.feedback = Some("No spectral data in the zoom window".into()),
+                        }
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Char('a') => {
+                        let half = match self.current_kind() {
+                            SpectrumKind::Ftir => 25.0,
+                            SpectrumKind::Hnmr => 0.08,
+                            SpectrumKind::Cnmr => 1.5,
+                            SpectrumKind::UvVis => 20.0,
+                        };
+                        let idx = self
+                            .add_integration_region(self.cursor_x - half, self.cursor_x + half);
+                        match idx {
+                            Some(i) => {
+                                st.selected = i;
+                                st.feedback =
+                                    Some(format!("Added cursor region #{} (±{:.2})", i + 1, half));
+                            }
+                            None => st.feedback = Some("No spectral data at the cursor".into()),
+                        }
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        st.selected = st.selected.saturating_sub(1);
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !self.integration_regions.is_empty() {
+                            st.selected = (st.selected + 1).min(self.integration_regions.len() - 1);
+                        }
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Char('r') => {
+                        if !self.integration_regions.is_empty() {
+                            st.selected = st.selected.min(self.integration_regions.len() - 1);
+                            self.integration_ref_idx = st.selected;
+                            st.feedback =
+                                Some(format!("Region #{} is now the reference ★", st.selected + 1));
+                        }
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Left | KeyCode::Right => {
+                        let step = if key.code == KeyCode::Right { 0.5 } else { -0.5 };
+                        self.integration_ref_val =
+                            (self.integration_ref_val + step).clamp(0.1, 10_000.0);
+                        st.feedback = Some(format!(
+                            "Reference integral = {:.2}",
+                            self.integration_ref_val
+                        ));
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Char('d') => {
+                        if !self.integration_regions.is_empty() {
+                            let idx = st.selected.min(self.integration_regions.len() - 1);
+                            self.integration_regions.remove(idx);
+                            if self.integration_regions.is_empty() {
+                                self.integration_ref_idx = 0;
+                            } else {
+                                self.integration_ref_idx =
+                                    self.integration_ref_idx.min(self.integration_regions.len() - 1);
+                                st.selected = idx.min(self.integration_regions.len() - 1);
+                            }
+                            st.feedback = Some(format!("Deleted region #{}", idx + 1));
+                        }
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Char('x') => {
+                        self.clear_integrations();
+                        st.selected = 0;
+                        st.feedback = Some("Cleared all integration regions".into());
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Char('c') => {
+                        if self.integration_regions.is_empty() {
+                            st.feedback = Some("No regions to copy".into());
+                        } else {
+                            let text = self.integration_table_text();
+                            match copy_text(&text) {
+                                Ok(tool) => st.feedback = Some(format!("Copied table via {}", tool)),
+                                Err(e) => st.feedback = Some(format!("Copy failed: {}", e)),
+                            }
+                        }
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Char('p') => {
+                        match self.push_integrations_to_polymer_lab() {
+                            Some(msg) => {
+                                self.status_msg = msg.clone();
+                                st.feedback = Some(msg);
+                                if self.tab == ActiveTab::PolymerLab {
+                                    self.modal = Modal::None;
+                                    return;
+                                }
+                            }
+                            None => {
+                                st.feedback = Some(
+                                    "Need at least 2 regions (3 for ¹H tacticity push)".into(),
+                                );
+                            }
+                        }
+                        self.modal = Modal::Integration(st);
+                    }
+                    _ => self.modal = Modal::Integration(st),
+                }
+            }
+            Modal::Calibration(mut st) => {
+                match key.code {
+                    KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
+                        st.target_buf.push(c);
+                        st.feedback = None;
+                        self.modal = Modal::Calibration(st);
+                    }
+                    KeyCode::Backspace => {
+                        st.target_buf.pop();
+                        st.feedback = None;
+                        self.modal = Modal::Calibration(st);
+                    }
+                    KeyCode::Char('t') => {
+                        let target = match self.current_kind() {
+                            SpectrumKind::Ftir => 1601.4,
+                            SpectrumKind::UvVis => 361.5,
+                            SpectrumKind::Hnmr | SpectrumKind::Cnmr => 0.0,
+                        };
+                        st.target_buf = format!("{:.4}", target);
+                        st.feedback = Some(match self.current_kind() {
+                            SpectrumKind::Ftir => "Polystyrene 1601.4 cm⁻¹".into(),
+                            SpectrumKind::UvVis => "Holmium oxide 361.5 nm".into(),
+                            _ => "TMS 0.00 ppm".into(),
+                        });
+                        self.modal = Modal::Calibration(st);
+                    }
+                    KeyCode::Char('s') => {
+                        let (target, label) = match self.current_kind() {
+                            SpectrumKind::Ftir => (3026.0, "Polystyrene 3026.0 cm⁻¹"),
+                            SpectrumKind::UvVis => (536.3, "Holmium oxide 536.3 nm"),
+                            SpectrumKind::Hnmr => (
+                                self.nmr_solvent.residual_h().first().copied().unwrap_or(7.26),
+                                "Active solvent residual ¹H",
+                            ),
+                            SpectrumKind::Cnmr => (
+                                self.nmr_solvent.residual_c().first().copied().unwrap_or(77.16),
+                                "Active solvent residual ¹³C",
+                            ),
+                        };
+                        st.target_buf = format!("{:.4}", target);
+                        st.feedback = Some(label.into());
+                        self.modal = Modal::Calibration(st);
+                    }
+                    KeyCode::Char('w') => {
+                        let (target, label) = match self.current_kind() {
+                            SpectrumKind::Ftir => (2349.0, "Atmospheric CO₂ 2349.0 cm⁻¹"),
+                            SpectrumKind::Hnmr => {
+                                (self.nmr_solvent.water_h(), "Residual H₂O in active solvent")
+                            }
+                            SpectrumKind::Cnmr => (
+                                self.nmr_solvent.residual_c().first().copied().unwrap_or(77.16),
+                                "Active solvent residual ¹³C",
+                            ),
+                            SpectrumKind::UvVis => (400.0, "UV-Vis 400.0 nm"),
+                        };
+                        st.target_buf = format!("{:.4}", target);
+                        st.feedback = Some(label.into());
+                        self.modal = Modal::Calibration(st);
+                    }
+                    KeyCode::Enter => match st.target_buf.trim().parse::<f64>() {
+                        Ok(target) => {
+                            let msg = self.apply_calibration_target(st.observed_x, target);
+                            self.status_msg = msg;
+                            self.modal = Modal::None;
+                            return;
+                        }
+                        Err(_) => {
+                            st.feedback = Some("Enter a valid numeric target X".into());
+                            self.modal = Modal::Calibration(st);
+                        }
+                    },
+                    _ => self.modal = Modal::Calibration(st),
                 }
             }
             Modal::Busy(busy) => {

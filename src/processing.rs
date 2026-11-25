@@ -1204,6 +1204,160 @@ pub fn integrate_region(xs: &[f64], ys: &[f64], x_lo: f64, x_hi: f64) -> Option<
 }
 
 // ============================================================================
+// QUANTITATIVE INTEGRATION REGIONS
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct IntegrationRegion {
+    #[allow(dead_code)] // stable identifier for future edit/undo support
+    pub id: usize,
+    pub x_lo: f64,
+    pub x_hi: f64,
+    pub area: f64,
+    pub peak_height: f64,
+    pub label: String,
+}
+
+/// Compute local linear-baseline-corrected area and height in linear Absorbance/Intensity space.
+pub fn integrate_spectrum_window(
+    xs: &[f64],
+    ys: &[f64],
+    y_unit: YUnit,
+    x_lo: f64,
+    x_hi: f64,
+) -> Option<(f64, f64)> {
+    let lo = x_lo.min(x_hi);
+    let hi = x_lo.max(x_hi);
+    if y_unit == YUnit::Transmittance {
+        let abs: Vec<f64> = ys.iter().copied().map(transmittance_to_absorbance).collect();
+        integrate_region(xs, &abs, lo, hi)
+    } else {
+        integrate_region(xs, ys, lo, hi)
+    }
+}
+
+/// Shift every X point of `spec` by `delta_x` (= target_x - observed_x) and record calibration metadata.
+pub fn apply_x_calibration(spec: &mut Spectrum, delta_x: f64) {
+    if !delta_x.is_finite() || delta_x.abs() < 1e-12 {
+        return;
+    }
+    for x in &mut spec.x {
+        *x += delta_x;
+    }
+    let note = format!("{:+.4} {}", delta_x, spec.kind.x_unit());
+    if let Some(entry) = spec.metadata.iter_mut().find(|(k, _)| k == "X Calibration") {
+        entry.1 = note;
+    } else {
+        spec.metadata.push(("X Calibration".to_string(), note));
+    }
+}
+
+// ============================================================================
+// ¹H NMR MULTIPLET & J-COUPLING ANALYZER
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct MultipletInfo {
+    #[allow(dead_code)] // reported by callers that render the multiplet centre
+    pub center_ppm: f64,
+    pub multiplicity: &'static str, // "s", "d", "t", "q", "dd", "m"
+    pub j_hz: Vec<f64>,
+    pub line_count: usize,
+    pub freq_mhz: f64,
+}
+
+/// Extract spectrometer observe frequency in MHz from spectrum metadata (defaults to 400.0 MHz).
+pub fn spectrum_nmr_freq_mhz(spec: &Spectrum) -> f64 {
+    for (k, v) in &spec.metadata {
+        let kl = k.to_ascii_lowercase();
+        if kl.contains("freq") || kl.contains("mhz") {
+            if let Some(num) = v
+                .split_whitespace()
+                .find_map(|tok| tok.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').parse::<f64>().ok())
+            {
+                if (60.0..=1200.0).contains(&num) {
+                    return num;
+                }
+            }
+        }
+    }
+    400.0
+}
+
+/// Analyze detected ¹H NMR peaks near `cursor_x` (within ±0.12 ppm) to estimate multiplicity & J (Hz).
+pub fn analyze_hnmr_multiplet(
+    peaks: &[Peak],
+    cursor_x: f64,
+    freq_mhz: f64,
+) -> Option<MultipletInfo> {
+    if freq_mhz <= 1.0 || peaks.is_empty() {
+        return None;
+    }
+    // Gather local cluster of peaks linked by <= 0.065 ppm (~26 Hz at 400 MHz), anchored at nearest peak within ±0.12 ppm
+    let nearest = peaks
+        .iter()
+        .min_by(|a, b| (a.x - cursor_x).abs().total_cmp(&(b.x - cursor_x).abs()))?;
+    if (nearest.x - cursor_x).abs() > 0.12 {
+        return None;
+    }
+    let mut cluster: Vec<f64> = vec![nearest.x];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for p in peaks {
+            if cluster.iter().all(|&cx| (cx - p.x).abs() > 1e-6)
+                && cluster.iter().any(|&cx| (cx - p.x).abs() <= 0.065)
+            {
+                cluster.push(p.x);
+                changed = true;
+            }
+        }
+    }
+    cluster.sort_by(|a, b| a.total_cmp(b));
+    let n = cluster.len();
+    let center_ppm = 0.5 * (cluster[0] + cluster[n - 1]);
+    if n == 1 {
+        return Some(MultipletInfo {
+            center_ppm,
+            multiplicity: "s",
+            j_hz: Vec::new(),
+            line_count: 1,
+            freq_mhz,
+        });
+    }
+    let spacings: Vec<f64> = cluster
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs() * freq_mhz)
+        .collect();
+    let avg_j = spacings.iter().sum::<f64>() / spacings.len() as f64;
+    let max_dev = spacings
+        .iter()
+        .map(|&j| (j - avg_j).abs())
+        .fold(0.0_f64, f64::max);
+
+    let (multiplicity, j_hz) = match n {
+        2 => ("d", vec![spacings[0]]),
+        3 if max_dev <= 1.5 => ("t", vec![avg_j]),
+        4 if max_dev <= 1.5 => ("q", vec![avg_j]),
+        4 if (spacings[0] - spacings[2]).abs() <= 1.5 => {
+            let j1 = 0.5 * (spacings[0] + spacings[2]);
+            let j2 = j1 + spacings[1];
+            let (lo, hi) = if j1 <= j2 { (j1, j2) } else { (j2, j1) };
+            ("dd", vec![hi, lo])
+        }
+        _ => ("m", vec![avg_j]),
+    };
+
+    Some(MultipletInfo {
+        center_ppm,
+        multiplicity,
+        j_hz,
+        line_count: n,
+        freq_mhz,
+    })
+}
+
+// ============================================================================
 // POLYMER CHEMISTRY CALCULATORS
 // ============================================================================
 

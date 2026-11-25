@@ -7,6 +7,7 @@ mod export;
 mod io;
 mod kitty_plot;
 mod matcher;
+mod mixture;
 mod processing;
 mod svg_export;
 mod theme;
@@ -631,7 +632,7 @@ mod tests {
         absorbance_to_transmittance, auto_ftir_conversion, beer_lambert_conc,
         compute_tauc_band_gap, nmr_mn_dpn, pu_hydrogen_bond_index, pvdf_beta_fraction,
         rubberband_baseline, savitzky_golay, tacticity_stats, transmittance_to_absorbance,
-        TaucMode,
+        ProcessConfig, TaucMode,
     };
     use crate::processing::{
         advanced_atr_correction, arpls_baseline, compute_spectral_math, kubelka_munk_transform,
@@ -2239,6 +2240,303 @@ mod tests {
             diff.y[i_flat].abs() < 0.05,
             "baseline not cancelled off-peak (y = {:.4})",
             diff.y[i_flat]
+        );
+    }
+
+    fn find_polymer_by_short(short: &str) -> &'static crate::data::PolymerRef {
+        crate::data::POLYMERS_DB
+            .iter()
+            .find(|p| p.short.eq_ignore_ascii_case(short))
+            .unwrap_or_else(|| panic!("Polymer '{}' not found in POLYMERS_DB", short))
+    }
+
+    fn blend_ftir_abs(parts: &[(&crate::data::PolymerRef, f64)]) -> Spectrum {
+        let mut specs: Vec<(Vec<f64>, Vec<f64>, f64)> = Vec::new();
+        for &(poly, w) in parts {
+            let s = crate::data::synthesize_polymer_reference(poly, SpectrumKind::Ftir);
+            let abs_raw: Vec<f64> = if s.raw_y_unit == YUnit::Transmittance {
+                s.y.iter().copied().map(transmittance_to_absorbance).collect()
+            } else {
+                s.y.clone()
+            };
+            let min_v = abs_raw.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_v = abs_raw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let span = (max_v - min_v).max(1e-12);
+            let norm: Vec<f64> = abs_raw.iter().map(|&v| (v - min_v) / span).collect();
+            specs.push((s.x, norm, w));
+        }
+        let xs = specs[0].0.clone();
+        let mut ys = vec![0.0; xs.len()];
+        for (sx, sy, w) in &specs {
+            for (i, &x) in xs.iter().enumerate() {
+                if let Some(v) = crate::processing::interpolate_y(sx, sy, x) {
+                    ys[i] += w * v;
+                }
+            }
+        }
+        Spectrum {
+            name: "Synthetic FTIR Blend".to_string(),
+            source_path: None,
+            kind: SpectrumKind::Ftir,
+            raw_y_unit: YUnit::Absorbance,
+            x: xs,
+            y: ys,
+            visible: true,
+            color_idx: 0,
+            metadata: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_nnls_mixture_identifies_binary_and_ternary_blends() {
+        let pmma = find_polymer_by_short("PMMA");
+        let ps = find_polymer_by_short("PS");
+        let pet = find_polymer_by_short("PET");
+        let pa66 = crate::data::POLYMERS_DB
+            .iter()
+            .find(|p| {
+                let s = p.short.to_ascii_uppercase();
+                s == "PA66" || s == "PA6,6" || s.contains("NYLON")
+            })
+            .expect("PA66 / Nylon polymer not found in POLYMERS_DB");
+
+        // Binary blend: 60% PMMA + 40% PS
+        let bin_blend = blend_ftir_abs(&[(pmma, 0.60), (ps, 0.40)]);
+        let bin_res = crate::mixture::analyze_mixture(
+            &bin_blend,
+            ProcessConfig::default(),
+            SolventId::Cdcl3,
+            3,
+        );
+        assert!(!bin_res.is_empty(), "binary mixture returned no matches");
+        let top_bin = &bin_res[0];
+        assert!(
+            top_bin.composite_hqi_pct > 92.0,
+            "binary composite HQI too low: {:.2}%",
+            top_bin.composite_hqi_pct
+        );
+        let find_w = |m: &crate::mixture::MixtureMatch, poly: &crate::data::PolymerRef| -> Option<f64> {
+            let target = poly.name.to_ascii_lowercase();
+            m.components
+                .iter()
+                .find(|c| {
+                    c.short.eq_ignore_ascii_case(poly.short)
+                        || c.name.to_ascii_lowercase().contains(&target)
+                        || target.contains(&c.name.to_ascii_lowercase())
+                })
+                .map(|c| c.weight_pct)
+        };
+        let w_pmma = find_w(top_bin, pmma).unwrap_or_else(|| {
+            panic!("PMMA missing from top binary match: {:?}", top_bin.components)
+        });
+        let w_ps = find_w(top_bin, ps).unwrap_or_else(|| {
+            panic!("PS missing from top binary match: {:?}", top_bin.components)
+        });
+        assert!(
+            (w_pmma - 60.0).abs() <= 12.0 && (w_ps - 40.0).abs() <= 12.0,
+            "binary weights out of ±12% tolerance: PMMA={:.1}%, PS={:.1}%",
+            w_pmma,
+            w_ps
+        );
+
+        // Ternary blend: 50% PET + 30% PA66 + 20% PS
+        let tern_blend = blend_ftir_abs(&[(pet, 0.50), (pa66, 0.30), (ps, 0.20)]);
+        let tern_res = crate::mixture::analyze_mixture(
+            &tern_blend,
+            ProcessConfig::default(),
+            SolventId::Cdcl3,
+            3,
+        );
+        assert!(!tern_res.is_empty(), "ternary mixture returned no matches");
+        let top_tern = &tern_res[0];
+        assert!(
+            top_tern.composite_hqi_pct > 92.0,
+            "ternary composite HQI too low: {:.2}%",
+            top_tern.composite_hqi_pct
+        );
+        let w_pet = find_w(top_tern, pet).unwrap_or_else(|| {
+            panic!("PET missing from top ternary match: {:?}", top_tern.components)
+        });
+        let w_pa = find_w(top_tern, pa66).unwrap_or_else(|| {
+            panic!("PA66 missing from top ternary match: {:?}", top_tern.components)
+        });
+        let w_ps3 = find_w(top_tern, ps).unwrap_or_else(|| {
+            panic!("PS missing from top ternary match: {:?}", top_tern.components)
+        });
+        assert!(
+            (w_pet - 50.0).abs() <= 12.0
+                && (w_pa - 30.0).abs() <= 12.0
+                && (w_ps3 - 20.0).abs() <= 12.0,
+            "ternary weights out of ±12% tolerance: PET={:.1}%, PA66={:.1}%, PS={:.1}%",
+            w_pet,
+            w_pa,
+            w_ps3
+        );
+    }
+
+    #[test]
+    fn test_nnls_does_not_overfit_pure_spectrum() {
+        let pmma = pmma_polymer_spectrum();
+        let res = crate::mixture::analyze_mixture(
+            &pmma,
+            ProcessConfig::default(),
+            SolventId::Cdcl3,
+            3,
+        );
+        assert!(!res.is_empty(), "pure PMMA returned no matches");
+        let top = &res[0];
+        assert_eq!(
+            top.components.len(),
+            1,
+            "pure PMMA overfitted into {} components: {:?}",
+            top.components.len(),
+            top.components
+        );
+        assert!(
+            top.components[0].short.eq_ignore_ascii_case("PMMA")
+                || top.components[0].name.to_ascii_uppercase().contains("PMMA")
+                || top.components[0].name.to_ascii_lowercase().contains("methyl methacrylate"),
+            "unexpected top single match: {}",
+            top.components[0].name
+        );
+        assert!(
+            top.composite_hqi_pct > 88.0,
+            "pure PMMA HQI too low: {:.2}%",
+            top.composite_hqi_pct
+        );
+    }
+
+    #[test]
+    fn test_nnls_gram_enforces_non_negativity() {
+        // SPD Gram matrix whose unconstrained solution is [1.0, -0.6, 0.4]
+        let g = vec![
+            vec![2.0, 1.0, 0.5],
+            vec![1.0, 2.0, 0.5],
+            vec![0.5, 0.5, 2.0],
+        ];
+        let rhs = vec![1.6, 0.0, 1.0];
+        let c = crate::mixture::nnls_gram(&g, &rhs);
+        assert_eq!(c.len(), 3);
+        for (j, &cj) in c.iter().enumerate() {
+            assert!(cj >= 0.0, "c[{}] = {} is negative", j, cj);
+        }
+        assert!(c[1].abs() < 1e-9, "expected c[1] == 0, got {}", c[1]);
+        assert!((c[0] - 0.72).abs() < 1e-5, "c[0] = {}", c[0]);
+        assert!((c[2] - 0.32).abs() < 1e-5, "c[2] = {}", c[2]);
+
+        // KKT optimality: grad = rhs - G c
+        for j in 0..3 {
+            let gc: f64 = (0..3).map(|m| g[j][m] * c[m]).sum();
+            let grad = rhs[j] - gc;
+            if c[j] <= 1e-12 {
+                assert!(grad <= 1e-6, "KKT inactive violation at {}: grad={}", j, grad);
+            } else {
+                assert!(grad.abs() <= 1e-6, "KKT active violation at {}: grad={}", j, grad);
+            }
+        }
+    }
+
+    #[test]
+    fn test_integration_regions_relative_ratio() {
+        let spec = crate::data::pmma_hnmr_spectrum();
+        let (a_och3, h_och3) = crate::processing::integrate_spectrum_window(
+            &spec.x,
+            &spec.y,
+            spec.raw_y_unit,
+            3.35,
+            3.85,
+        )
+        .expect("OCH3 integration failed");
+        let (a_ch3, h_ch3) = crate::processing::integrate_spectrum_window(
+            &spec.x,
+            &spec.y,
+            spec.raw_y_unit,
+            0.65,
+            1.35,
+        )
+        .expect("alpha-CH3 integration failed");
+
+        assert!(a_och3 > 0.0 && a_och3.is_finite() && h_och3 > 0.0);
+        assert!(a_ch3 > 0.0 && a_ch3.is_finite() && h_ch3 > 0.0);
+        let ratio = a_och3 / a_ch3;
+        assert!(ratio > 0.2 && ratio < 5.0 && ratio.is_finite(), "unexpected ratio {:.4}", ratio);
+    }
+
+    #[test]
+    fn test_x_axis_calibration_shifts_peaks() {
+        let orig = polystyrene_ftir_spectrum();
+        let peak_in = |s: &Spectrum, lo: f64, hi: f64| -> f64 {
+            let mut best_x = lo;
+            let mut best_a = f64::NEG_INFINITY;
+            for (&x, &y) in s.x.iter().zip(&s.y) {
+                if x >= lo && x <= hi {
+                    let a = if s.raw_y_unit == YUnit::Transmittance {
+                        transmittance_to_absorbance(y)
+                    } else {
+                        y
+                    };
+                    if a > best_a {
+                        best_a = a;
+                        best_x = x;
+                    }
+                }
+            }
+            best_x
+        };
+
+        let orig_peak = peak_in(&orig, 1580.0, 1620.0);
+        let mut shifted = orig.clone();
+        for x in &mut shifted.x {
+            *x -= 4.5;
+        }
+        crate::processing::apply_x_calibration(&mut shifted, 4.5);
+
+        let restored_peak = peak_in(&shifted, 1580.0, 1620.0);
+        assert!(
+            (restored_peak - orig_peak).abs() <= 0.1,
+            "calibrated peak {:.3} != original {:.3}",
+            restored_peak,
+            orig_peak
+        );
+        assert!(
+            shifted.metadata.iter().any(|(k, _)| k == "X Calibration"),
+            "X Calibration metadata not recorded"
+        );
+    }
+
+    #[test]
+    fn test_hnmr_j_coupling_doublet_triplet_detection() {
+        let mk_peak = |x: f64| crate::processing::Peak {
+            x,
+            y: 1.0,
+            prominence: 1.0,
+            fwhm: Some(0.01),
+            snr: 50.0,
+            label: String::new(),
+        };
+
+        // Doublet: J = 7.2 Hz at 400 MHz -> spacing = 0.018 ppm
+        let doublet = vec![mk_peak(4.100), mk_peak(4.118)];
+        let d_info = crate::processing::analyze_hnmr_multiplet(&doublet, 4.109, 400.0)
+            .expect("doublet not detected");
+        assert_eq!(d_info.multiplicity, "d");
+        assert_eq!(d_info.line_count, 2);
+        assert!(
+            (d_info.j_hz[0] - 7.2).abs() <= 0.1,
+            "expected doublet J=7.2 Hz, got {:.3}",
+            d_info.j_hz[0]
+        );
+
+        // Triplet: J = 7.0 Hz at 400 MHz -> spacing = 0.0175 ppm
+        let triplet = vec![mk_peak(1.2000), mk_peak(1.2175), mk_peak(1.2350)];
+        let t_info = crate::processing::analyze_hnmr_multiplet(&triplet, 1.218, 400.0)
+            .expect("triplet not detected");
+        assert_eq!(t_info.multiplicity, "t");
+        assert_eq!(t_info.line_count, 3);
+        assert!(
+            (t_info.j_hz[0] - 7.0).abs() <= 0.1,
+            "expected triplet J=7.0 Hz, got {:.3}",
+            t_info.j_hz[0]
         );
     }
 }

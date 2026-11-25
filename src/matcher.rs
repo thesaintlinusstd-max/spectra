@@ -197,30 +197,6 @@ fn interpolate_and_normalize(
     Some(smooth_and_deriv_finite(&out, SmoothLevel::Win5))
 }
 
-fn pearson(a: &[f64], b: &[f64]) -> Option<f64> {
-    if a.len() != b.len() || a.len() < 8 {
-        return None;
-    }
-    let n = a.len() as f64;
-    let ma = a.iter().sum::<f64>() / n;
-    let mb = b.iter().sum::<f64>() / n;
-    let mut num = 0.0;
-    let mut da = 0.0;
-    let mut db = 0.0;
-    for (&x, &y) in a.iter().zip(b) {
-        let dx = x - ma;
-        let dy = y - mb;
-        num += dx * dy;
-        da += dx * dx;
-        db += dy * dy;
-    }
-    let den = (da * db).sqrt();
-    if den <= 1e-15 {
-        return None;
-    }
-    Some(num / den)
-}
-
 fn to_f32_vec(v: &[f64]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
@@ -515,6 +491,35 @@ fn save_binary_cache(path: &Path, sig: u64, entries: &[CachedFingerprint]) {
     let _ = fs::remove_file(&tmp_path);
 }
 
+fn build_cached_entry(
+    path: &Path,
+    kind: SpectrumKind,
+    cfg: ProcessConfig,
+) -> Option<CachedFingerprint> {
+    let spec = load_spectrum_file(path, Some(kind)).ok()?;
+    let (vals, deriv) = prepare_for_kind(&spec, cfg)?;
+    let short = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ref")
+        .to_string();
+    let source = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| format!("{s}/"))
+        .unwrap_or_else(|| "library/".to_string());
+
+    Some(CachedFingerprint {
+        name: spec.name,
+        short,
+        source,
+        path: path.to_path_buf(),
+        vals: to_f32_vec(&vals),
+        deriv: to_f32_vec(&deriv),
+    })
+}
+
 fn cached_library_entries(kind: SpectrumKind) -> Vec<CachedFingerprint> {
     let mut paths: Vec<PathBuf> = crate::io::library_index()
         .iter()
@@ -551,7 +556,9 @@ fn cached_library_entries(kind: SpectrumKind) -> Vec<CachedFingerprint> {
         return entries;
     }
 
-    // 3. Cold build: parse & fingerprint all library files
+    // 3. Cold build: parse & fingerprint all library files. Large packs are
+    // split into contiguous chunks and fingerprinted concurrently so a cold
+    // start scales with available cores while output order stays deterministic.
     let prep_cfg = ProcessConfig {
         y_pref: YAxisPreference::Native,
         baseline: BaselineMode::Off,
@@ -559,35 +566,37 @@ fn cached_library_entries(kind: SpectrumKind) -> Vec<CachedFingerprint> {
         ..ProcessConfig::default()
     };
 
-    let mut entries = Vec::with_capacity(paths.len());
-    for path in paths {
-        let Ok(spec) = load_spectrum_file(&path, Some(kind)) else {
-            continue;
-        };
-        let Some((vals, deriv)) = prepare_for_kind(&spec, prep_cfg) else {
-            continue;
-        };
-        let short = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("ref")
-            .to_string();
-        let source = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .map(|s| format!("{s}/"))
-            .unwrap_or_else(|| "library/".to_string());
-
-        entries.push(CachedFingerprint {
-            name: spec.name,
-            short,
-            source,
-            path,
-            vals: to_f32_vec(&vals),
-            deriv: to_f32_vec(&deriv),
-        });
-    }
+    let entries: Vec<CachedFingerprint> = if paths.len() >= 16 {
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(12)
+            .min(paths.len())
+            .max(1);
+        let chunk_size = (paths.len() + n_threads - 1) / n_threads;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .filter_map(|p| build_cached_entry(p, kind, prep_cfg))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    } else {
+        paths
+            .iter()
+            .filter_map(|p| build_cached_entry(p, kind, prep_cfg))
+            .collect()
+    };
 
     // Best-effort atomic disk cache write
     save_binary_cache(&disk_path, sig, &entries);
@@ -606,6 +615,46 @@ fn cached_library_entries(kind: SpectrumKind) -> Vec<CachedFingerprint> {
 // SCORING FUNCTIONS
 // ============================================================================
 
+/// Single-pass, zero-allocation Pearson accumulator. All sums are gathered in
+/// one sweep and the correlation is finished in O(1) stack math.
+#[derive(Default, Clone, Copy)]
+struct PearsonAcc {
+    n: usize,
+    sx: f64,
+    sy: f64,
+    sxx: f64,
+    syy: f64,
+    sxy: f64,
+}
+
+impl PearsonAcc {
+    #[inline]
+    fn push(&mut self, x: f64, y: f64) {
+        self.n += 1;
+        self.sx += x;
+        self.sy += y;
+        self.sxx += x * x;
+        self.syy += y * y;
+        self.sxy += x * y;
+    }
+
+    #[inline]
+    fn finish(self, min_n: usize) -> Option<f64> {
+        if self.n < min_n {
+            return None;
+        }
+        let nf = self.n as f64;
+        let vx = (self.sxx - (self.sx * self.sx) / nf).max(0.0);
+        let vy = (self.syy - (self.sy * self.sy) / nf).max(0.0);
+        let den = (vx * vy).sqrt();
+        if den <= 1e-15 {
+            return None;
+        }
+        let cov = self.sxy - (self.sx * self.sy) / nf;
+        Some((cov / den).clamp(-1.0, 1.0))
+    }
+}
+
 fn score_ftir_pair(
     q_val: &[f64],
     q_der: &[f64],
@@ -621,12 +670,9 @@ fn score_ftir_pair(
         .min(c_der.len());
 
     let mut q_valid = 0usize;
-    let mut qa = Vec::with_capacity(n);
-    let mut ca = Vec::with_capacity(n);
-    let mut qd = Vec::with_capacity(n);
-    let mut cd = Vec::with_capacity(n);
-    let mut qfp = Vec::with_capacity(n);
-    let mut cfp = Vec::with_capacity(n);
+    let mut abs_acc = PearsonAcc::default();
+    let mut der_acc = PearsonAcc::default();
+    let mut fp_acc = PearsonAcc::default();
 
     for i in 0..n {
         let x = g[i];
@@ -638,39 +684,24 @@ fn score_ftir_pair(
             q_valid += 1;
             let cv = c_val[i] as f64;
             if cv.is_finite() {
-                qa.push(qv);
-                ca.push(cv);
+                abs_acc.push(qv, cv);
                 if x <= FP_HI {
-                    qfp.push(qv);
-                    cfp.push(cv);
+                    fp_acc.push(qv, cv);
                 }
             }
         }
         let qdv = q_der[i];
         let cdv = c_der[i] as f64;
         if qdv.is_finite() && cdv.is_finite() {
-            qd.push(qdv);
-            cd.push(cdv);
+            der_acc.push(qdv, cdv);
         }
     }
 
-    if qa.len() < MIN_POINTS {
-        return None;
-    }
+    let r_abs = abs_acc.finish(MIN_POINTS)?.clamp(0.0, 1.0);
+    let r_deriv = der_acc.finish(16).unwrap_or(0.0).clamp(0.0, 1.0);
+    let r_fp = fp_acc.finish(60).unwrap_or(r_abs).clamp(0.0, 1.0);
 
-    let r_abs = pearson(&qa, &ca)?.clamp(0.0, 1.0);
-    let r_deriv = if qd.len() >= 16 {
-        pearson(&qd, &cd).unwrap_or(0.0).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let r_fp = if qfp.len() >= 60 {
-        pearson(&qfp, &cfp).unwrap_or(r_abs).clamp(0.0, 1.0)
-    } else {
-        r_abs
-    };
-
-    let overlap_ratio = (qa.len() as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
+    let overlap_ratio = (abs_acc.n as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
     let cov_factor = 0.55 + 0.45 * overlap_ratio;
     let hqi_pct = (0.35 * r_abs + 0.40 * r_deriv + 0.25 * r_fp) * cov_factor * 100.0;
 
@@ -690,10 +721,8 @@ fn score_uvvis_pair(
         .min(c_der.len());
 
     let mut q_valid = 0usize;
-    let mut qa = Vec::with_capacity(n);
-    let mut ca = Vec::with_capacity(n);
-    let mut qd = Vec::with_capacity(n);
-    let mut cd = Vec::with_capacity(n);
+    let mut abs_acc = PearsonAcc::default();
+    let mut der_acc = PearsonAcc::default();
 
     for i in 0..n {
         let qv = q_val[i];
@@ -701,30 +730,20 @@ fn score_uvvis_pair(
             q_valid += 1;
             let cv = c_val[i] as f64;
             if cv.is_finite() {
-                qa.push(qv);
-                ca.push(cv);
+                abs_acc.push(qv, cv);
             }
         }
         let qdv = q_der[i];
         let cdv = c_der[i] as f64;
         if qdv.is_finite() && cdv.is_finite() {
-            qd.push(qdv);
-            cd.push(cdv);
+            der_acc.push(qdv, cdv);
         }
     }
 
-    if qa.len() < UVVIS_MIN_POINTS {
-        return None;
-    }
+    let r_abs = abs_acc.finish(UVVIS_MIN_POINTS)?.clamp(0.0, 1.0);
+    let r_deriv = der_acc.finish(8).unwrap_or(0.0).clamp(0.0, 1.0);
 
-    let r_abs = pearson(&qa, &ca)?.clamp(0.0, 1.0);
-    let r_deriv = if qd.len() >= 8 {
-        pearson(&qd, &cd).unwrap_or(0.0).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-
-    let overlap_ratio = (qa.len() as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
+    let overlap_ratio = (abs_acc.n as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
     let cov_factor = 0.60 + 0.40 * overlap_ratio;
     let hqi_pct = (0.60 * r_abs + 0.40 * r_deriv) * cov_factor * 100.0;
 
@@ -746,10 +765,8 @@ fn score_nmr_pair(
         .min(c_der.len());
 
     let mut q_valid = 0usize;
-    let mut qa = Vec::with_capacity(n);
-    let mut ca = Vec::with_capacity(n);
-    let mut qd = Vec::with_capacity(n);
-    let mut cd = Vec::with_capacity(n);
+    let mut abs_acc = PearsonAcc::default();
+    let mut der_acc = PearsonAcc::default();
 
     for i in 0..n {
         if masked[i] {
@@ -760,30 +777,20 @@ fn score_nmr_pair(
             q_valid += 1;
             let cv = c_val[i] as f64;
             if cv.is_finite() {
-                qa.push(qv);
-                ca.push(cv);
+                abs_acc.push(qv, cv);
             }
         }
         let qdv = q_der[i];
         let cdv = c_der[i] as f64;
         if qdv.is_finite() && cdv.is_finite() {
-            qd.push(qdv);
-            cd.push(cdv);
+            der_acc.push(qdv, cdv);
         }
     }
 
-    if qa.len() < NMR_MIN_POINTS {
-        return None;
-    }
+    let r_abs = abs_acc.finish(NMR_MIN_POINTS)?.clamp(0.0, 1.0);
+    let r_deriv = der_acc.finish(16).unwrap_or(0.0).clamp(0.0, 1.0);
 
-    let r_abs = pearson(&qa, &ca)?.clamp(0.0, 1.0);
-    let r_deriv = if qd.len() >= 16 {
-        pearson(&qd, &cd).unwrap_or(0.0).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-
-    let overlap_ratio = (qa.len() as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
+    let overlap_ratio = (abs_acc.n as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
     let cov_factor = 0.60 + 0.40 * overlap_ratio;
     let hqi_pct = (0.65 * r_abs + 0.35 * r_deriv) * cov_factor * 100.0;
 
@@ -1026,4 +1033,183 @@ pub fn match_nmr_library(
     results.sort_by(|a, b| b.hqi_pct.total_cmp(&a.hqi_pct));
     results.truncate(MAX_MATCHES);
     results
+}
+
+// ============================================================================
+// SHARED PREPARED LIBRARY BUNDLES (used by the mixture NNLS solver)
+// ============================================================================
+
+#[derive(Clone)]
+pub(crate) struct PreparedRef {
+    pub name: String,
+    pub short: String,
+    pub source: String,
+    pub is_builtin: bool,
+    pub file_path: Option<PathBuf>,
+    pub vals: Vec<f32>,
+    pub deriv: Vec<f32>,
+}
+
+pub(crate) struct PreparedQuery {
+    #[allow(dead_code)] // retained for callers that need the raw grid
+    pub grid: Vec<f64>,
+    pub vals: Vec<f64>,
+    pub deriv: Vec<f64>,
+    pub masked: Vec<bool>,
+    pub min_points: usize,
+}
+
+fn kind_grid(kind: SpectrumKind) -> Vec<f64> {
+    match kind {
+        SpectrumKind::Ftir => grid_ftir(),
+        SpectrumKind::UvVis => grid_uvvis(),
+        SpectrumKind::Hnmr => grid_hnmr(),
+        SpectrumKind::Cnmr => grid_cnmr(),
+    }
+}
+
+fn kind_min_points(kind: SpectrumKind) -> usize {
+    match kind {
+        SpectrumKind::Ftir => MIN_POINTS,
+        SpectrumKind::UvVis => UVVIS_MIN_POINTS,
+        SpectrumKind::Hnmr | SpectrumKind::Cnmr => NMR_MIN_POINTS,
+    }
+}
+
+pub(crate) fn prepare_query_bundle(
+    query: &Spectrum,
+    cfg: ProcessConfig,
+    solvent: SolventId,
+) -> Option<PreparedQuery> {
+    let (vals, deriv) = prepare_for_kind(query, cfg)?;
+    let grid = kind_grid(query.kind);
+    let masked: Vec<bool> = match query.kind {
+        SpectrumKind::Ftir => grid
+            .iter()
+            .map(|&x| (CO2_LO..=CO2_HI).contains(&x))
+            .collect(),
+        SpectrumKind::Hnmr => {
+            let res_h = solvent.residual_h();
+            let water = solvent.water_h();
+            grid.iter()
+                .map(|&x| {
+                    (x - 0.0).abs() <= 0.08
+                        || (x - water).abs() <= 0.12
+                        || res_h.iter().any(|&s| (x - s).abs() <= 0.12)
+                })
+                .collect()
+        }
+        SpectrumKind::Cnmr => {
+            let res_c = solvent.residual_c();
+            grid.iter()
+                .map(|&x| res_c.iter().any(|&s| (x - s).abs() <= 1.5))
+                .collect()
+        }
+        SpectrumKind::UvVis => vec![false; grid.len()],
+    };
+
+    Some(PreparedQuery {
+        grid,
+        vals,
+        deriv,
+        masked,
+        min_points: kind_min_points(query.kind),
+    })
+}
+
+pub(crate) fn collect_prepared_refs(
+    kind: SpectrumKind,
+    cfg: ProcessConfig,
+) -> Vec<PreparedRef> {
+    let score_cfg = ProcessConfig {
+        smooth: SmoothLevel::Off,
+        ..cfg
+    };
+    let mut out: Vec<PreparedRef> = Vec::new();
+
+    match kind {
+        SpectrumKind::Ftir => {
+            for poly in POLYMERS_DB {
+                let cand = synthesize_polymer_reference(poly, SpectrumKind::Ftir);
+                if let Some((vals, deriv)) = prepare_ftir(&cand, score_cfg) {
+                    out.push(PreparedRef {
+                        name: poly.name.to_string(),
+                        short: poly.short.to_string(),
+                        source: "Built-in".to_string(),
+                        is_builtin: true,
+                        file_path: None,
+                        vals: to_f32_vec(&vals),
+                        deriv: to_f32_vec(&deriv),
+                    });
+                }
+            }
+        }
+        SpectrumKind::Hnmr | SpectrumKind::Cnmr => {
+            for poly in POLYMERS_DB {
+                let has_peaks = match kind {
+                    SpectrumKind::Hnmr => !poly.hnmr_peaks.is_empty(),
+                    SpectrumKind::Cnmr => !poly.cnmr_peaks.is_empty(),
+                    _ => false,
+                };
+                if !has_peaks {
+                    continue;
+                }
+                let cand = synthesize_polymer_reference(poly, kind);
+                if let Some((vals, deriv)) = prepare_nmr(&cand, score_cfg, &kind_grid(kind)) {
+                    out.push(PreparedRef {
+                        name: poly.name.to_string(),
+                        short: poly.short.to_string(),
+                        source: "Built-in".to_string(),
+                        is_builtin: true,
+                        file_path: None,
+                        vals: to_f32_vec(&vals),
+                        deriv: to_f32_vec(&deriv),
+                    });
+                }
+            }
+        }
+        SpectrumKind::UvVis => {
+            for preset in DemoPreset::ALL {
+                if preset.kind() != SpectrumKind::UvVis {
+                    continue;
+                }
+                for demo in generate_demo_preset(preset) {
+                    if demo.kind != SpectrumKind::UvVis {
+                        continue;
+                    }
+                    if let Some((vals, deriv)) = prepare_uvvis(&demo, score_cfg) {
+                        out.push(PreparedRef {
+                            name: demo.name.clone(),
+                            short: demo
+                                .name
+                                .split(['(', '—'])
+                                .next()
+                                .unwrap_or(&demo.name)
+                                .trim()
+                                .to_string(),
+                            source: "Built-in".to_string(),
+                            is_builtin: true,
+                            file_path: None,
+                            vals: to_f32_vec(&vals),
+                            deriv: to_f32_vec(&deriv),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    for entry in cached_library_entries(kind) {
+        out.push(PreparedRef {
+            name: entry.name,
+            short: entry.short,
+            source: entry.source,
+            is_builtin: false,
+            file_path: Some(entry.path),
+            vals: entry.vals,
+            deriv: entry.deriv,
+        });
+    }
+
+    out
 }
