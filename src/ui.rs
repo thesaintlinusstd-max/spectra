@@ -1793,6 +1793,41 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 // ============================================================================
 // MODALS (GoTo, Search, FilePicker, DemoPicker, Publication Export, Help)
 // ============================================================================
+/// Truncate `s` with `…` if longer than `width` chars, or right-pad with spaces
+/// to exact `width` chars so modal columns always align cleanly.
+fn fit_col(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > width {
+        if width <= 1 {
+            "…".to_string()
+        } else {
+            let mut out: String = chars[..width - 1].iter().collect();
+            out.push('…');
+            out
+        }
+    } else {
+        let mut out = s.to_string();
+        for _ in 0..(width - chars.len()) {
+            out.push(' ');
+        }
+        out
+    }
+}
+
+/// Truncate `s` with `…` when longer than `max_chars`, without right-padding.
+fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = chars[..max_chars - 1].iter().collect();
+    out.push('…');
+    out
+}
+
 fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
     let v = Layout::default()
         .direction(Direction::Vertical)
@@ -2199,11 +2234,11 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(ACCENT_YELLOW),
                     ),
                     Span::styled(
-                        format!("{:<8}", format!("[{}]", entry.kind.display_name())),
+                        fit_col(&format!("[{}]", entry.kind.display_name()), 10),
                         Style::default().fg(kind_color).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!(" {:<32}", name.chars().take(32).collect::<String>()),
+                        format!(" {}", fit_col(&name, 34)),
                         Style::default()
                             .fg(if active { DARK_TEXT } else { TEXT_PRIMARY })
                             .bg(if active { ACCENT_AMBER } else { SURFACE_ALT }),
@@ -2301,6 +2336,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(ACCENT_CORAL),
                     )));
                 } else {
+                    let inner_w = rect.width.saturating_sub(2) as usize;
                     let max_vis = (rect.height.saturating_sub(11) as usize / 3).max(1);
                     let start = st.mixture_selected.saturating_sub(max_vis.saturating_sub(1));
                     for (i, m) in st
@@ -2340,7 +2376,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                                 Style::default().fg(color).add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
-                                format!("  ΔHQI {:+.1}%", m.improvement_pct),
+                                format!(" ΔHQI {:+5.1}%", m.improvement_pct),
                                 Style::default().fg(if m.improvement_pct > 0.0 {
                                     ACCENT_GREEN
                                 } else {
@@ -2373,7 +2409,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                                 _ => ACCENT_AMBER,
                             };
                             comp_spans.push(Span::styled(
-                                format!("{:.1}% {}", c.weight_pct, c.short),
+                                format!("{:.1}% {}", c.weight_pct, truncate_ellipsis(&c.short, 22)),
                                 Style::default().fg(ccol).add_modifier(Modifier::BOLD),
                             ));
                         }
@@ -2385,11 +2421,12 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                             .map(|c| c.name.clone())
                             .collect::<Vec<_>>()
                             .join(" + ");
+                        let detail = format!(
+                            "       r_abs {:.3} · r_deriv {:.3} · {}",
+                            m.r_abs, m.r_deriv, names
+                        );
                         lines.push(TextLine::from(Span::styled(
-                            format!(
-                                "       r_abs {:.3} · r_deriv {:.3} · {}",
-                                m.r_abs, m.r_deriv, names
-                            ),
+                            truncate_ellipsis(&detail, inner_w.saturating_sub(4)),
                             Style::default().fg(TEXT_MUTED),
                         )));
                     }
@@ -2417,9 +2454,25 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                     )));
                 }
 
+                let inner_w = rect.width.saturating_sub(2) as usize;
+                let name_w = inner_w.saturating_sub(52).clamp(18, 30);
+
+                // Column header
+                lines.push(TextLine::from(Span::styled(
+                    format!(
+                        " {} {:<20} {:>6} {:<11} {}",
+                        fit_col("Name", name_w),
+                        "Score",
+                        "HQI",
+                        "Source",
+                        "Correlation"
+                    ),
+                    Style::default().fg(TEXT_MUTED),
+                )));
+
                 // Two rendered lines per hit (score row + name row): scroll the
                 // window so the j/k selection is always visible.
-                let max_vis = (rect.height.saturating_sub(10) as usize / 2).max(1);
+                let max_vis = (rect.height.saturating_sub(11) as usize / 2).max(1);
                 let start = st.selected.saturating_sub(max_vis.saturating_sub(1));
                 for (i, m) in st
                     .results
@@ -2445,7 +2498,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                             Style::default().fg(ACCENT_GREEN),
                         ),
                         Span::styled(
-                            format!("{:<12}", m.short),
+                            fit_col(&m.short, name_w),
                             Style::default()
                                 .fg(if active { DARK_TEXT } else { TEXT_PRIMARY })
                                 .bg(if active { ACCENT_GREEN } else { SURFACE_DARK })
@@ -2461,22 +2514,22 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                             format!(" {:5.1}%", m.hqi_pct),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ),
-                        Span::raw("  "),
+                        Span::raw(" "),
                         Span::styled(
-                            format!("[{}]", m.source),
+                            fit_col(&format!("[{}]", m.source), 11),
                             Style::default()
                                 .fg(if m.is_builtin { ACCENT_AQUA } else { ACCENT_AMBER }),
                         ),
                     ];
                     if active {
                         spans.push(Span::styled(
-                            format!("  r_abs {:.3} · r_deriv {:.3}", m.r_abs, m.r_deriv),
+                            format!(" r_abs {:.3} · r_deriv {:.3}", m.r_abs, m.r_deriv),
                             Style::default().fg(ACCENT_YELLOW),
                         ));
                     }
                     lines.push(TextLine::from(spans));
                     lines.push(TextLine::from(Span::styled(
-                        format!("     {}", m.name),
+                        format!("     {}", truncate_ellipsis(&m.name, inner_w.saturating_sub(6))),
                         Style::default().fg(TEXT_MUTED),
                     )));
                 }
@@ -2580,6 +2633,8 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
         Modal::LibrarySetup(st) => {
             let rect = centered_rect(76, 52, area);
             frame.render_widget(Clear, rect);
+            let inner_w = rect.width.saturating_sub(2) as usize;
+            let source_w = inner_w.saturating_sub(3 + 4 + 32 + 24).max(1);
 
             let pack_info: [(&str, &str, &str, &str); 5] = [
                 (
@@ -2646,15 +2701,15 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                         check_style,
                     ),
                     Span::styled(
-                        format!("{:<30} ", name),
+                        fit_col(name, 32),
                         row_style,
                     ),
                     Span::styled(
-                        format!("({}) ", size),
+                        fit_col(size, 24),
                         Style::default().fg(ACCENT_AQUA),
                     ),
                     Span::styled(
-                        format!("— {}", source),
+                        truncate_ellipsis(&format!("— {}", source), source_w),
                         Style::default().fg(TEXT_MUTED),
                     ),
                 ]));
@@ -3518,5 +3573,14 @@ mod tests {
             full_text.contains("[q] Quit"),
             "top-bar quit hint must not be clipped"
         );
+    }
+
+    #[test]
+    fn fit_col_aligns_ascii_and_unicode() {
+        assert_eq!(fit_col("PMMA", 12).chars().count(), 12);
+        let long = fit_col("org_mnhn_consolidant_paraloid_b82", 12);
+        assert_eq!(long.chars().count(), 12);
+        assert!(long.ends_with('…'));
+        assert_eq!(fit_col("[¹³C NMR]", 10).chars().count(), 10);
     }
 }
