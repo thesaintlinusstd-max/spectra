@@ -2801,7 +2801,7 @@ fn field_line(label: &str, value: String, cursor: bool, active: bool) -> TextLin
     };
     TextLine::from(Span::styled(
         format!(
-            "  {:<14}{}{}",
+            "  {:<17}{}{}",
             label,
             value,
             if cursor { "█" } else { " " }
@@ -3082,6 +3082,8 @@ fn draw_integration_modal(
 
     let kind = app.current_kind();
     let unit = kind.x_unit();
+    let inner_w = inner.width as usize;
+    let total_area: f64 = app.integration_regions.iter().map(|r| r.area.max(0.0)).sum();
     let ref_txt = if app.integration_regions.is_empty() {
         "—".to_string()
     } else {
@@ -3102,18 +3104,21 @@ fn draw_integration_modal(
             Style::default().fg(ACCENT_YELLOW).add_modifier(Modifier::BOLD),
         )),
         TextLine::from(Span::styled(
-            "  #   Region Range                Center      Abs Area    Rel Integral   Ref   Assignment",
+            format!(
+                "  {:>2}  {:<22} {:>8}  {:>10}  {:>7}  {:>9}  {:^3}  {}",
+                "#", "Region Range", "Center", "Abs Area", "Area %", "Rel Int", "Ref", "Assignment"
+            ),
             Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
         )),
         TextLine::from(Span::styled(
-            "  ─────────────────────────────────────────────────────────────────────────────────────",
+            format!("  {}", "─".repeat(inner_w.saturating_sub(4).max(40))),
             Style::default().fg(TEXT_MUTED),
         )),
     ];
 
     if app.integration_regions.is_empty() {
         lines.push(TextLine::from(Span::styled(
-            "  No regions yet — [z] adds the current zoom window, [a] adds around the cursor.",
+            "  No regions yet — [A] auto-all peaks, [z] current zoom window, [a] around the cursor.",
             Style::default().fg(ACCENT_CORAL),
         )));
     }
@@ -3130,24 +3135,26 @@ fn draw_integration_modal(
         let active = i == st.selected;
         let lo = r.x_lo.min(r.x_hi);
         let hi = r.x_lo.max(r.x_hi);
-        let range = format!("{:.2} – {:.2} {}", lo, hi, unit);
         let center = 0.5 * (r.x_lo + r.x_hi);
         let rel = app
             .integration_relative(i)
             .map(|v| format!("{:.4}", v))
             .unwrap_or_else(|| "—".into());
         let mark = if i == app.integration_ref_idx { "★" } else { "" };
-        let label = if r.label.chars().count() > 28 {
-            r.label.chars().take(28).collect::<String>()
+        let area_pct = if total_area > 1e-12 {
+            100.0 * r.area.max(0.0) / total_area
         } else {
-            r.label.clone()
+            0.0
         };
+        let range = truncate_ellipsis(&format!("{:.2}–{:.2} {}", lo, hi, unit), 22);
+        let label = truncate_ellipsis(&r.label, inner_w.saturating_sub(74).max(12));
         let row = format!(
-            "{:>2}  {:<26} {:>9.3}  {:>11.5}  {:>13}  {:^4}  {}",
+            "  {:>2}  {:<22} {:>8.3}  {:>10.5}  {:>6.1}%  {:>9}  {:^3}  {}",
             i + 1,
             range,
             center,
             r.area,
+            area_pct,
             rel,
             mark,
             label
@@ -3160,12 +3167,12 @@ fn draw_integration_modal(
         } else {
             Style::default().fg(TEXT_PRIMARY)
         };
-        lines.push(TextLine::from(Span::styled(format!("  {}", row), style)));
+        lines.push(TextLine::from(Span::styled(row, style)));
     }
 
     lines.push(TextLine::from(""));
     lines.push(TextLine::from(Span::styled(
-        "  [z] Add Zoom Window   [a] Add Around Cursor   [j/k] Navigate   [r] Set Ref ★   [←/→] Ref Value",
+        "  [A] Auto-All Peaks   [z] Add Zoom   [a] Add Cursor   [j/k] Navigate   [r] Set Ref ★   [←/→] Ref Value",
         Style::default().fg(TEXT_MUTED),
     )));
     lines.push(TextLine::from(Span::styled(

@@ -1351,6 +1351,14 @@ pub fn ftir_band_rule(band: &FtirBand) -> FtirBandRule {
     if g.starts_with("PVDF α-phase") {
         return FtirBandRule { tier: BandTier::Specific, short_label: "PVDF α-phase", requires: &[(1140.0, 1225.0), (965.0, 990.0)], forbids: &[] };
     }
+    if g.starts_with("C–F / CF₂") {
+        return FtirBandRule {
+            tier: BandTier::Specific,
+            short_label: "C–F / CF₂",
+            requires: &[(500.0, 645.0)],
+            forbids: &[(1700.0, 1765.0)],
+        };
+    }
     if g.starts_with("Graphene Oxide (GO) C=O") {
         return FtirBandRule { tier: BandTier::Specific, short_label: "GO C=O", requires: &[(3200.0, 3560.0), (1605.0, 1638.0), (1035.0, 1068.0)], forbids: &[] };
     }

@@ -389,9 +389,12 @@ fn compute_plot_hash(app: &App) -> u64 {
     app.peak_threshold.to_bits().hash(&mut h);
     app.auto_peaks.len().hash(&mut h);
     app.integration_regions.len().hash(&mut h);
+    app.integration_ref_idx.hash(&mut h);
+    app.integration_ref_val.to_bits().hash(&mut h);
     for r in &app.integration_regions {
         r.x_lo.to_bits().hash(&mut h);
         r.x_hi.to_bits().hash(&mut h);
+        r.area.to_bits().hash(&mut h);
     }
     (app.tab as u8).hash(&mut h);
     app.traces.len().hash(&mut h);
@@ -601,6 +604,25 @@ pub fn sync_hd_plot(
                 0.55,
                 false,
             );
+            // Relative integral value centred just above the teal cap.
+            let lbl = match app.integration_relative(ri) {
+                Some(v) => {
+                    if ri == app.integration_ref_idx {
+                        format!("*{:.2}", v)
+                    } else {
+                        format!("{:.2}", v)
+                    }
+                }
+                None => format!("{:.3}", r.area),
+            };
+            let cx = (pxa + pxb) / 2;
+            let cy = (py_top - 11).max(12);
+            let lbl_col = if ri == app.integration_ref_idx {
+                PEAK_PIN_RGB
+            } else {
+                (126, 224, 198)
+            };
+            img.draw_label(cx, cy, &lbl, lbl_col);
         }
     }
 

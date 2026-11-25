@@ -249,6 +249,21 @@ pub fn deconvolve_window(
     cfg: &DeconvConfig,
     solvent: SolventId,
 ) -> Result<DeconvResult> {
+    deconvolve_window_with_context(kind, xs, ys, y_unit, x_lo, x_hi, cfg, solvent, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn deconvolve_window_with_context(
+    kind: SpectrumKind,
+    xs: &[f64],
+    ys: &[f64],
+    y_unit: YUnit,
+    x_lo: f64,
+    x_hi: f64,
+    cfg: &DeconvConfig,
+    solvent: SolventId,
+    context_peaks: &[f64],
+) -> Result<DeconvResult> {
     let n_total = xs.len().min(ys.len());
     if n_total < 8 {
         bail!("Need at least 8 data points for peak deconvolution.");
@@ -584,8 +599,126 @@ pub fn deconvolve_window(
         };
     }
 
+    // Prune degenerate zero-height / ghost peaks (< 1.5% window dy OR < 0.5% area),
+    // always preserving at least the single tallest peak.
+    let mut keep: Vec<usize> = peaks
+        .iter()
+        .enumerate()
+        .filter(|(_, pk)| pk.height >= 0.015 * dy && pk.area_pct >= 0.5)
+        .map(|(i, _)| i)
+        .collect();
+    if keep.is_empty() && !peaks.is_empty() {
+        let tallest = peaks
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.height.total_cmp(&b.1.height))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        keep.push(tallest);
+    }
+
+    let mut effective_n_params = n_params;
+    let mut y_fit = y_fit;
+    let mut y_residual = y_residual;
+
+    if keep.len() < k {
+        // Rebuild fit & residuals from surviving components only
+        for i in 0..n {
+            let mut sum = y_baseline[i];
+            for &pi in &keep {
+                sum += components[pi][i] - y_baseline[i];
+            }
+            y_fit[i] = sum;
+            y_residual[i] = wy[i] - sum;
+        }
+
+        // Recompute parameter SEs from reduced Jacobian columns of surviving peaks (+ baseline)
+        let mut active_cols: Vec<usize> = Vec::with_capacity(keep.len() * per + n_base);
+        for &pi in &keep {
+            for c in 0..per {
+                active_cols.push(pi * per + c);
+            }
+        }
+        if cfg.fit_baseline {
+            active_cols.push(k * per);
+            active_cols.push(k * per + 1);
+        }
+        let m = active_cols.len();
+        effective_n_params = m;
+        let rss_norm_red: f64 = y_residual
+            .iter()
+            .map(|&r| {
+                let rn = r / dy;
+                rn * rn
+            })
+            .sum();
+        let dof_red = (n as isize - m as isize).max(1) as f64;
+        let chi2_norm_red = rss_norm_red / dof_red;
+
+        let mut jtj_red = vec![vec![0.0_f64; m]; m];
+        for i in 0..n {
+            for (ra, &ca) in active_cols.iter().enumerate() {
+                let ja = jac[i][ca];
+                if ja == 0.0 {
+                    continue;
+                }
+                for (rb, &cb) in active_cols.iter().enumerate().skip(ra) {
+                    jtj_red[ra][rb] += ja * jac[i][cb];
+                }
+            }
+        }
+        for ra in 0..m {
+            for rb in 0..ra {
+                jtj_red[ra][rb] = jtj_red[rb][ra];
+            }
+            jtj_red[ra][ra] += 1e-10;
+        }
+        let mut red_se = vec![0.0_f64; m];
+        for col in 0..m {
+            let mut e = vec![0.0_f64; m];
+            e[col] = 1.0;
+            if let Some(inv_col) = solve_linear(&jtj_red, &e) {
+                red_se[col] = (inv_col[col].max(0.0) * chi2_norm_red).sqrt();
+            }
+        }
+
+        let mut new_peaks = Vec::with_capacity(keep.len());
+        let mut new_comps = Vec::with_capacity(keep.len());
+        let mut new_total_area = 0.0_f64;
+        for (idx, &pi) in keep.iter().enumerate() {
+            let mut pk = peaks[pi].clone();
+            let base_col = idx * per;
+            pk.err_height = dy * red_se[base_col];
+            pk.err_center = dx * red_se[base_col + 1];
+            pk.err_fwhm = dx * red_se[base_col + 2];
+            pk.err_eta = if per == 4 { red_se[base_col + 3] } else { 0.0 };
+            new_total_area += pk.area;
+            new_peaks.push(pk);
+            new_comps.push(components[pi].clone());
+        }
+        for pk in &mut new_peaks {
+            pk.area_pct = if new_total_area > 1e-18 {
+                100.0 * pk.area / new_total_area
+            } else {
+                0.0
+            };
+        }
+        peaks = new_peaks;
+        components = new_comps;
+    }
+
+    // Safety guard against dead-peak SE blowup
+    for pk in &mut peaks {
+        if pk.height < 1e-6 {
+            pk.err_height = 0.0;
+            pk.err_center = 0.0;
+            pk.err_fwhm = 0.0;
+            pk.err_eta = 0.0;
+        }
+    }
+
     // Sort peaks & components in lockstep in display order
-    let mut order: Vec<usize> = (0..k).collect();
+    let mut order: Vec<usize> = (0..peaks.len()).collect();
     if kind.is_x_reversed() {
         order.sort_by(|&a, &b| peaks[b].center.total_cmp(&peaks[a].center));
     } else {
@@ -596,7 +729,14 @@ pub fn deconvolve_window(
     let mut peaks = peaks_sorted;
     let components = comps_sorted;
 
-    let centers_ctx: Vec<f64> = peaks.iter().map(|pk| pk.center).collect();
+    // Build context centers: fitted peaks + caller-provided context + full-spectrum peaks if no context given
+    let mut centers_ctx: Vec<f64> = peaks.iter().map(|pk| pk.center).collect();
+    centers_ctx.extend(context_peaks.iter().copied());
+    if context_peaks.is_empty() && n_total > n {
+        // Caller passed full spectrum without explicit context: detect peaks on full spectrum
+        let full_peaks = crate::processing::detect_peaks(xs, ys, kind, y_unit, 0.08, 16);
+        centers_ctx.extend(full_peaks.iter().map(|pk| pk.x));
+    }
     for pk in &mut peaks {
         pk.label = best_peak_label_in_context(kind, pk.center, &centers_ctx, solvent);
     }
@@ -609,7 +749,8 @@ pub fn deconvolve_window(
     } else {
         1.0
     };
-    let adj_r_squared = if n > n_params + 1 && tss > 1e-18 {
+    let dof = (n as isize - effective_n_params as isize).max(1) as f64;
+    let adj_r_squared = if n > effective_n_params + 1 && tss > 1e-18 {
         (1.0 - (1.0 - r_squared) * ((n - 1) as f64 / dof)).clamp(0.0, 1.0)
     } else {
         r_squared

@@ -15,8 +15,8 @@ use crate::data::{
     SpectrumKind, YUnit, CNMR_DB, FTIR_DB, HNMR_DB, POLYMERS_DB, SOLVENT_IMPURITIES, UVVIS_DB,
 };
 use crate::deconv::{
-    deconvolve_window, format_deconv_csv, format_deconv_markdown, DeconvConfig, DeconvResult,
-    PeakShape,
+    deconvolve_window_with_context, format_deconv_csv, format_deconv_markdown, DeconvConfig,
+    DeconvResult, PeakShape,
 };
 use crate::export::{
     open_exported_file, run_export, ExportDeconv, ExportFormat, ExportPayload, ExportPeak,
@@ -2009,34 +2009,100 @@ impl App {
 
     fn integration_table_text(&self) -> String {
         let kind = self.current_kind();
+        let total_area: f64 = self.integration_regions.iter().map(|r| r.area.max(0.0)).sum();
         let mut out = format!(
             "# SPECTRA Integration Regions — {}\n# Ref = region {} (×{:.2})\n\n",
             kind.display_name(),
             self.integration_ref_idx + 1,
             self.integration_ref_val
         );
-        out.push_str("| # | Range | Center | Abs Area | Rel Integral | Ref | Assignment |\n");
-        out.push_str("|--:|:------|-------:|---------:|-------------:|:---:|:-----------|\n");
+        out.push_str("| # | Range | Center | Abs Area | Area % | Rel Integral | Ref | Assignment |\n");
+        out.push_str("|--:|:------|-------:|---------:|-------:|-------------:|:---:|:-----------|\n");
         for (i, r) in self.integration_regions.iter().enumerate() {
             let rel = self
                 .integration_relative(i)
                 .map(|v| format!("{:.4}", v))
                 .unwrap_or_else(|| "—".into());
+            let area_pct = if total_area > 1e-12 {
+                100.0 * r.area.max(0.0) / total_area
+            } else {
+                0.0
+            };
             let mark = if i == self.integration_ref_idx { "★" } else { "" };
             out.push_str(&format!(
-                "| {} | {:.3} – {:.3} {} | {:.3} | {:.5} | {} | {} | {} |\n",
+                "| {} | {:.3} – {:.3} {} | {:.3} | {:.5} | {:.1}% | {} | {} | {} |\n",
                 i + 1,
                 r.x_lo.min(r.x_hi),
                 r.x_lo.max(r.x_hi),
                 kind.x_unit(),
                 0.5 * (r.x_lo + r.x_hi),
                 r.area,
+                area_pct,
                 rel,
                 mark,
                 r.label
             ));
         }
         out
+    }
+
+    /// Auto-integrate all detected peaks (except solvents/impurities), Mnova-style.
+    /// Returns the number of integration regions created.
+    pub fn auto_integrate_detected_peaks(&mut self) -> usize {
+        let kind = self.current_kind();
+        let default_hw = match kind {
+            SpectrumKind::Ftir => 22.0,
+            SpectrumKind::Hnmr => 0.07,
+            SpectrumKind::Cnmr => 1.2,
+            SpectrumKind::UvVis => 18.0,
+        };
+        let mut peaks: Vec<(f64, Option<f64>)> = self
+            .auto_peaks
+            .iter()
+            .filter(|pk| {
+                let lbl = &pk.label;
+                !lbl.contains("[solvent/imp]")
+                    && !lbl.contains("(solvent)")
+                    && !lbl.contains("(impurity)")
+            })
+            .map(|pk| (pk.x, pk.fwhm))
+            .collect();
+        peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        self.clear_integrations();
+        let n = peaks.len();
+        for i in 0..n {
+            let (px, fwhm) = peaks[i];
+            let hw = fwhm
+                .map(|w| w * 2.0)
+                .unwrap_or(default_hw)
+                .clamp(default_hw * 0.45, default_hw * 2.2);
+            let mut lo = px - hw;
+            let mut hi = px + hw;
+            if i > 0 {
+                let mid = (peaks[i - 1].0 + px) * 0.5;
+                lo = lo.max(mid);
+            }
+            if i + 1 < n {
+                let mid = (px + peaks[i + 1].0) * 0.5;
+                hi = hi.min(mid);
+            }
+            if hi - lo > 1e-9 {
+                self.add_integration_region(lo, hi);
+            }
+        }
+        if !self.integration_regions.is_empty() {
+            let max_idx = self
+                .integration_regions
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.area.total_cmp(&b.1.area))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.integration_ref_idx = max_idx;
+            self.integration_ref_val = if kind == SpectrumKind::Hnmr { 3.0 } else { 1.0 };
+        }
+        self.integration_regions.len()
     }
 
     fn apply_calibration_target(&mut self, observed: f64, target: f64) -> String {
@@ -3831,9 +3897,11 @@ impl App {
                             max_iter: 150,
                         };
                         let solvent = self.nmr_solvent;
+                        // Full-spectrum peak context so zoomed deconv still sees out-of-window bands (e.g., 1722 C=O)
+                        let ctx_peaks: Vec<f64> = self.auto_peaks.iter().map(|p| p.x).collect();
                         self.pending_deconv = Some(st);
                         self.start_task("Running Levenberg-Marquardt peak deconvolution…", move || {
-                            let result = deconvolve_window(
+                            let result = deconvolve_window_with_context(
                                 spec.kind,
                                 &proc_t.x,
                                 &proc_t.y,
@@ -3842,6 +3910,7 @@ impl App {
                                 x_hi,
                                 &cfg,
                                 solvent,
+                                &ctx_peaks,
                             )
                             .map_err(|e| e.to_string());
                             TaskOutcome::Deconv(result)
@@ -3984,6 +4053,18 @@ impl App {
                             }
                             None => st.feedback = Some("No spectral data in the zoom window".into()),
                         }
+                        self.modal = Modal::Integration(st);
+                    }
+                    KeyCode::Char('A') | KeyCode::Char('a')
+                        if key.modifiers.contains(KeyModifiers::SHIFT)
+                            || key.code == KeyCode::Char('A') =>
+                    {
+                        let count = self.auto_integrate_detected_peaks();
+                        st.selected = self.integration_ref_idx;
+                        st.feedback = Some(format!(
+                            "Auto-integrated {} peak(s) (solvents skipped) — [p] pushes to Polymer Lab",
+                            count
+                        ));
                         self.modal = Modal::Integration(st);
                     }
                     KeyCode::Char('a') => {

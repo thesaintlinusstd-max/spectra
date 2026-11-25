@@ -1,6 +1,6 @@
 [package]
 name = "spectra"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "SPECTRA — FTIR & NMR Spectroscopy Explorer & Polymer Chemistry Toolkit"
 

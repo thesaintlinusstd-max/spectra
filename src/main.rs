@@ -1419,7 +1419,7 @@ mod tests {
 
     #[test]
     fn test_version_is_0_7() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.7.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.7.1");
     }
 
     #[test]
@@ -3103,6 +3103,94 @@ mod tests {
         assert_eq!(app.pinned_peaks.len(), 1);
         // The remaining pin should be the one at ~1728
         assert!((app.pinned_peaks[0].x - 1728.0).abs() < 0.5, "expected remaining pin at 1728, got {}", app.pinned_peaks[0].x);
+    }
+
+    #[test]
+    fn test_auto_integrate_detected_peaks_skips_solvents() {
+        let mut app = App::new(vec![], Some(SpectrumKind::Hnmr));
+        app.load_demo(DemoPreset::PmmaHnmr);
+        let n = app.auto_integrate_detected_peaks();
+        assert!(n >= 4, "expected >= 4 auto-integrated peaks on PMMA 1H NMR, got {}", n);
+
+        let total_area: f64 = app.integration_regions.iter().map(|r| r.area.max(0.0)).sum();
+        assert!(total_area > 0.0, "total integrated area must be positive");
+        let pct_sum: f64 = app
+            .integration_regions
+            .iter()
+            .map(|r| 100.0 * r.area.max(0.0) / total_area)
+            .sum();
+        assert!((pct_sum - 100.0).abs() < 0.2, "area_pct sum = {:.3}", pct_sum);
+
+        for r in &app.integration_regions {
+            let center = 0.5 * (r.x_lo + r.x_hi);
+            assert!(
+                (center - 7.26).abs() > 0.08,
+                "CDCl3 solvent peak at 7.26 ppm should have been skipped (got region center {:.3})",
+                center
+            );
+            assert!(
+                (center - 1.56).abs() > 0.08,
+                "Water peak at 1.56 ppm should have been skipped (got region center {:.3})",
+                center
+            );
+        }
+    }
+
+    #[test]
+    fn test_deconv_prunes_ghost_peak_and_no_cf_on_mma() {
+        let spec = mma_monomer_spectrum();
+        let cfg = DeconvConfig {
+            shape: PeakShape::PseudoVoigt,
+            max_peaks: 3,
+            fit_baseline: true,
+            manual_centers: Vec::new(),
+            max_iter: 150,
+        };
+        let res = deconvolve_window(
+            spec.kind,
+            &spec.x,
+            &spec.y,
+            spec.raw_y_unit,
+            1070.0,
+            1275.0,
+            &cfg,
+            SolventId::Cdcl3,
+        )
+        .expect("MMA deconvolution failed");
+
+        assert!(!res.peaks.is_empty());
+        let pct_sum: f64 = res.peaks.iter().map(|p| p.area_pct).sum();
+        assert!(
+            (pct_sum - 100.0).abs() <= 0.2,
+            "area_pct must sum to 100 ± 0.2%, got {:.3}%",
+            pct_sum
+        );
+        for pk in &res.peaks {
+            assert!(
+                pk.height > 0.01,
+                "ghost peak not pruned: center={:.1}, height={:.5}",
+                pk.center,
+                pk.height
+            );
+            assert!(
+                pk.err_center < 10.0,
+                "err_center blown up: {:.2} at {:.1}",
+                pk.err_center,
+                pk.center
+            );
+            assert!(
+                pk.err_fwhm < 20.0,
+                "err_fwhm blown up: {:.2} at {:.1}",
+                pk.err_fwhm,
+                pk.center
+            );
+            assert!(
+                !pk.label.contains("C–F") && !pk.label.contains("CF₂"),
+                "ester peak at {:.1} cm⁻¹ mislabeled as fluoropolymer: {}",
+                pk.center,
+                pk.label
+            );
+        }
     }
 }
 
