@@ -113,6 +113,14 @@ pub struct ExportPeak {
     pub pinned: bool,
 }
 
+/// Deconvolved sub-peaks rendered alongside the measured trace.
+#[derive(Debug, Clone)]
+pub struct ExportDeconv {
+    pub x: Vec<f64>,
+    pub y_fit: Vec<f64>,
+    pub components: Vec<Vec<f64>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExportPayload {
     pub mode: String,
@@ -125,6 +133,7 @@ pub struct ExportPayload {
     pub active_trace: usize,
     pub traces: Vec<ExportTrace>,
     pub peaks: Vec<ExportPeak>,
+    pub deconv: Option<ExportDeconv>,
 }
 
 fn push_json_str(out: &mut String, s: &str) {
@@ -210,7 +219,22 @@ impl ExportPayload {
             push_json_str(&mut out, &pk.label);
             let _ = write!(out, ",\"pinned\":{}}}", pk.pinned);
         }
-        out.push_str("]}");
+        out.push(']');
+        if let Some(dc) = &self.deconv {
+            out.push_str(",\"deconv\":{\"x\":");
+            push_json_f64_slice(&mut out, &dc.x);
+            out.push_str(",\"y_fit\":");
+            push_json_f64_slice(&mut out, &dc.y_fit);
+            out.push_str(",\"components\":[");
+            for (i, comp) in dc.components.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_f64_slice(&mut out, comp);
+            }
+            out.push_str("]}");
+        }
+        out.push('}');
         out
     }
 }

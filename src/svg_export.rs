@@ -715,6 +715,55 @@ pub fn write_publication_svg(payload: &ExportPayload, output_path: &Path) -> Res
     }
     let _ = writeln!(svg, r#"</g>"#);
 
+    // Deconvolved sub-peaks: dashed component curves + crisp cumulative fit.
+    if let Some(dc) = &payload.deconv {
+        let y_off = offsets.get(active_trace).copied().unwrap_or(0.0);
+        let _ = writeln!(
+            svg,
+            r#"<g id="deconv-components" clip-path="url(#plot-clip)">"#
+        );
+        for (ci, comp) in dc.components.iter().enumerate() {
+            let color = cfg.palette[(ci + 1) % cfg.palette.len()];
+            let mut points_str = String::with_capacity(comp.len() * 14);
+            for (i, &y) in comp.iter().enumerate() {
+                if i >= dc.x.len() {
+                    break;
+                }
+                let x = dc.x[i];
+                if !x.is_finite() || !y.is_finite() {
+                    continue;
+                }
+                let _ = write!(points_str, "{:.2},{:.2} ", fx(x), fy(y + y_off));
+            }
+            let _ = writeln!(
+                svg,
+                r#"<polyline fill="none" stroke="{}" stroke-width="1.15" stroke-opacity="0.78" stroke-dasharray="5,3" stroke-linecap="round" points="{}"/>"#,
+                color,
+                points_str.trim_end()
+            );
+        }
+        let _ = writeln!(svg, r#"</g>"#);
+
+        let _ = writeln!(svg, r#"<g id="deconv-fit" clip-path="url(#plot-clip)">"#);
+        let mut fit_str = String::with_capacity(dc.y_fit.len() * 14);
+        for (i, &y) in dc.y_fit.iter().enumerate() {
+            if i >= dc.x.len() {
+                break;
+            }
+            let x = dc.x[i];
+            if !x.is_finite() || !y.is_finite() {
+                continue;
+            }
+            let _ = write!(fit_str, "{:.2},{:.2} ", fx(x), fy(y + y_off));
+        }
+        let _ = writeln!(
+            svg,
+            r##"<polyline fill="none" stroke="#d49b1a" stroke-width="1.35" stroke-opacity="0.92" stroke-linecap="round" stroke-linejoin="round" points="{}"/>"##,
+            fit_str.trim_end()
+        );
+        let _ = writeln!(svg, r#"</g>"#);
+    }
+
     // Legend
     if traces.len() > 1 {
         let _ = writeln!(

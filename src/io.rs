@@ -26,8 +26,6 @@ fn decode_spectrum_bytes(bytes: Vec<u8>) -> String {
 pub fn load_spectrum_file(path: &Path, kind_override: Option<SpectrumKind>) -> Result<Spectrum> {
     let bytes = fs::read(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
-    let text = decode_spectrum_bytes(bytes);
-    let text = text.trim_start_matches('\u{feff}');
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -38,6 +36,16 @@ pub fn load_spectrum_file(path: &Path, kind_override: Option<SpectrumKind>) -> R
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+
+    // Native binary instrument formats must never be decoded as UTF-8 text.
+    if let Some(parsed) = crate::binary_io::try_parse_binary(&bytes, &name, &ext, kind_override) {
+        let mut spec = parsed?;
+        spec.source_path = Some(path.display().to_string());
+        return Ok(spec);
+    }
+
+    let text = decode_spectrum_bytes(bytes);
+    let text = text.trim_start_matches('\u{feff}');
 
     let mut spec = if matches!(ext.as_str(), "jdx" | "dx" | "jcamp")
         || text.trim_start().starts_with("##TITLE")
@@ -833,6 +841,151 @@ pub fn encode_jcamp_difdup(spec: &Spectrum) -> String {
     out
 }
 
+/// Write a processed trace as a clean CSV with a commented provenance header.
+/// FTIR / NMR are written in the conventional descending instrument order;
+/// UV-Vis stays ascending.
+pub fn save_processed_csv(
+    path: &Path,
+    spec: &Spectrum,
+    xs: &[f64],
+    ys: &[f64],
+    y_unit: YUnit,
+    note: &str,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let x_label = match spec.kind {
+        SpectrumKind::Ftir => "Wavenumber (cm-1)",
+        SpectrumKind::Hnmr | SpectrumKind::Cnmr => "Chemical Shift (ppm)",
+        SpectrumKind::UvVis => "Wavelength (nm)",
+    };
+    let y_label = match y_unit {
+        YUnit::Transmittance => "Transmittance (%T)",
+        YUnit::Absorbance => "Absorbance (a.u.)",
+        YUnit::Intensity => "Intensity (a.u.)",
+    };
+
+    let mut buf = String::new();
+    buf.push_str("# SPECTRA processed spectrum\n");
+    buf.push_str(&format!("# Trace: {}\n", spec.name));
+    buf.push_str(&format!("# Technique: {}\n", spec.kind.display_name()));
+    buf.push_str(&format!("# Y-axis: {}\n", y_unit.label()));
+    for line in note.lines() {
+        buf.push_str(&format!("# Processing: {}\n", line.trim()));
+    }
+    buf.push_str(&format!("{}\n", format!("{},{}", x_label, y_label)));
+
+    let n = xs.len().min(ys.len());
+    if spec.kind.is_x_reversed() {
+        for i in (0..n).rev() {
+            buf.push_str(&format!("{:.6},{:.6}\n", xs[i], ys[i]));
+        }
+    } else {
+        for i in 0..n {
+            buf.push_str(&format!("{:.6},{:.6}\n", xs[i], ys[i]));
+        }
+    }
+
+    fs::write(path, buf).with_context(|| format!("Failed writing {}", path.display()))
+}
+
+/// Write a processed trace as JCAMP-DX. FTIR %T keeps the compact DIFDUP
+/// encoder; everything else uses clean AFFN `##XYPOINTS=(XY..XY)` pairs.
+pub fn save_processed_jcamp(
+    path: &Path,
+    name: &str,
+    kind: SpectrumKind,
+    xs: &[f64],
+    ys: &[f64],
+    y_unit: YUnit,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let n = xs.len().min(ys.len());
+    if n < 2 {
+        return Err(anyhow!("Not enough points to write JCAMP-DX"));
+    }
+
+    let text = if kind == SpectrumKind::Ftir && y_unit == YUnit::Transmittance {
+        let spec = Spectrum {
+            name: name.to_string(),
+            source_path: None,
+            kind,
+            raw_y_unit: y_unit,
+            x: xs[..n].to_vec(),
+            y: ys[..n].to_vec(),
+            visible: true,
+            color_idx: 0,
+            metadata: Vec::new(),
+        };
+        encode_jcamp_difdup(&spec)
+    } else {
+        let (data_type, xunits, yunits) = match kind {
+            SpectrumKind::Ftir => (
+                "INFRARED SPECTRUM",
+                "1/CM",
+                match y_unit {
+                    YUnit::Transmittance => "TRANSMITTANCE",
+                    YUnit::Absorbance => "ABSORBANCE",
+                    YUnit::Intensity => "ARBITRARY UNITS",
+                },
+            ),
+            SpectrumKind::Hnmr | SpectrumKind::Cnmr => {
+                ("NMR SPECTRUM", "PPM", "ARBITRARY UNITS")
+            }
+            SpectrumKind::UvVis => (
+                "UV/VIS SPECTRUM",
+                "NANOMETERS",
+                match y_unit {
+                    YUnit::Transmittance => "TRANSMITTANCE",
+                    YUnit::Absorbance => "ABSORBANCE",
+                    YUnit::Intensity => "ARBITRARY UNITS",
+                },
+            ),
+        };
+
+        let mut out = String::new();
+        out.push_str(&format!("##TITLE={}\n", name));
+        out.push_str("##JCAMP-DX=5.00 $$ Generated by SPECTRA\n");
+        out.push_str(&format!("##DATA TYPE={}\n", data_type));
+        out.push_str(&format!("##XUNITS={}\n", xunits));
+        out.push_str(&format!("##YUNITS={}\n", yunits));
+        let (first, last) = if kind.is_x_reversed() {
+            (xs[n - 1], xs[0])
+        } else {
+            (xs[0], xs[n - 1])
+        };
+        out.push_str(&format!("##FIRSTX={:.6}\n", first));
+        out.push_str(&format!("##LASTX={:.6}\n", last));
+        out.push_str(&format!("##NPOINTS={}\n", n));
+        out.push_str("##XYPOINTS=(XY..XY)\n");
+        let mut line = String::new();
+        for i in 0..n {
+            let idx = if kind.is_x_reversed() { n - 1 - i } else { i };
+            line.push_str(&format!("{:.6} {:.6}; ", xs[idx], ys[idx]));
+            if line.len() > 96 {
+                out.push_str(line.trim_end());
+                out.push('\n');
+                line.clear();
+            }
+        }
+        if !line.trim().is_empty() {
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out.push_str("##END=\n");
+        out
+    };
+
+    fs::write(path, text).with_context(|| format!("Failed writing {}", path.display()))
+}
+
 fn write_csv(path: &Path, spec: &Spectrum, header: &str) -> Result<()> {
     let mut buf = String::new();
     buf.push_str(header);
@@ -865,8 +1018,9 @@ pub fn is_spectrum_extension(path: &Path) -> bool {
         .to_ascii_lowercase();
     matches!(
         ext.as_str(),
-        "csv" | "tsv" | "txt" | "dpt" | "asc" | "xy" | "jdx" | "dx" | "jcamp"
-    )
+        "csv" | "tsv" | "txt" | "dpt" | "asc" | "xy" | "jdx" | "dx" | "jcamp" | "spc" | "spa"
+            | "opus"
+    ) || (!ext.is_empty() && ext.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn push_unique_dir(out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathBuf) {

@@ -1,4 +1,5 @@
 mod app;
+mod binary_io;
 mod clipboard;
 mod data;
 mod deconv;
@@ -261,6 +262,251 @@ fn parse_style(s: &str) -> Result<ExportStyle> {
     }
 }
 
+/// Map a solvent name/short code onto the built-in solvent table.
+fn parse_solvent_arg(s: &str) -> Result<crate::data::SolventId> {
+    use crate::data::SolventId;
+    Ok(match s.trim().to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+        "cdcl3" | "chloroform" => SolventId::Cdcl3,
+        "dmso" | "dmso6" => SolventId::Dmso,
+        "cd3od" | "methanol" | "meod" => SolventId::Cd3od,
+        "d2o" | "water" => SolventId::D2o,
+        "acetone" | "acetoned6" => SolventId::Acetone,
+        "thf" | "thf8" => SolventId::Thf,
+        "c6d6" | "benzene" => SolventId::C6d6,
+        "toluene" | "toluened8" => SolventId::Toluene,
+        "cd2cl2" | "dcm" => SolventId::Cd2cl2,
+        "cd3cn" | "acetonitrile" | "mecn" => SolventId::Cd3cn,
+        other => bail!(
+            "Unknown solvent '{}' (cdcl3|dmso|cd3od|d2o|acetone|thf|c6d6|toluene|cd2cl2|cd3cn)",
+            other
+        ),
+    })
+}
+
+/// `spectra deconv FILE [--range LO:HI] [--shape voigt|gauss|lorentz]
+///  [--peaks N] [--no-baseline] [-o fit.csv]`
+fn run_deconv_cli(args: &[String]) -> Result<()> {
+    use crate::deconv::{deconvolve_window, format_deconv_csv, format_deconv_markdown, DeconvConfig, PeakShape};
+
+    let mut file: Option<PathBuf> = None;
+    let mut range: Option<(f64, f64)> = None;
+    let mut cfg = DeconvConfig::default();
+    let mut output: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--range" | "-r" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --range"))?;
+                let (lo, hi) = raw
+                    .split_once(':')
+                    .or_else(|| raw.split_once(".."))
+                    .ok_or_else(|| anyhow::anyhow!("--range expects LO:HI (e.g. 1650:1800)"))?;
+                let lo: f64 = lo.trim().parse()?;
+                let hi: f64 = hi.trim().parse()?;
+                range = Some((lo.min(hi), lo.max(hi)));
+            }
+            "--shape" | "-s" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --shape"))?;
+                cfg.shape = match raw.to_ascii_lowercase().as_str() {
+                    "voigt" | "pvoigt" | "pseudo-voigt" => PeakShape::PseudoVoigt,
+                    "gauss" | "gaussian" => PeakShape::Gaussian,
+                    "lorentz" | "lorentzian" => PeakShape::Lorentzian,
+                    other => bail!("Unknown shape '{}' (voigt|gauss|lorentz)", other),
+                };
+            }
+            "--peaks" | "-n" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --peaks"))?;
+                cfg.max_peaks = raw.parse::<usize>()?.clamp(1, 8);
+            }
+            "--no-baseline" => cfg.fit_baseline = false,
+            "-o" | "--output" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --output"))?;
+                output = Some(PathBuf::from(raw));
+            }
+            other if !other.starts_with('-') && file.is_none() => file = Some(PathBuf::from(other)),
+            flag => bail!("Unknown deconv flag: {}", flag),
+        }
+        i += 1;
+    }
+
+    let file = file.ok_or_else(|| anyhow::anyhow!("Usage: spectra deconv <FILE> [--range LO:HI]"))?;
+    let spec = load_spectrum_file(&file, None)?;
+    let (xs, ys, y_unit) = process_trace(&spec, ProcessConfig::default());
+    let (lo, hi) = range.unwrap_or_else(|| {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &x in &xs {
+            if x.is_finite() {
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+        (lo, hi)
+    });
+
+    let res = deconvolve_window(
+        spec.kind,
+        &xs,
+        &ys,
+        y_unit,
+        lo,
+        hi,
+        &cfg,
+        crate::data::SolventId::Cdcl3,
+    )?;
+
+    print!("{}", format_deconv_markdown(&res));
+    if let Some(path) = output {
+        std::fs::write(&path, format_deconv_csv(&res))?;
+        println!("\nWrote deconvolution data: {}", path.display());
+    }
+    Ok(())
+}
+
+/// `spectra mix FILE [--components N] [--solvent cdcl3]`
+fn run_mix_cli(args: &[String]) -> Result<()> {
+    use crate::mixture::{analyze_mixture, format_mixture_markdown};
+
+    let mut file: Option<PathBuf> = None;
+    let mut max_components = 3usize;
+    let mut solvent = crate::data::SolventId::Cdcl3;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--components" | "-c" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --components"))?;
+                max_components = raw.parse::<usize>()?.clamp(1, 3);
+            }
+            "--solvent" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --solvent"))?;
+                solvent = parse_solvent_arg(raw)?;
+            }
+            other if !other.starts_with('-') && file.is_none() => file = Some(PathBuf::from(other)),
+            flag => bail!("Unknown mix flag: {}", flag),
+        }
+        i += 1;
+    }
+
+    let file = file.ok_or_else(|| anyhow::anyhow!("Usage: spectra mix <FILE> [--components N]"))?;
+    let spec = load_spectrum_file(&file, None)?;
+    let results = analyze_mixture(&spec, ProcessConfig::default(), solvent, max_components);
+    if results.is_empty() {
+        bail!("No mixture candidates found — build the reference library first (spectra fetch nist).");
+    }
+    print!("{}", format_mixture_markdown(&results, spec.kind));
+    Ok(())
+}
+
+/// `spectra convert INPUT -o OUT.csv|OUT.jdx [--atr diamond|znse|ge|si] [--km]
+///  [--arpls] [--baseline] [--smooth 0|5|9|15] [--absorbance]`
+fn run_convert_cli(args: &[String]) -> Result<()> {
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut cfg = ProcessConfig::default();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --output"))?;
+                output = Some(PathBuf::from(raw));
+            }
+            "--atr" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --atr"))?;
+                cfg.optics = match raw.to_ascii_lowercase().as_str() {
+                    "diamond" | "dia" => OpticsMode::AtrDiamond,
+                    "znse" => OpticsMode::AtrZnSe,
+                    "ge" | "germanium" => OpticsMode::AtrGe,
+                    "si" | "silicon" => OpticsMode::AtrSi,
+                    other => bail!("Unknown ATR crystal '{}' (diamond|znse|ge|si)", other),
+                };
+            }
+            "--km" => cfg.optics = OpticsMode::KubelkaMunk,
+            "--arpls" => cfg.baseline = BaselineMode::Arpls,
+            "--rubberband" => cfg.baseline = BaselineMode::Rubberband,
+            "--baseline" => cfg.baseline = BaselineMode::Asls,
+            "--smooth" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --smooth"))?;
+                cfg.smooth = match raw.trim() {
+                    "0" | "off" => SmoothLevel::Off,
+                    "5" => SmoothLevel::Win5,
+                    "9" => SmoothLevel::Win9,
+                    "15" => SmoothLevel::Win15,
+                    other => bail!("Unknown smoothing window '{}' (0|5|9|15)", other),
+                };
+            }
+            "--absorbance" => cfg.y_pref = YAxisPreference::Swapped,
+            "--deriv" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --deriv"))?;
+                cfg.deriv = match raw.as_str() {
+                    "1" => DerivOrder::First,
+                    "2" => DerivOrder::Second,
+                    other => bail!("Unknown derivative order '{}' (1|2)", other),
+                };
+            }
+            "--norm" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --norm"))?;
+                cfg.norm = match raw.to_ascii_lowercase().as_str() {
+                    "minmax" => NormMode::MinMax,
+                    "snv" | "vector" => NormMode::VectorSnv,
+                    "area" => NormMode::Area,
+                    "off" | "none" => NormMode::Off,
+                    other => bail!("Unknown normalization '{}' (minmax|snv|area)", other),
+                };
+            }
+            other if !other.starts_with('-') && input.is_none() => input = Some(PathBuf::from(other)),
+            flag => bail!("Unknown convert flag: {}", flag),
+        }
+        i += 1;
+    }
+
+    let input = input.ok_or_else(|| anyhow::anyhow!("Usage: spectra convert <INPUT> -o <OUT.csv|OUT.jdx>"))?;
+    let output = output.ok_or_else(|| anyhow::anyhow!("convert requires -o <OUT.csv|OUT.jdx>"))?;
+
+    let spec = load_spectrum_file(&input, None)?;
+    let (xs, ys, y_unit) = process_trace(&spec, cfg);
+    let note = format!(
+        "Baseline {}, Smooth {}, Norm {}, Optics {}, Deriv {}",
+        cfg.baseline.label(),
+        cfg.smooth.label(),
+        cfg.norm.label(),
+        cfg.optics.label(),
+        cfg.deriv.label()
+    );
+
+    let ext = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "jdx" | "dx" | "jcamp") {
+        crate::io::save_processed_jcamp(&output, &spec.name, spec.kind, &xs, &ys, y_unit)?;
+    } else {
+        crate::io::save_processed_csv(&output, &spec, &xs, &ys, y_unit, &note)?;
+    }
+    println!(
+        "Converted {} ({} pts, {}) -> {}",
+        input.display(),
+        xs.len(),
+        y_unit.label(),
+        output.display()
+    );
+    Ok(())
+}
+
 fn print_help() {
     println!(
         "SPECTRA {} — FTIR & NMR Spectroscopy Explorer & Polymer Chemistry Toolkit\n\n\
@@ -269,6 +515,12 @@ fn print_help() {
            spectra [ftir|nmr|cnmr|uvvis] [QUERY...]     (e.g. spectra ftir butane)\n  \
            spectra init-samples [--dir samples]\n  \
            spectra fetch <nist|nmr|nmr-search|import|list|pack> [ARGS...]\n  \
+           spectra deconv <FILE> [--range LO:HI] [--shape voigt|gauss|lorentz]\n                 \
+                   [--peaks N] [--no-baseline] [-o fit.csv]\n  \
+           spectra mix <FILE> [--components 1|2|3] [--solvent cdcl3|dmso|d2o|...]\n  \
+           spectra convert <INPUT> -o <OUT.csv|OUT.jdx> [--atr diamond|znse|ge|si | --km]\n                 \
+                   [--baseline | --rubberband | --arpls] [--smooth 0|5|9|15]\n                 \
+                   [--absorbance] [--deriv 1|2] [--norm minmax|snv|area]\n  \
            spectra export <FILES...> -o <OUT.svg|png|pdf> [--style acs|rsc|everforest]\n                 \
                    [--stacked] [--absorbance] [--baseline (AsLS) | --rubberband | --arpls]\n                 \
                    [--atr diamond|znse|ge|si | --km] [--deriv 1|2]\n                 \
@@ -373,6 +625,7 @@ fn run_headless_export(
         active_trace: 0,
         traces,
         peaks: peaks_out,
+        deconv: None,
     };
 
     let saved = run_export(&payload, &output)?;
@@ -475,6 +728,18 @@ fn main() -> Result<()> {
             bail!("fetch_library.py exited with status {}", status);
         }
         return Ok(());
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("deconv") {
+        return run_deconv_cli(&args[1..]);
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("mix") {
+        return run_mix_cli(&args[1..]);
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("convert") {
+        return run_convert_cli(&args[1..]);
     }
 
     if args.first().map(|s| s.as_str()) == Some("export") {
@@ -745,6 +1010,7 @@ mod tests {
                 label: "1725 C=O".into(),
                 pinned: true,
             }],
+            deconv: None,
         };
         let js = payload.to_json_string();
         assert!(js.contains("\"title\":\"MMA \\\"vs\\\" PMMA\""));
@@ -1794,6 +2060,7 @@ mod tests {
                 ExportPeak { x: 1450.0, y: 82.0, label: "CH2 1450".into(), pinned: false },
                 ExportPeak { x: 1150.0, y: 80.0, label: "C-O 1150".into(), pinned: false },
             ],
+            deconv: None,
         };
 
         let saved_ftir = crate::export::run_export(&ftir_payload, &tmp_ftir)
@@ -1832,6 +2099,7 @@ mod tests {
                 label: "λmax 450 nm".into(),
                 pinned: true,
             }],
+            deconv: None,
         };
 
         let saved_uv = crate::export::run_export(&uv_payload, &tmp_uv)
@@ -2538,6 +2806,279 @@ mod tests {
             "expected triplet J=7.0 Hz, got {:.3}",
             t_info.j_hz[0]
         );
+    }
+
+    // ========================================================================
+    // Phase 3: native binary instrument formats, deconv export, report
+    // ========================================================================
+    use crate::app::App;
+
+    fn build_synthetic_spc_f32(title: &str, xs: &[f32], ys: &[f32]) -> Vec<u8> {
+        let n = xs.len();
+        let mut buf = vec![0u8; 512 + n * 4 + 32 + n * 4];
+        buf[0] = 0x80; // TXVALS explicit f32 X array
+        buf[1] = 0x4B; // new little-endian SPC
+        buf[2] = 4; // FTIR
+        buf[3] = (-128i8) as u8; // IEEE float32 Y
+        buf[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        buf[8..16].copy_from_slice(&(xs[0] as f64).to_le_bytes());
+        buf[16..24].copy_from_slice(&(xs[n - 1] as f64).to_le_bytes());
+        buf[28] = 1; // cm^-1
+        buf[29] = 2; // Absorbance
+        let tb = title.as_bytes();
+        buf[48..48 + tb.len().min(129)].copy_from_slice(&tb[..tb.len().min(129)]);
+        for (i, &x) in xs.iter().enumerate() {
+            buf[512 + i * 4..512 + (i + 1) * 4].copy_from_slice(&x.to_le_bytes());
+        }
+        let y_off = 512 + n * 4 + 32;
+        for (i, &y) in ys.iter().enumerate() {
+            buf[y_off + i * 4..y_off + (i + 1) * 4].copy_from_slice(&y.to_le_bytes());
+        }
+        buf
+    }
+
+    fn build_synthetic_spc_i32(title: &str, ffirst: f64, flast: f64, ys: &[f64]) -> Vec<u8> {
+        let n = ys.len();
+        let mut buf = vec![0u8; 512 + 32 + n * 4];
+        buf[0] = 0x00;
+        buf[1] = 0x4B;
+        buf[2] = 4;
+        buf[3] = 1u8; // fexp = 1 -> scale = 2.0
+        buf[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        buf[8..16].copy_from_slice(&ffirst.to_le_bytes());
+        buf[16..24].copy_from_slice(&flast.to_le_bytes());
+        buf[28] = 1;
+        buf[29] = 2;
+        let tb = title.as_bytes();
+        buf[48..48 + tb.len().min(129)].copy_from_slice(&tb[..tb.len().min(129)]);
+        let y_off = 544;
+        for (i, &y) in ys.iter().enumerate() {
+            let raw = (y * 4_294_967_296.0 / 2.0).round() as i32;
+            buf[y_off + i * 4..y_off + (i + 1) * 4].copy_from_slice(&raw.to_le_bytes());
+        }
+        buf
+    }
+
+    fn build_synthetic_opus(fxv: f64, lxv: f64, csf: f64, ys_raw: &[f32]) -> Vec<u8> {
+        let n = ys_raw.len();
+        let mut params = Vec::new();
+        let push_param = |out: &mut Vec<u8>, tag: &[u8; 4], ptype: u16, val: &[u8]| {
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&ptype.to_le_bytes());
+            out.extend_from_slice(&((val.len() / 2) as u16).to_le_bytes());
+            out.extend_from_slice(val);
+        };
+        push_param(&mut params, b"NPF\0", 0, &(n as i32).to_le_bytes());
+        push_param(&mut params, b"FXV\0", 1, &fxv.to_le_bytes());
+        push_param(&mut params, b"LXV\0", 1, &lxv.to_le_bytes());
+        push_param(&mut params, b"CSF\0", 1, &csf.to_le_bytes());
+        params.extend_from_slice(b"END\0\0\0\0\0");
+        while params.len() % 4 != 0 {
+            params.push(0);
+        }
+
+        let dir_offset = 24u32;
+        let data_offset = 24u32 + 24u32; // 2 dir entries * 12 bytes
+        let param_offset = data_offset + (n as u32) * 4;
+        let mut buf = vec![0u8; 24];
+        buf[0..4].copy_from_slice(b"\x0A\x0A\xFE\xFE");
+        buf[12..16].copy_from_slice(&dir_offset.to_le_bytes());
+        buf[20..24].copy_from_slice(&2u32.to_le_bytes());
+
+        // Entry 0: AB data block (b0=0x0F, b1=0x10)
+        buf.extend_from_slice(&0x0000_100Fu32.to_le_bytes());
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.extend_from_slice(&data_offset.to_le_bytes());
+        // Entry 1: AB param block (b0=0x1F, b1=0x10)
+        buf.extend_from_slice(&0x0000_101Fu32.to_le_bytes());
+        buf.extend_from_slice(&((params.len() / 4) as u32).to_le_bytes());
+        buf.extend_from_slice(&param_offset.to_le_bytes());
+
+        for &y in ys_raw {
+            buf.extend_from_slice(&y.to_le_bytes());
+        }
+        buf.extend_from_slice(&params);
+        buf
+    }
+
+    fn build_synthetic_spa(title: &str, x_first: f32, x_last: f32, ys: &[f32]) -> Vec<u8> {
+        let n = ys.len();
+        let hdr_off = 336u32;
+        let data_off = 360u32;
+        let mut buf = vec![0u8; data_off as usize + n * 4];
+        buf[0..18].copy_from_slice(b"Spectral Data File");
+        let tb = title.as_bytes();
+        buf[30..30 + tb.len().min(255)].copy_from_slice(&tb[..tb.len().min(255)]);
+        buf[294..296].copy_from_slice(&2u16.to_le_bytes());
+
+        // Dir entry 0: key 2 (Header)
+        buf[304..306].copy_from_slice(&2u16.to_le_bytes());
+        buf[306..310].copy_from_slice(&hdr_off.to_le_bytes());
+        buf[310..314].copy_from_slice(&24u32.to_le_bytes());
+        // Dir entry 1: key 3 (Data)
+        buf[320..322].copy_from_slice(&3u16.to_le_bytes());
+        buf[322..326].copy_from_slice(&data_off.to_le_bytes());
+        buf[326..330].copy_from_slice(&((n * 4) as u32).to_le_bytes());
+
+        // Key-2 header
+        let h = hdr_off as usize;
+        buf[h + 4..h + 8].copy_from_slice(&(n as u32).to_le_bytes());
+        buf[h + 8..h + 12].copy_from_slice(&1u32.to_le_bytes()); // cm^-1
+        buf[h + 12..h + 16].copy_from_slice(&1u32.to_le_bytes()); // Absorbance
+        buf[h + 16..h + 20].copy_from_slice(&x_first.to_le_bytes());
+        buf[h + 20..h + 24].copy_from_slice(&x_last.to_le_bytes());
+
+        for (i, &y) in ys.iter().enumerate() {
+            let p = data_off as usize + i * 4;
+            buf[p..p + 4].copy_from_slice(&y.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn test_binary_spc_parser_roundtrip() {
+        let xs = [4000.0_f32, 2800.0, 1728.0, 400.0];
+        let ys = [0.05_f32, 0.22, 0.85, 0.11];
+        let buf_f = build_synthetic_spc_f32("PMMA Film SPC", &xs, &ys);
+        let sp_f = crate::binary_io::parse_spc_bytes(&buf_f, "fallback", None)
+            .expect("SPC f32 parse failed");
+        assert_eq!(sp_f.name, "PMMA Film SPC");
+        assert_eq!(sp_f.kind, SpectrumKind::Ftir);
+        assert_eq!(sp_f.raw_y_unit, YUnit::Absorbance);
+        assert_eq!(sp_f.x.len(), 4);
+        assert!(sp_f.x.windows(2).all(|w| w[0] < w[1]));
+        assert!((sp_f.y[0] - 0.11).abs() < 1e-4);
+        assert!((sp_f.y[1] - 0.85).abs() < 1e-4);
+        assert!((sp_f.y[3] - 0.05).abs() < 1e-4);
+
+        let ys_i = [0.10_f64, 0.45, 0.90, 0.20];
+        let buf_i = build_synthetic_spc_i32("Scaled i32 SPC", 4000.0, 400.0, &ys_i);
+        let sp_i = crate::binary_io::parse_spc_bytes(&buf_i, "fallback", None)
+            .expect("SPC i32 parse failed");
+        assert_eq!(sp_i.name, "Scaled i32 SPC");
+        assert_eq!(sp_i.kind, SpectrumKind::Ftir);
+        assert_eq!(sp_i.raw_y_unit, YUnit::Absorbance);
+        assert!(sp_i.x.windows(2).all(|w| w[0] < w[1]));
+        assert!((sp_i.y[0] - 0.20).abs() < 1e-4);
+        assert!((sp_i.y[1] - 0.90).abs() < 1e-4);
+        assert!((sp_i.y[3] - 0.10).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_binary_opus_parser_roundtrip() {
+        let raw_y = [0.05_f32, 0.30, 0.60, 0.10];
+        let buf = build_synthetic_opus(4000.0, 400.0, 2.0, &raw_y);
+        let spec = crate::binary_io::parse_opus_bytes(&buf, "sample_opus", None)
+            .expect("OPUS parse failed");
+        assert_eq!(spec.kind, SpectrumKind::Ftir);
+        assert_eq!(spec.raw_y_unit, YUnit::Absorbance);
+        assert_eq!(spec.x.len(), 4);
+        assert!(spec.x.windows(2).all(|w| w[0] < w[1]));
+        assert!((spec.x[0] - 400.0).abs() < 1e-6);
+        assert!((spec.x[3] - 4000.0).abs() < 1e-6);
+        // Reversed ascending + multiplied by CSF = 2.0
+        assert!((spec.y[0] - 0.20).abs() < 1e-4);
+        assert!((spec.y[1] - 1.20).abs() < 1e-4);
+        assert!((spec.y[3] - 0.10).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_binary_spa_parser_roundtrip() {
+        let ys = [0.04_f32, 0.42, 0.78, 0.09];
+        let buf = build_synthetic_spa("Nicolet PS Film", 4000.0, 400.0, &ys);
+        let spec = crate::binary_io::parse_spa_bytes(&buf, "fallback", None)
+            .expect("SPA parse failed");
+        assert_eq!(spec.name, "Nicolet PS Film");
+        assert_eq!(spec.kind, SpectrumKind::Ftir);
+        assert_eq!(spec.raw_y_unit, YUnit::Absorbance);
+        assert_eq!(spec.x.len(), 4);
+        assert!(spec.x.windows(2).all(|w| w[0] < w[1]));
+        assert!((spec.y[0] - 0.09).abs() < 1e-4);
+        assert!((spec.y[1] - 0.78).abs() < 1e-4);
+        assert!((spec.y[3] - 0.04).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_binary_auto_dispatch_via_load_spectrum_file() {
+        let tmp = std::env::temp_dir();
+        let p_spc = tmp.join("spectra_test_dispatch.spc");
+        let p_opus = tmp.join("spectra_test_dispatch.0");
+        let p_spa = tmp.join("spectra_test_dispatch.spa");
+
+        std::fs::write(
+            &p_spc,
+            build_synthetic_spc_f32("Auto SPC", &[4000.0, 2000.0, 1720.0, 400.0], &[0.1, 0.2, 0.9, 0.1]),
+        )
+        .unwrap();
+        std::fs::write(
+            &p_opus,
+            build_synthetic_opus(4000.0, 400.0, 1.0, &[0.1, 0.3, 0.8, 0.1]),
+        )
+        .unwrap();
+        std::fs::write(
+            &p_spa,
+            build_synthetic_spa("Auto SPA", 4000.0, 400.0, &[0.1, 0.4, 0.7, 0.1]),
+        )
+        .unwrap();
+
+        let s_spc = load_spectrum_file(&p_spc, None).expect("dispatch spc failed");
+        let s_opus = load_spectrum_file(&p_opus, None).expect("dispatch opus .0 failed");
+        let s_spa = load_spectrum_file(&p_spa, None).expect("dispatch spa failed");
+
+        let _ = std::fs::remove_file(&p_spc);
+        let _ = std::fs::remove_file(&p_opus);
+        let _ = std::fs::remove_file(&p_spa);
+
+        assert!(s_spc.x.len() >= 3 && s_spc.kind == SpectrumKind::Ftir);
+        assert!(s_opus.x.len() >= 3 && s_opus.kind == SpectrumKind::Ftir);
+        assert!(s_spa.x.len() >= 3 && s_spa.kind == SpectrumKind::Ftir);
+    }
+
+    #[test]
+    fn test_svg_export_includes_deconv_subpeaks() {
+        let tmp_svg = std::env::temp_dir().join("spectra_test_deconv_export.svg");
+        let xs = vec![1680.0, 1700.0, 1720.0, 1740.0, 1760.0];
+        let payload = ExportPayload {
+            mode: "ftir".into(),
+            y_unit: "absorbance".into(),
+            style: "acs".into(),
+            stacked: false,
+            dpi: 300,
+            title: "Deconv Export Test".into(),
+            x_bounds: [1680.0, 1760.0],
+            active_trace: 0,
+            traces: vec![crate::export::ExportTrace {
+                name: "PMMA C=O".into(),
+                x: xs.clone(),
+                y: vec![0.05, 0.35, 0.80, 0.40, 0.06],
+            }],
+            peaks: Vec::new(),
+            deconv: Some(crate::export::ExportDeconv {
+                x: xs,
+                y_fit: vec![0.05, 0.36, 0.79, 0.41, 0.06],
+                components: vec![
+                    vec![0.02, 0.30, 0.50, 0.15, 0.02],
+                    vec![0.03, 0.06, 0.29, 0.26, 0.04],
+                ],
+            }),
+        };
+        crate::export::run_export(&payload, &tmp_svg).expect("SVG export failed");
+        let svg = std::fs::read_to_string(&tmp_svg).expect("read exported SVG");
+        let _ = std::fs::remove_file(&tmp_svg);
+
+        assert!(svg.contains("<svg") && svg.contains("</svg>"));
+        assert!(svg.contains("deconv-components"), "missing deconv-components group");
+        assert!(svg.contains("deconv-fit"), "missing deconv-fit group");
+    }
+
+    #[test]
+    fn test_processed_report_markdown_contains_sections() {
+        let mut app = App::new(vec![], Some(SpectrumKind::Ftir));
+        app.load_demo(DemoPreset::MmaVsPmmaFtir);
+        let md = app.build_analytical_report_markdown();
+        assert!(md.contains("# SPECTRA Analytical Report"));
+        assert!(md.contains("Processing Pipeline"));
+        assert!(md.contains("Detected Peaks"));
     }
 }
 

@@ -19,12 +19,16 @@ use crate::deconv::{
     PeakShape,
 };
 use crate::export::{
-    open_exported_file, run_export, ExportFormat, ExportPayload, ExportPeak, ExportPeakMode,
-    ExportStyle, ExportTrace,
+    open_exported_file, run_export, ExportDeconv, ExportFormat, ExportPayload, ExportPeak,
+    ExportPeakMode, ExportStyle, ExportTrace,
 };
-use crate::io::{expand_tilde, load_spectrum_file, parse_pasted_paths, search_library};
+use crate::io::{
+    expand_tilde, load_spectrum_file, parse_pasted_paths, save_processed_csv, save_processed_jcamp,
+    search_library,
+};
 use crate::processing::{
-    apply_x_calibration, auto_ftir_conversion, average_spectra, beer_lambert_conc,
+    absorbance_to_transmittance, apply_x_calibration, auto_ftir_conversion, average_spectra,
+    beer_lambert_conc,
     compute_spectral_math, compute_tauc_band_gap_with_optics, detect_peaks,
     ftir_conversion_percent, integrate_spectrum_window, interpolate_y, nmr_mn_dpn,
     optimal_subtraction_factor, process_trace, pu_hydrogen_bond_index, pvdf_beta_fraction,
@@ -270,6 +274,13 @@ pub struct IntegrationModalState {
     pub feedback: Option<String>,
 }
 
+/// Save Processed Data & Analytical Report modal (`W`).
+#[derive(Debug, Clone)]
+pub struct SaveDataModalState {
+    pub selected: usize,
+    pub feedback: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CalibrationModalState {
     pub observed_x: f64,
@@ -373,6 +384,7 @@ pub enum Modal {
     SpectralMath(SpectralMathState),
     Integration(IntegrationModalState),
     Calibration(CalibrationModalState),
+    SaveData(SaveDataModalState),
 }
 
 #[derive(Debug, Clone)]
@@ -1319,7 +1331,11 @@ impl App {
                 }
                 return;
             }
-            Modal::Deconv(_) | Modal::SpectralMath(_) | Modal::Integration(_) | Modal::Calibration(_) => {
+            Modal::Deconv(_)
+            | Modal::SpectralMath(_)
+            | Modal::Integration(_)
+            | Modal::Calibration(_)
+            | Modal::SaveData(_) => {
                 return;
             }
             Modal::FilePicker(_) => {
@@ -1589,6 +1605,121 @@ impl App {
             .or_else(|| active_dir.filter(|p| p.is_dir()))
             .unwrap_or(cwd);
         self.modal = Modal::FilePicker(FilePickerState::new(dir, append_mode));
+    }
+
+    /// Open the Save Processed Data & Analytical Report modal (`W`).
+    pub fn open_save_data_modal(&mut self) {
+        if self.traces.get(self.active_trace).is_some() {
+            self.modal = Modal::SaveData(SaveDataModalState {
+                selected: 0,
+                feedback: None,
+            });
+            self.status_msg =
+                "Save Processed Data & Analytical Report — [↑/↓] Select · [Enter] Save · [c] Copy MD"
+                    .into();
+        } else {
+            self.status_msg = "Load a spectrum before saving processed data".into();
+        }
+    }
+
+    /// One-line description of the active processing pipeline.
+    pub fn processing_summary(&self) -> String {
+        let mut parts = vec![
+            format!("Y-Pref: {:?}", self.process_cfg.y_pref),
+            format!("Baseline: {}", self.process_cfg.baseline.label()),
+            format!("Smooth: {}", self.process_cfg.smooth.label()),
+            format!("Norm: {}", self.process_cfg.norm.label()),
+            format!("Optics: {}", self.process_cfg.optics.label()),
+            format!("Deriv: {}", self.process_cfg.deriv.label()),
+        ];
+        if self.process_cfg.atm_co2 {
+            parts.push("CO2: Suppressed (2280-2410 cm-1)".to_string());
+        }
+        parts.join(" | ")
+    }
+
+    /// Full Markdown analytical report: metadata, pipeline, peaks, deconv
+    /// fit and quantitative integration regions.
+    pub fn build_analytical_report_markdown(&self) -> String {
+        let mut out = String::from("# SPECTRA Analytical Report\n\n");
+        let Some(spec) = self.traces.get(self.active_trace) else {
+            out.push_str("_No active spectrum loaded._\n");
+            return out;
+        };
+        let proc_t = self.processed.get(self.active_trace);
+        let y_unit = proc_t.map(|p| p.y_unit).unwrap_or(spec.raw_y_unit);
+        let npts = proc_t.map(|p| p.x.len()).unwrap_or(spec.x.len());
+        let unit = spec.kind.x_unit();
+
+        out.push_str(&format!("- **Trace:** {}\n", spec.name));
+        out.push_str(&format!("- **Technique:** {}\n", spec.kind.display_name()));
+        out.push_str(&format!("- **Data Points:** {}\n", npts));
+        out.push_str(&format!("- **Displayed Y-Axis:** {}\n", y_unit.label()));
+        for (k, v) in &spec.metadata {
+            out.push_str(&format!("- **{}:** {}\n", k, v));
+        }
+
+        out.push_str("\n## Processing Pipeline\n\n");
+        out.push_str(&format!("- **Y-Axis:** {}\n", y_unit.label()));
+        out.push_str(&format!("- **Baseline:** {}\n", self.process_cfg.baseline.label()));
+        out.push_str(&format!("- **Smoothing:** {}\n", self.process_cfg.smooth.label()));
+        out.push_str(&format!("- **Normalization:** {}\n", self.process_cfg.norm.label()));
+        out.push_str(&format!("- **Optical Physics:** {}\n", self.process_cfg.optics.label()));
+        out.push_str(&format!("- **Derivative:** {}\n", self.process_cfg.deriv.label()));
+        out.push_str(&format!(
+            "- **Atmospheric CO₂ Suppression:** {}\n",
+            if self.process_cfg.atm_co2 { "ON" } else { "OFF" }
+        ));
+
+        out.push_str("\n## Detected Peaks\n\n");
+        if self.pinned_peaks.is_empty() && self.auto_peaks.is_empty() {
+            out.push_str("_No peaks detected or pinned._\n");
+        } else {
+            out.push_str(&format!(
+                "| # | Position ({}) | Prominence | FWHM | Assignment |\n",
+                unit
+            ));
+            out.push_str("|--:|--------------:|-----------:|-----:|:-----------|\n");
+            let mut row_idx = 1usize;
+            for pk in &self.pinned_peaks {
+                let fwhm = pk
+                    .fwhm
+                    .map(|w| format!("{:.2}", w))
+                    .unwrap_or_else(|| "—".into());
+                out.push_str(&format!(
+                    "| {} ★ | {:.2} | {:.4} | {} | {} |\n",
+                    row_idx, pk.x, pk.prominence, fwhm, pk.label
+                ));
+                row_idx += 1;
+            }
+            for pk in &self.auto_peaks {
+                let fwhm = pk
+                    .fwhm
+                    .map(|w| format!("{:.2}", w))
+                    .unwrap_or_else(|| "—".into());
+                out.push_str(&format!(
+                    "| {} | {:.2} | {:.4} | {} | {} |\n",
+                    row_idx, pk.x, pk.prominence, fwhm, pk.label
+                ));
+                row_idx += 1;
+            }
+        }
+
+        if let Some(ov) = self
+            .deconv_overlay
+            .as_ref()
+            .filter(|ov| ov.trace_idx == self.active_trace)
+        {
+            out.push_str("\n## Peak Deconvolution Fit\n\n");
+            out.push_str(&format_deconv_markdown(&ov.result));
+        }
+
+        if !self.integration_regions.is_empty() {
+            out.push_str("\n## Quantitative Integration Regions\n\n");
+            out.push_str(&self.integration_table_text());
+        }
+
+        out
     }
 
     pub fn open_export_modal(&mut self) {
@@ -2134,6 +2265,37 @@ impl App {
         let mut out_path = PathBuf::from(&state.output_path);
         out_path.set_extension(state.format.ext());
 
+        let deconv = self
+            .deconv_overlay
+            .as_ref()
+            .filter(|ov| {
+                ov.trace_idx == self.active_trace
+                    && self
+                        .traces
+                        .get(ov.trace_idx)
+                        .map(|t| t.visible)
+                        .unwrap_or(false)
+            })
+            .map(|ov| {
+                let to_export_y = |v: f64| {
+                    if y_unit == YUnit::Transmittance {
+                        absorbance_to_transmittance(v)
+                    } else {
+                        v
+                    }
+                };
+                ExportDeconv {
+                    x: ov.result.x.clone(),
+                    y_fit: ov.result.y_fit.iter().copied().map(to_export_y).collect(),
+                    components: ov
+                        .result
+                        .components
+                        .iter()
+                        .map(|c| c.iter().copied().map(to_export_y).collect())
+                        .collect(),
+                }
+            });
+
         let payload = ExportPayload {
             mode: self.current_kind().as_str().to_string(),
             y_unit: y_unit.as_str().to_string(),
@@ -2145,6 +2307,7 @@ impl App {
             active_trace: exported_active.min(traces_out.len().saturating_sub(1)),
             traces: traces_out,
             peaks: peaks_out,
+            deconv,
         };
 
         self.pending_export = Some(state.clone());
@@ -2370,6 +2533,12 @@ impl App {
                 self.process_cfg.smooth = self.process_cfg.smooth.next();
                 self.recompute_processing();
                 self.status_msg = format!("Savitzky-Golay Smoothing: {}", self.process_cfg.smooth.label());
+            }
+            KeyCode::Char('W') | KeyCode::Char('w')
+                if key.code == KeyCode::Char('W')
+                    || key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.open_save_data_modal();
             }
             KeyCode::Char('w') => {
                 self.process_cfg.norm = self.process_cfg.norm.next();
@@ -3977,6 +4146,90 @@ impl App {
                     _ => self.modal = Modal::Calibration(st),
                 }
             }
+            Modal::SaveData(mut st) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    st.selected = (st.selected + 2) % 3;
+                    self.modal = Modal::SaveData(st);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    st.selected = (st.selected + 1) % 3;
+                    self.modal = Modal::SaveData(st);
+                }
+                KeyCode::Char('c') => {
+                    let report = self.build_analytical_report_markdown();
+                    match copy_text(&report) {
+                        Ok(tool) => st.feedback = Some(format!("Copied Markdown report via {}", tool)),
+                        Err(e) => st.feedback = Some(format!("Copy failed: {}", e)),
+                    }
+                    self.modal = Modal::SaveData(st);
+                }
+                KeyCode::Enter => {
+                    let pair = (
+                        self.traces.get(self.active_trace).cloned(),
+                        self.processed.get(self.active_trace).cloned(),
+                    );
+                    let (Some(spec), Some(pt)) = pair else {
+                        st.feedback = Some("No active spectrum to save".into());
+                        self.modal = Modal::SaveData(st);
+                        return;
+                    };
+                    let slug: String = spec
+                        .name
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+                        .collect::<String>()
+                        .split('_')
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("_");
+                    let slug: String = if slug.is_empty() {
+                        "spectrum".to_string()
+                    } else {
+                        slug.chars().take(36).collect()
+                    };
+                    let stamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let dir = PathBuf::from("exports");
+                    let res: std::result::Result<PathBuf, String> = (|| {
+                        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                        match st.selected {
+                            0 => {
+                                let p = dir.join(format!("{}_processed_{}.csv", slug, stamp));
+                                let note = self.processing_summary();
+                                save_processed_csv(&p, &spec, &pt.x, &pt.y, pt.y_unit, &note)
+                                    .map_err(|e| e.to_string())?;
+                                Ok(p)
+                            }
+                            1 => {
+                                let p = dir.join(format!("{}_processed_{}.jdx", slug, stamp));
+                                save_processed_jcamp(&p, &spec.name, spec.kind, &pt.x, &pt.y, pt.y_unit)
+                                    .map_err(|e| e.to_string())?;
+                                Ok(p)
+                            }
+                            _ => {
+                                let p = dir.join(format!("{}_report_{}.md", slug, stamp));
+                                let report = self.build_analytical_report_markdown();
+                                fs::write(&p, report).map_err(|e| e.to_string())?;
+                                Ok(p)
+                            }
+                        }
+                    })();
+                    match res {
+                        Ok(path) => {
+                            let msg = format!("Saved: {}", path.display());
+                            self.status_msg = msg.clone();
+                            st.feedback = Some(msg);
+                        }
+                        Err(e) => {
+                            st.feedback = Some(format!("Save failed: {}", e));
+                        }
+                    }
+                    self.modal = Modal::SaveData(st);
+                }
+                _ => self.modal = Modal::SaveData(st),
+            },
             Modal::Busy(busy) => {
                 // Swallow input while a background task runs; the outcome
                 // arrives through `poll_background`.
@@ -4124,7 +4377,12 @@ fn scan_directory(dir: &Path) -> Vec<FileEntry> {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if matches!(ext.as_str(), "csv" | "tsv" | "txt" | "dpt" | "asc" | "xy" | "jdx" | "dx" | "jcamp") {
+                if matches!(
+                    ext.as_str(),
+                    "csv" | "tsv" | "txt" | "dpt" | "asc" | "xy" | "jdx" | "dx" | "jcamp" | "spc"
+                        | "spa" | "opus"
+                ) || (!ext.is_empty() && ext.chars().all(|c| c.is_ascii_digit()))
+                {
                     files.push(FileEntry {
                         path,
                         display: format!("📈 {}", name),

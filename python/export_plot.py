@@ -331,6 +331,38 @@ def render(payload):
             zorder=3 + idx,
         )
 
+    deconv = payload.get("deconv")
+    if deconv and deconv.get("x") and deconv.get("y_fit"):
+        dc_x = np.asarray(deconv["x"], dtype=float)
+        y_off = offsets[active_trace] if active_trace < len(offsets) else 0.0
+        palette = cfg["palette"]
+        for ci, comp in enumerate(deconv.get("components") or []):
+            cy = np.asarray(comp, dtype=float)
+            m = min(len(dc_x), len(cy))
+            if m >= 2:
+                col = palette[(ci + 1) % len(palette)]
+                ax.plot(
+                    dc_x[:m],
+                    cy[:m] + y_off,
+                    color=col,
+                    linestyle="--",
+                    linewidth=0.95,
+                    alpha=0.72,
+                    zorder=3.2,
+                )
+        fy = np.asarray(deconv["y_fit"], dtype=float)
+        m = min(len(dc_x), len(fy))
+        if m >= 2:
+            ax.plot(
+                dc_x[:m],
+                fy[:m] + y_off,
+                color="#d49b1a",
+                linewidth=1.25,
+                alpha=0.92,
+                label="Cumulative Fit",
+                zorder=3.6,
+            )
+
     # UV-Vis: ascending wavelength (nm) left-to-right. Others: IUPAC reversed.
     if mode == "uvvis":
         ax.set_xlim(x_lo, x_hi)
