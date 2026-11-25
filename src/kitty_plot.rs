@@ -371,7 +371,17 @@ fn compute_plot_hash(app: &App) -> u64 {
     app.process_cfg.y_pref.hash(&mut h);
     app.process_cfg.baseline.hash(&mut h);
     (app.process_cfg.smooth as u8).hash(&mut h);
-    app.process_cfg.normalize.hash(&mut h);
+    app.process_cfg.norm.hash(&mut h);
+    app.process_cfg.optics.hash(&mut h);
+    app.process_cfg.deriv.hash(&mut h);
+    app.process_cfg.atm_co2.hash(&mut h);
+    app.deconv_overlay.as_ref().map(|ov| {
+        ov.trace_idx.hash(&mut h);
+        ov.result.r_squared.to_bits().hash(&mut h);
+        ov.result.peaks.len().hash(&mut h);
+        ov.show_components.hash(&mut h);
+        ov.show_residual.hash(&mut h);
+    });
     app.pinned_peaks.len().hash(&mut h);
     for p in &app.pinned_peaks {
         p.x.to_bits().hash(&mut h);
@@ -606,6 +616,115 @@ pub fn sync_hd_plot(
                     img.draw_line_aa(fx, mn, fx, mx, col, alpha, is_active);
                 }
                 prev = Some((fx, last));
+            }
+        }
+    }
+
+    // 4b. Deconvolution overlay: pastel component curves + crisp gold fit envelope
+    if let Some(ov) = app
+        .deconv_overlay
+        .as_ref()
+        .filter(|ov| ov.trace_idx == app.active_trace)
+    {
+        let to_display = |v: f64| -> f64 {
+            if y_unit == YUnit::Transmittance {
+                crate::processing::absorbance_to_transmittance(v)
+            } else {
+                v
+            }
+        };
+        if ov.show_components {
+            for (ci, comp) in ov.result.components.iter().enumerate() {
+                let col = HD_TRACE_PALETTE[(ci + 1) % HD_TRACE_PALETTE.len()];
+                let n = ov.result.x.len().min(comp.len());
+                if n < 2 {
+                    continue;
+                }
+                let mut prev: Option<(f64, f64)> = None;
+                let mut last_px: i32 = i32::MIN;
+                for k in 0..n {
+                    let xv = ov.result.x[k];
+                    if xv < x_lo || xv > x_hi {
+                        prev = None;
+                        continue;
+                    }
+                    let fx = map_x(xv);
+                    let fy = map_y(to_display(comp[k]) + active_stack_offset);
+                    let px = fx as i32;
+                    if px == last_px {
+                        continue;
+                    }
+                    last_px = px;
+                    if let Some((px_prev, py_prev)) = prev {
+                        img.draw_line_aa(px_prev, py_prev, fx, fy, col, 0.65, false);
+                    }
+                    prev = Some((fx, fy));
+                }
+            }
+        }
+
+        let fit = &ov.result.y_fit;
+        let n = ov.result.x.len().min(fit.len());
+        let mut prev: Option<(f64, f64)> = None;
+        let mut last_px: i32 = i32::MIN;
+        for k in 0..n {
+            let xv = ov.result.x[k];
+            if xv < x_lo || xv > x_hi {
+                prev = None;
+                continue;
+            }
+            let fx = map_x(xv);
+            let fy = map_y(to_display(fit[k]) + active_stack_offset);
+            let px = fx as i32;
+            if px == last_px {
+                continue;
+            }
+            last_px = px;
+            if let Some((px_prev, py_prev)) = prev {
+                img.draw_line_aa(px_prev, py_prev, fx, fy, (255, 224, 110), 0.92, false);
+            }
+            prev = Some((fx, fy));
+        }
+
+        if ov.show_residual {
+            let max_abs = ov
+                .result
+                .y_residual
+                .iter()
+                .fold(0.0_f64, |m, v| m.max(v.abs()))
+                .max(1e-12);
+            let y_span = (plot_y_max - plot_y_min).max(1e-12);
+            let base = plot_y_min + y_span * 0.16;
+            let amp = y_span * 0.10;
+
+            // Subtle zero reference line for the residual inset
+            let x_start = map_x(x_lo);
+            let x_end = map_x(x_hi);
+            let y_zero = map_y(base);
+            img.draw_line_aa(x_start, y_zero, x_end, y_zero, (133, 146, 137), 0.45, false);
+
+            // Residual curve in coral
+            let res = &ov.result.y_residual;
+            let n_res = ov.result.x.len().min(res.len());
+            let mut prev: Option<(f64, f64)> = None;
+            let mut last_px: i32 = i32::MIN;
+            for k in 0..n_res {
+                let xv = ov.result.x[k];
+                if xv < x_lo || xv > x_hi {
+                    prev = None;
+                    continue;
+                }
+                let fx = map_x(xv);
+                let fy = map_y(base + amp * (res[k] / max_abs));
+                let px = fx as i32;
+                if px == last_px {
+                    continue;
+                }
+                last_px = px;
+                if let Some((px_prev, py_prev)) = prev {
+                    img.draw_line_aa(px_prev, py_prev, fx, fy, (230, 126, 128), 0.85, false);
+                }
+                prev = Some((fx, fy));
             }
         }
     }

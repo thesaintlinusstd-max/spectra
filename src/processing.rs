@@ -33,6 +33,7 @@ pub enum BaselineMode {
     Off,
     Rubberband,
     Asls,
+    Arpls,
 }
 
 impl BaselineMode {
@@ -40,7 +41,8 @@ impl BaselineMode {
         match self {
             Self::Off => Self::Rubberband,
             Self::Rubberband => Self::Asls,
-            Self::Asls => Self::Off,
+            Self::Asls => Self::Arpls,
+            Self::Arpls => Self::Off,
         }
     }
 
@@ -49,6 +51,104 @@ impl BaselineMode {
             Self::Off => "OFF",
             Self::Rubberband => "Rubberband",
             Self::Asls => "AsLS",
+            Self::Arpls => "arPLS",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NormMode {
+    Off,
+    MinMax,
+    VectorSnv,
+    Area,
+}
+
+impl NormMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::MinMax,
+            Self::MinMax => Self::VectorSnv,
+            Self::VectorSnv => Self::Area,
+            Self::Area => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::MinMax => "MinMax",
+            Self::VectorSnv => "SNV",
+            Self::Area => "Area",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OpticsMode {
+    Off,
+    AtrDiamond,
+    AtrZnSe,
+    AtrGe,
+    AtrSi,
+    KubelkaMunk,
+}
+
+impl OpticsMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::AtrDiamond,
+            Self::AtrDiamond => Self::AtrZnSe,
+            Self::AtrZnSe => Self::AtrGe,
+            Self::AtrGe => Self::AtrSi,
+            Self::AtrSi => Self::KubelkaMunk,
+            Self::KubelkaMunk => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::AtrDiamond => "ATR-Dia",
+            Self::AtrZnSe => "ATR-ZnSe",
+            Self::AtrGe => "ATR-Ge",
+            Self::AtrSi => "ATR-Si",
+            Self::KubelkaMunk => "KM F(R)",
+        }
+    }
+
+    pub fn atr_n1(self) -> Option<f64> {
+        match self {
+            Self::AtrDiamond => Some(2.400),
+            Self::AtrZnSe => Some(2.403),
+            Self::AtrGe => Some(4.003),
+            Self::AtrSi => Some(3.422),
+            Self::Off | Self::KubelkaMunk => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DerivOrder {
+    Raw,
+    First,
+    Second,
+}
+
+impl DerivOrder {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Raw => Self::First,
+            Self::First => Self::Second,
+            Self::Second => Self::Raw,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Raw => "Raw",
+            Self::First => "dY/dX",
+            Self::Second => "d²Y/dX²",
         }
     }
 }
@@ -66,7 +166,10 @@ pub struct ProcessConfig {
     pub y_pref: YAxisPreference,
     pub baseline: BaselineMode,
     pub smooth: SmoothLevel,
-    pub normalize: bool,
+    pub norm: NormMode,
+    pub optics: OpticsMode,
+    pub deriv: DerivOrder,
+    pub atm_co2: bool,
 }
 
 impl Default for ProcessConfig {
@@ -75,7 +178,10 @@ impl Default for ProcessConfig {
             y_pref: YAxisPreference::Native,
             baseline: BaselineMode::Off,
             smooth: SmoothLevel::Off,
-            normalize: false,
+            norm: NormMode::Off,
+            optics: OpticsMode::Off,
+            deriv: DerivOrder::Raw,
+            atm_co2: false,
         }
     }
 }
@@ -175,17 +281,93 @@ pub fn savitzky_golay_deriv1(ys: &[f64]) -> Vec<f64> {
     out
 }
 
-/// Eilers & Boelens (2005) Asymmetric Least Squares (AsLS) baseline correction.
-/// Solves `(W + λ D₂ᵀD₂) z = W y` in O(N) via symmetric pentadiagonal LDLᵀ factorization.
-/// `base_lambda` is auto-scaled by `(n / 1800)⁴` for sampling-density invariance.
-pub fn asls_baseline(ys: &[f64], base_lambda: f64, p: f64, n_iter: usize) -> Vec<f64> {
+/// 9-point or 15-point quadratic/cubic Savitzky-Golay 2nd derivative with reflected edges.
+pub fn savitzky_golay_deriv2(ys: &[f64], win15: bool) -> Vec<f64> {
+    const COEFFS_9: [f64; 9] = [28.0, 7.0, -8.0, -17.0, -20.0, -17.0, -8.0, 7.0, 28.0];
+    const NORM_9: f64 = 462.0;
+    const COEFFS_15: [f64; 15] = [
+        91.0, 52.0, 19.0, -8.0, -29.0, -44.0, -53.0, -56.0, -53.0, -44.0, -29.0, -8.0, 19.0, 52.0,
+        91.0,
+    ];
+    const NORM_15: f64 = 6188.0;
+
+    let n = ys.len();
+    let (coeffs, norm): (&[f64], f64) = if win15 && n >= 15 {
+        (&COEFFS_15, NORM_15)
+    } else if n >= 9 {
+        (&COEFFS_9, NORM_9)
+    } else {
+        return vec![0.0; n];
+    };
+
+    let half = (coeffs.len() / 2) as isize;
+    let mut out = vec![0.0; n];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let mut acc = 0.0;
+        for (k, &w) in coeffs.iter().enumerate() {
+            let mut idx = i as isize + (k as isize - half);
+            if idx < 0 {
+                idx = -idx;
+            }
+            if idx >= n as isize {
+                idx = 2 * (n as isize - 1) - idx;
+            }
+            let c = idx.clamp(0, (n - 1) as isize) as usize;
+            acc += w * ys[c];
+        }
+        *slot = acc / norm;
+    }
+    out
+}
+
+/// Physical Savitzky-Golay spectral derivative scaled by median |Δx|.
+pub fn spectral_derivative(xs: &[f64], ys: &[f64], order: DerivOrder) -> Vec<f64> {
+    if order == DerivOrder::Raw {
+        return ys.to_vec();
+    }
+    let n = xs.len().min(ys.len());
+    if n < 2 {
+        return ys.to_vec();
+    }
+    let mut dxs: Vec<f64> = xs[..n]
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .filter(|&d| d > 1e-12)
+        .collect();
+    let dx = if dxs.is_empty() {
+        1.0
+    } else {
+        dxs.sort_by(|a, b| a.total_cmp(b));
+        dxs[dxs.len() / 2]
+    };
+    match order {
+        DerivOrder::Raw => ys.to_vec(),
+        DerivOrder::First => {
+            let d1 = savitzky_golay_deriv1(&ys[..n]);
+            if dx > 1e-9 {
+                d1.into_iter().map(|v| v / dx).collect()
+            } else {
+                d1
+            }
+        }
+        DerivOrder::Second => {
+            let d2 = savitzky_golay_deriv2(&ys[..n], n > 600);
+            if dx > 1e-9 {
+                let dx2 = dx * dx;
+                d2.into_iter().map(|v| v / dx2).collect()
+            } else {
+                d2
+            }
+        }
+    }
+}
+
+/// O(N) symmetric pentadiagonal LDLᵀ solver for `(W + λ D₂ᵀD₂) z = W y`.
+fn pentadiag_ldlt_solve(w: &[f64], ys: &[f64], lam: f64) -> Vec<f64> {
     let n = ys.len();
     if n < 5 {
         return ys.to_vec();
     }
-    let scale = (n as f64 / 1800.0).powi(4);
-    let lam = (base_lambda * scale).clamp(1e2, 1e10);
-
     let mut p0 = vec![0.0_f64; n];
     let mut p1 = vec![0.0_f64; n.saturating_sub(1)];
     let mut p2 = vec![0.0_f64; n.saturating_sub(2)];
@@ -198,60 +380,137 @@ pub fn asls_baseline(ys: &[f64], base_lambda: f64, p: f64, n_iter: usize) -> Vec
         p2[i] += lam;
     }
 
-    let mut w = vec![1.0_f64; n];
     let mut z = vec![0.0_f64; n];
     let mut d = vec![0.0_f64; n];
     let mut l1 = vec![0.0_f64; n];
     let mut l2 = vec![0.0_f64; n];
     let mut v = vec![0.0_f64; n];
 
-    for _ in 0..n_iter {
-        for i in 0..n {
-            let mut a0 = w[i] + p0[i];
-            if i >= 1 {
-                a0 -= l1[i - 1] * l1[i - 1] * d[i - 1];
-            }
-            if i >= 2 {
-                a0 -= l2[i - 2] * l2[i - 2] * d[i - 2];
-            }
-            d[i] = a0.max(1e-18);
+    for i in 0..n {
+        let mut a0 = w[i] + p0[i];
+        if i >= 1 {
+            a0 -= l1[i - 1] * l1[i - 1] * d[i - 1];
+        }
+        if i >= 2 {
+            a0 -= l2[i - 2] * l2[i - 2] * d[i - 2];
+        }
+        d[i] = a0.max(1e-18);
 
-            if i + 1 < n {
-                let mut a1 = p1[i];
-                if i >= 1 {
-                    a1 -= l2[i - 1] * l1[i - 1] * d[i - 1];
-                }
-                l1[i] = a1 / d[i];
-            }
-            if i + 2 < n {
-                l2[i] = p2[i] / d[i];
-            }
-        }
-        for i in 0..n {
-            let mut s = w[i] * ys[i];
+        if i + 1 < n {
+            let mut a1 = p1[i];
             if i >= 1 {
-                s -= l1[i - 1] * v[i - 1];
+                a1 -= l2[i - 1] * l1[i - 1] * d[i - 1];
             }
-            if i >= 2 {
-                s -= l2[i - 2] * v[i - 2];
-            }
-            v[i] = s;
+            l1[i] = a1 / d[i];
         }
-        for i in (0..n).rev() {
-            let mut s = v[i] / d[i];
-            if i + 1 < n {
-                s -= l1[i] * z[i + 1];
-            }
-            if i + 2 < n {
-                s -= l2[i] * z[i + 2];
-            }
-            z[i] = s;
+        if i + 2 < n {
+            l2[i] = p2[i] / d[i];
         }
+    }
+    for i in 0..n {
+        let mut s = w[i] * ys[i];
+        if i >= 1 {
+            s -= l1[i - 1] * v[i - 1];
+        }
+        if i >= 2 {
+            s -= l2[i - 2] * v[i - 2];
+        }
+        v[i] = s;
+    }
+    for i in (0..n).rev() {
+        let mut s = v[i] / d[i];
+        if i + 1 < n {
+            s -= l1[i] * z[i + 1];
+        }
+        if i + 2 < n {
+            s -= l2[i] * z[i + 2];
+        }
+        z[i] = s;
+    }
+    z
+}
+
+/// Eilers & Boelens (2005) Asymmetric Least Squares (AsLS) baseline correction.
+/// Solves `(W + λ D₂ᵀD₂) z = W y` in O(N) via symmetric pentadiagonal LDLᵀ factorization.
+/// `base_lambda` is auto-scaled by `(n / 1800)⁴` for sampling-density invariance.
+pub fn asls_baseline(ys: &[f64], base_lambda: f64, p: f64, n_iter: usize) -> Vec<f64> {
+    let n = ys.len();
+    if n < 5 {
+        return ys.to_vec();
+    }
+    let scale = (n as f64 / 1800.0).powi(4);
+    let lam = (base_lambda * scale).clamp(1e2, 1e10);
+    let mut w = vec![1.0_f64; n];
+    let mut z = vec![0.0_f64; n];
+
+    for _ in 0..n_iter {
+        z = pentadiag_ldlt_solve(&w, ys, lam);
         for i in 0..n {
             w[i] = if ys[i] > z[i] { p } else { 1.0 - p };
         }
     }
 
+    ys.iter().zip(&z).map(|(&y, &b)| (y - b).max(0.0)).collect()
+}
+
+/// Baek et al. (Analyst 2015, 140, 250) asymmetrically reweighted Penalized Least Squares (arPLS).
+pub fn arpls_baseline(ys: &[f64], base_lambda: f64, ratio: f64, max_iter: usize) -> Vec<f64> {
+    let n = ys.len();
+    if n < 5 {
+        return ys.to_vec();
+    }
+    let scale = (n as f64 / 1800.0).powi(4);
+    let lam = (base_lambda * scale).clamp(1e2, 1e10);
+    let mut w = vec![1.0_f64; n];
+    let mut z = vec![0.0_f64; n];
+
+    for _ in 0..max_iter {
+        z = pentadiag_ldlt_solve(&w, ys, lam);
+        let mut dn_sum = 0.0;
+        let mut dn_cnt = 0usize;
+        for i in 0..n {
+            let d = ys[i] - z[i];
+            if d < 0.0 {
+                dn_sum += d;
+                dn_cnt += 1;
+            }
+        }
+        if dn_cnt < 2 {
+            break;
+        }
+        let mean = dn_sum / dn_cnt as f64;
+        let mut var = 0.0;
+        for i in 0..n {
+            let d = ys[i] - z[i];
+            if d < 0.0 {
+                let diff = d - mean;
+                var += diff * diff;
+            }
+        }
+        let std = (var / dn_cnt as f64).sqrt();
+        if std < 1e-12 {
+            break;
+        }
+
+        let mut diff_sq = 0.0;
+        let mut w_sq = 0.0;
+        for i in 0..n {
+            let d = ys[i] - z[i];
+            let w_new = if d <= 0.0 {
+                1.0
+            } else {
+                let arg = (2.0 * (d - (2.0 * std - mean)) / std).clamp(-60.0, 60.0);
+                1.0 / (1.0 + arg.exp())
+            };
+            let dw = w_new - w[i];
+            diff_sq += dw * dw;
+            w_sq += w[i] * w[i];
+            w[i] = w_new;
+        }
+        if (diff_sq.sqrt() / w_sq.sqrt().max(1e-12)) < ratio {
+            break;
+        }
+    }
     ys.iter().zip(&z).map(|(&y, &b)| (y - b).max(0.0)).collect()
 }
 
@@ -312,63 +571,340 @@ pub fn rubberband_baseline(xs: &[f64], ys: &[f64], upper: bool) -> Vec<f64> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Complex {
+    re: f64,
+    im: f64,
+}
+
+impl Complex {
+    fn new(re: f64, im: f64) -> Self {
+        Self { re, im }
+    }
+    fn add(self, o: Self) -> Self {
+        Self {
+            re: self.re + o.re,
+            im: self.im + o.im,
+        }
+    }
+    fn sub(self, o: Self) -> Self {
+        Self {
+            re: self.re - o.re,
+            im: self.im - o.im,
+        }
+    }
+    fn mul(self, o: Self) -> Self {
+        Self {
+            re: self.re * o.re - self.im * o.im,
+            im: self.re * o.im + self.im * o.re,
+        }
+    }
+    fn div(self, o: Self) -> Self {
+        let den = (o.re * o.re + o.im * o.im).max(1e-30);
+        Self {
+            re: (self.re * o.re + self.im * o.im) / den,
+            im: (self.im * o.re - self.re * o.im) / den,
+        }
+    }
+    fn norm_sq(self) -> f64 {
+        self.re * self.re + self.im * self.im
+    }
+    fn sqrt(self) -> Self {
+        let r = self.re.hypot(self.im);
+        let re = ((r + self.re) * 0.5).max(0.0).sqrt();
+        let im_mag = ((r - self.re) * 0.5).max(0.0).sqrt();
+        let im = if self.im < 0.0 { -im_mag } else { im_mag };
+        Self { re, im }
+    }
+}
+
+fn fresnel_atr_absorbance_scalar(n1: f64, n2_real: f64, k: f64, sin_th: f64, cos_th: f64) -> f64 {
+    let n2 = Complex::new(n2_real, k.max(0.0));
+    let ratio = Complex::new(n1 * sin_th, 0.0).div(n2);
+    let one_minus = Complex::new(1.0, 0.0).sub(ratio.mul(ratio));
+    let mut cos_t = one_minus.sqrt();
+    // Enforce evanescent decay into the sample: Im(n2 * cos_t) >= 0
+    if n2.mul(cos_t).im < 0.0 {
+        cos_t = Complex::new(-cos_t.re, -cos_t.im);
+    }
+    let n1_c = Complex::new(n1 * cos_th, 0.0);
+    let n2_ct = n2.mul(cos_t);
+    let rs = n1_c.sub(n2_ct).div(n1_c.add(n2_ct));
+
+    let n2_c = n2.mul(Complex::new(cos_th, 0.0));
+    let n1_ct = cos_t.mul(Complex::new(n1, 0.0));
+    let rp = n2_c.sub(n1_ct).div(n2_c.add(n1_ct));
+
+    let r_unpol = 0.5 * (rs.norm_sq() + rp.norm_sq());
+    -(r_unpol.clamp(1e-6, 1.0)).log10()
+}
+
+/// Ohta & Ishida (1988) Maclaurin Cauchy principal value Kramers-Kronig transform
+/// on a downsampled uniform grid (<= 450 pts for <1 ms speed).
+fn kk_n_from_k(wn: &[f64], k: &[f64], n_inf: f64) -> Vec<f64> {
+    let n = wn.len();
+    if n < 4 || k.len() != n {
+        return vec![n_inf; n];
+    }
+    const MAX_GRID: usize = 450;
+    let (g_wn, g_k): (Vec<f64>, Vec<f64>) = if n <= MAX_GRID {
+        (wn.to_vec(), k.to_vec())
+    } else {
+        let lo = wn[0];
+        let hi = wn[n - 1];
+        let mut gx = Vec::with_capacity(MAX_GRID);
+        let mut gk = Vec::with_capacity(MAX_GRID);
+        for i in 0..MAX_GRID {
+            let x = lo + (hi - lo) * (i as f64 / (MAX_GRID - 1) as f64);
+            gx.push(x);
+            gk.push(interpolate_y(wn, k, x).unwrap_or(0.0));
+        }
+        (gx, gk)
+    };
+
+    let m = g_wn.len();
+    let mut vk = vec![0.0_f64; m];
+    let mut v2 = vec![0.0_f64; m];
+    for j in 0..m {
+        let dw = if j == 0 {
+            g_wn[1] - g_wn[0]
+        } else if j == m - 1 {
+            g_wn[m - 1] - g_wn[m - 2]
+        } else {
+            0.5 * (g_wn[j + 1] - g_wn[j - 1])
+        };
+        vk[j] = g_wn[j] * g_k[j] * (2.0 * dw);
+        v2[j] = g_wn[j] * g_wn[j];
+    }
+
+    let mut g_n = vec![n_inf; m];
+    let inv_pi2 = 2.0 / std::f64::consts::PI;
+    for i in 0..m {
+        let vi2 = v2[i];
+        let mut acc = 0.0;
+        let mut j = if i % 2 == 0 { 1 } else { 0 };
+        while j < m {
+            let denom = v2[j] - vi2;
+            if denom.abs() > 1e-9 {
+                acc += vk[j] / denom;
+            }
+            j += 2;
+        }
+        g_n[i] = n_inf + inv_pi2 * acc;
+    }
+
+    if n <= MAX_GRID {
+        g_n
+    } else {
+        wn.iter()
+            .map(|&x| interpolate_y(&g_wn, &g_n, x).unwrap_or(n_inf))
+            .collect()
+    }
+}
+
+/// Advanced ATR-to-Transmission correction (Fresnel + Kramers-Kronig anomalous dispersion +
+/// Harrick penetration depth scaling). Input & output are in linear Absorbance units.
+pub fn advanced_atr_correction(
+    wn: &[f64],
+    abs_ys: &[f64],
+    n1: f64,
+    n_sample: f64,
+    theta_deg: f64,
+) -> Vec<f64> {
+    let n = wn.len().min(abs_ys.len());
+    if n < 4 || n1 <= n_sample + 0.05 {
+        return abs_ys.to_vec();
+    }
+    let th = theta_deg.to_radians();
+    let (s, c) = (th.sin(), th.cos());
+    let n21 = n_sample / n1;
+    let rad = (s * s - n21 * n21).max(1e-6).sqrt();
+    let de_perp = n21 * c / (std::f64::consts::PI * n1 * (1.0 - n21 * n21) * rad);
+    let de_par = de_perp * (2.0 * s * s - n21 * n21) / ((1.0 + n21 * n21) * s * s - n21 * n21);
+    let scale_k = (4.0 * std::f64::consts::PI / 10.0_f64.ln()) * n_sample * 0.5 * (de_perp + de_par);
+
+    let k_limit = if n1 < 3.0 { 0.80 } else { 1.40 };
+    let a_single_max = fresnel_atr_absorbance_scalar(n1, n_sample, k_limit, s, c);
+    let a_obs_max = abs_ys.iter().copied().fold(0.0_f64, |m, v| m.max(v.max(0.0)));
+    if a_obs_max <= 1e-9 || a_single_max <= 1e-9 {
+        return abs_ys.to_vec();
+    }
+
+    // Auto-estimate effective bounces if input is multi-bounce or high-absorbance
+    let bounces = (a_obs_max / (0.90 * a_single_max)).ceil().max(1.0);
+    let a_single: Vec<f64> = abs_ys[..n].iter().map(|&v| v.max(0.0) / bounces).collect();
+
+    let mut k_est: Vec<f64> = a_single
+        .iter()
+        .map(|&a| (a / scale_k.max(1e-6)).clamp(0.0, k_limit))
+        .collect();
+    let n_cap = n1 * s * 0.992;
+
+    for _ in 0..8 {
+        let n_est = kk_n_from_k(&wn[..n], &k_est, n_sample);
+        for i in 0..n {
+            let target = a_single[i];
+            let k_solved = if target < 1e-7 {
+                0.0
+            } else {
+                let ni = n_est[i].clamp(1.05, n_cap);
+                let mut lo = 0.0_f64;
+                let mut hi = k_limit;
+                if target >= fresnel_atr_absorbance_scalar(n1, ni, hi, s, c) {
+                    hi
+                } else {
+                    for _ in 0..16 {
+                        let mid = 0.5 * (lo + hi);
+                        if fresnel_atr_absorbance_scalar(n1, ni, mid, s, c) < target {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    0.5 * (lo + hi)
+                }
+            };
+            k_est[i] = 0.5 * k_est[i] + 0.5 * k_solved;
+        }
+    }
+
+    (0..n)
+        .map(|i| bounces * (wn[i].max(1.0) / 1000.0) * k_est[i] * scale_k)
+        .collect()
+}
+
+/// Kubelka-Munk remission transform F(R) = (1 - R)^2 / (2R) for DRIFTS and UV-Vis DRS.
+/// Automatically detects %R (0..100) vs fractional R (0..1).
+pub fn kubelka_munk_transform(ys: &[f64]) -> Vec<f64> {
+    let y_max = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let is_pct = y_max > 1.5;
+    ys.iter()
+        .map(|&v| {
+            let r = (if is_pct { v / 100.0 } else { v }).clamp(0.001, 0.9999);
+            let d = 1.0 - r;
+            (d * d) / (2.0 * r)
+        })
+        .collect()
+}
+
+/// Linearly bridge atmospheric CO₂ doublet (2280..2410 cm⁻¹) on FTIR traces.
+pub fn suppress_co2_band(xs: &[f64], ys: &[f64]) -> Vec<f64> {
+    let n = xs.len().min(ys.len());
+    if n < 4 {
+        return ys.to_vec();
+    }
+    let i0 = xs.partition_point(|&v| v < 2280.0);
+    let i1 = xs.partition_point(|&v| v <= 2410.0);
+    if i0 == 0 || i1 >= n || i1 <= i0 {
+        return ys.to_vec();
+    }
+    let mut out = ys.to_vec();
+    let (x0, y0) = (xs[i0 - 1], ys[i0 - 1]);
+    let (x1, y1) = (xs[i1], ys[i1]);
+    let span = (x1 - x0).max(1e-12);
+    for i in i0..i1 {
+        let t = ((xs[i] - x0) / span).clamp(0.0, 1.0);
+        out[i] = y0 + t * (y1 - y0);
+    }
+    out
+}
+
 pub fn process_trace(spec: &Spectrum, cfg: ProcessConfig) -> (Vec<f64>, Vec<f64>, YUnit) {
     let xs = spec.x.clone();
-    let (mut ys, y_unit) = match spec.kind {
-        SpectrumKind::Ftir => {
-            if cfg.y_pref == YAxisPreference::Swapped {
-                let converted = match spec.raw_y_unit {
-                    YUnit::Transmittance => {
-                        spec.y.iter().copied().map(transmittance_to_absorbance).collect()
-                    }
-                    _ => spec.y.clone(),
-                };
-                (converted, YUnit::Absorbance)
-            } else {
-                let converted = match spec.raw_y_unit {
-                    YUnit::Absorbance => {
-                        spec.y.iter().copied().map(absorbance_to_transmittance).collect()
-                    }
-                    _ => spec.y.clone(),
-                };
-                (converted, YUnit::Transmittance)
+    // Step A: Optical / Y-unit conversion
+    let (mut ys, mut y_unit) = if cfg.optics == OpticsMode::KubelkaMunk
+        && matches!(spec.kind, SpectrumKind::Ftir | SpectrumKind::UvVis)
+    {
+        let refl: Vec<f64> = if spec.raw_y_unit == YUnit::Absorbance {
+            spec.y.iter().copied().map(absorbance_to_transmittance).collect()
+        } else {
+            spec.y.clone()
+        };
+        (kubelka_munk_transform(&refl), YUnit::Absorbance)
+    } else if let Some(n1) = cfg.optics.atr_n1().filter(|_| spec.kind == SpectrumKind::Ftir) {
+        let abs: Vec<f64> = match spec.raw_y_unit {
+            YUnit::Transmittance => {
+                spec.y.iter().copied().map(transmittance_to_absorbance).collect()
             }
+            _ => spec.y.clone(),
+        };
+        let corr = advanced_atr_correction(&xs, &abs, n1, 1.50, 45.0);
+        if cfg.y_pref == YAxisPreference::Native
+            && cfg.deriv == DerivOrder::Raw
+            && !matches!(cfg.norm, NormMode::VectorSnv | NormMode::Area)
+        {
+            (
+                corr.into_iter().map(absorbance_to_transmittance).collect(),
+                YUnit::Transmittance,
+            )
+        } else {
+            (corr, YUnit::Absorbance)
         }
-        SpectrumKind::Hnmr | SpectrumKind::Cnmr => (spec.y.clone(), YUnit::Intensity),
-        SpectrumKind::UvVis => {
-            // Default = Absorbance; `YAxisPreference::Swapped` toggles %T <-> Abs.
-            let want_transmittance = cfg.y_pref == YAxisPreference::Swapped;
-            if want_transmittance {
-                let converted = match spec.raw_y_unit {
-                    YUnit::Absorbance => {
-                        spec.y.iter().copied().map(absorbance_to_transmittance).collect()
-                    }
-                    _ => spec.y.clone(),
-                };
-                (converted, YUnit::Transmittance)
-            } else {
-                let converted = match spec.raw_y_unit {
-                    YUnit::Transmittance => {
-                        spec.y.iter().copied().map(transmittance_to_absorbance).collect()
-                    }
-                    _ => spec.y.clone(),
-                };
-                (converted, YUnit::Absorbance)
+    } else {
+        match spec.kind {
+            SpectrumKind::Ftir => {
+                if cfg.y_pref == YAxisPreference::Swapped {
+                    let converted = match spec.raw_y_unit {
+                        YUnit::Transmittance => {
+                            spec.y.iter().copied().map(transmittance_to_absorbance).collect()
+                        }
+                        _ => spec.y.clone(),
+                    };
+                    (converted, YUnit::Absorbance)
+                } else {
+                    let converted = match spec.raw_y_unit {
+                        YUnit::Absorbance => {
+                            spec.y.iter().copied().map(absorbance_to_transmittance).collect()
+                        }
+                        _ => spec.y.clone(),
+                    };
+                    (converted, YUnit::Transmittance)
+                }
+            }
+            SpectrumKind::Hnmr | SpectrumKind::Cnmr => (spec.y.clone(), YUnit::Intensity),
+            SpectrumKind::UvVis => {
+                // Default = Absorbance; `YAxisPreference::Swapped` toggles %T <-> Abs.
+                let want_transmittance = cfg.y_pref == YAxisPreference::Swapped;
+                if want_transmittance {
+                    let converted = match spec.raw_y_unit {
+                        YUnit::Absorbance => {
+                            spec.y.iter().copied().map(absorbance_to_transmittance).collect()
+                        }
+                        _ => spec.y.clone(),
+                    };
+                    (converted, YUnit::Transmittance)
+                } else {
+                    let converted = match spec.raw_y_unit {
+                        YUnit::Transmittance => {
+                            spec.y.iter().copied().map(transmittance_to_absorbance).collect()
+                        }
+                        _ => spec.y.clone(),
+                    };
+                    (converted, YUnit::Absorbance)
+                }
             }
         }
     };
 
+    // Step B: Atmospheric CO₂ suppression
+    if cfg.atm_co2 && spec.kind == SpectrumKind::Ftir {
+        ys = suppress_co2_band(&xs, &ys);
+    }
+
+    // Step C: Smoothing
     if cfg.smooth != SmoothLevel::Off {
         ys = savitzky_golay(&ys, cfg.smooth);
     }
 
+    // Step D: Baseline correction
     if cfg.baseline != BaselineMode::Off {
         let lam = if spec.kind == SpectrumKind::UvVis { 5e5 } else { 1e6 };
         if y_unit == YUnit::Transmittance {
             let abs: Vec<f64> = ys.iter().copied().map(transmittance_to_absorbance).collect();
             let corr = match cfg.baseline {
                 BaselineMode::Rubberband => rubberband_baseline(&xs, &abs, false),
-                BaselineMode::Asls => asls_baseline(&abs, 1e6, 0.01, 10),
+                BaselineMode::Asls => asls_baseline(&abs, lam, 0.01, 10),
+                BaselineMode::Arpls => arpls_baseline(&abs, lam, 1e-3, 40),
                 BaselineMode::Off => abs,
             };
             ys = corr.into_iter().map(absorbance_to_transmittance).collect();
@@ -376,24 +912,69 @@ pub fn process_trace(spec: &Spectrum, cfg: ProcessConfig) -> (Vec<f64>, Vec<f64>
             ys = match cfg.baseline {
                 BaselineMode::Rubberband => rubberband_baseline(&xs, &ys, false),
                 BaselineMode::Asls => asls_baseline(&ys, lam, 0.01, 10),
+                BaselineMode::Arpls => arpls_baseline(&ys, lam, 1e-3, 40),
                 BaselineMode::Off => ys,
             };
         }
     }
 
-    if cfg.normalize && ys.len() >= 2 {
-        let y_min = ys.iter().copied().fold(f64::INFINITY, f64::min);
-        let y_max = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let span = (y_max - y_min).max(1e-12);
-        if y_unit == YUnit::Transmittance {
-            for v in &mut ys {
-                *v = 10.0 + 90.0 * (*v - y_min) / span;
+    // Step E: Normalization
+    if ys.len() >= 2 {
+        match cfg.norm {
+            NormMode::Off => {}
+            NormMode::MinMax => {
+                let y_min = ys.iter().copied().fold(f64::INFINITY, f64::min);
+                let y_max = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let span = (y_max - y_min).max(1e-12);
+                if y_unit == YUnit::Transmittance {
+                    for v in &mut ys {
+                        *v = 10.0 + 90.0 * (*v - y_min) / span;
+                    }
+                } else {
+                    for v in &mut ys {
+                        *v = (*v - y_min) / span;
+                    }
+                }
             }
-        } else {
-            for v in &mut ys {
-                *v = (*v - y_min) / span;
+            NormMode::VectorSnv => {
+                if y_unit == YUnit::Transmittance {
+                    ys = ys.into_iter().map(transmittance_to_absorbance).collect();
+                    y_unit = YUnit::Absorbance;
+                }
+                let n_f = ys.len() as f64;
+                let mean = ys.iter().sum::<f64>() / n_f;
+                let var = ys.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / n_f;
+                let std = var.sqrt().max(1e-12);
+                for v in &mut ys {
+                    *v = (*v - mean) / std;
+                }
+            }
+            NormMode::Area => {
+                if y_unit == YUnit::Transmittance {
+                    ys = ys.into_iter().map(transmittance_to_absorbance).collect();
+                    y_unit = YUnit::Absorbance;
+                }
+                let mut area = 0.0;
+                for k in 0..(xs.len().min(ys.len()) - 1) {
+                    let dx = (xs[k + 1] - xs[k]).abs();
+                    area += 0.5 * (ys[k].abs() + ys[k + 1].abs()) * dx;
+                }
+                if area > 1e-12 {
+                    for v in &mut ys {
+                        *v /= area;
+                    }
+                }
             }
         }
+    }
+
+    // Step F: Derivative Spectroscopy
+    if cfg.deriv != DerivOrder::Raw {
+        if y_unit == YUnit::Transmittance {
+            ys = ys.into_iter().map(transmittance_to_absorbance).collect();
+        }
+        ys = spectral_derivative(&xs, &ys, cfg.deriv);
+        y_unit = YUnit::Intensity;
     }
 
     (xs, ys, y_unit)
@@ -811,12 +1392,28 @@ pub struct TaucResult {
 ///
 /// `(αhν)^(1/n)` versus `hν` is fitted in a sliding linear window on the
 /// first fundamental absorption onset; the x-intercept of the best-fit line is Eg.
+#[allow(dead_code)]
 pub fn compute_tauc_band_gap(spec: &Spectrum, mode: TaucMode) -> Option<TaucResult> {
+    compute_tauc_band_gap_with_optics(spec, mode, OpticsMode::Off)
+}
+
+pub fn compute_tauc_band_gap_with_optics(
+    spec: &Spectrum,
+    mode: TaucMode,
+    optics: OpticsMode,
+) -> Option<TaucResult> {
     if spec.kind != SpectrumKind::UvVis || spec.x.len() < 12 || spec.x.len() != spec.y.len() {
         return None;
     }
 
-    let ys_abs: Vec<f64> = if spec.raw_y_unit == YUnit::Transmittance {
+    let ys_abs: Vec<f64> = if optics == OpticsMode::KubelkaMunk {
+        let refl: Vec<f64> = if spec.raw_y_unit == YUnit::Absorbance {
+            spec.y.iter().copied().map(absorbance_to_transmittance).collect()
+        } else {
+            spec.y.clone()
+        };
+        kubelka_munk_transform(&refl)
+    } else if spec.raw_y_unit == YUnit::Transmittance {
         spec.y.iter().copied().map(transmittance_to_absorbance).collect()
     } else {
         spec.y.clone()
@@ -987,4 +1584,257 @@ pub fn beer_lambert_conc(absorbance: f64, epsilon: f64, path_cm: f64) -> Option<
         return None;
     }
     Some(absorbance / (epsilon * path_cm))
+}
+
+// ============================================================================
+// INTERACTIVE SPECTRAL MATH ENGINE
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpectralOp {
+    Subtract, // A - k * B
+    Add,      // A + k * B
+    Ratio,    // A / (k * B)
+    Average,  // Mean of compatible visible traces
+}
+
+impl SpectralOp {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Subtract => Self::Add,
+            Self::Add => Self::Ratio,
+            Self::Ratio => Self::Average,
+            Self::Average => Self::Subtract,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Subtract => Self::Average,
+            Self::Add => Self::Subtract,
+            Self::Ratio => Self::Add,
+            Self::Average => Self::Ratio,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Subtract => "A - k·B (Subtract)",
+            Self::Add => "A + k·B (Add)",
+            Self::Ratio => "A / (k·B) (Ratio)",
+            Self::Average => "Average Visible",
+        }
+    }
+}
+
+fn to_linear_space(spec: &Spectrum) -> Vec<f64> {
+    if spec.raw_y_unit == YUnit::Transmittance {
+        spec.y
+            .iter()
+            .copied()
+            .map(transmittance_to_absorbance)
+            .collect()
+    } else {
+        spec.y.clone()
+    }
+}
+
+/// Computes baseline-invariant optimal subtraction factor k* = sum(dA * dB) / sum(dB^2)
+/// over overlapping points inside [x_lo, x_hi] in linear space (clamped to [0.0, 20.0]).
+/// Falls back to full overlapping range if [x_lo, x_hi] has < 4 overlapping points.
+pub fn optimal_subtraction_factor(
+    a: &Spectrum,
+    b: &Spectrum,
+    x_lo: f64,
+    x_hi: f64,
+) -> Option<f64> {
+    if a.kind != b.kind || a.x.len() < 4 || b.x.len() < 4 {
+        return None;
+    }
+    let a_lin = to_linear_space(a);
+    let b_lin = to_linear_space(b);
+    let b_lo = *b.x.first()?;
+    let b_hi = *b.x.last()?;
+
+    let collect_overlap = |lo: f64, hi: f64| -> (Vec<f64>, Vec<f64>) {
+        let mut va = Vec::new();
+        let mut vb = Vec::new();
+        for (&x, &ya) in a.x.iter().zip(&a_lin) {
+            if x >= lo && x <= hi && x >= b_lo && x <= b_hi {
+                if let Some(yb) = interpolate_y(&b.x, &b_lin, x) {
+                    va.push(ya);
+                    vb.push(yb);
+                }
+            }
+        }
+        (va, vb)
+    };
+
+    let (mut va, mut vb) = collect_overlap(x_lo.min(x_hi), x_lo.max(x_hi));
+    if va.len() < 4 {
+        (va, vb) = collect_overlap(f64::NEG_INFINITY, f64::INFINITY);
+    }
+    if va.len() < 4 {
+        return None;
+    }
+
+    let da: Vec<f64> = va.windows(2).map(|w| w[1] - w[0]).collect();
+    let db: Vec<f64> = vb.windows(2).map(|w| w[1] - w[0]).collect();
+    if da.len() < 3 {
+        return None;
+    }
+    // Removing the mean derivative rejects constant linear-baseline tilt as well as offsets.
+    let mean_da = da.iter().sum::<f64>() / da.len() as f64;
+    let mean_db = db.iter().sum::<f64>() / db.len() as f64;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for (&dai, &dbi) in da.iter().zip(&db) {
+        let ac = dai - mean_da;
+        let bc = dbi - mean_db;
+        num += ac * bc;
+        den += bc * bc;
+    }
+    if den <= 1e-18 {
+        return None;
+    }
+    Some((num / den).clamp(0.0, 20.0))
+}
+
+pub fn compute_spectral_math(
+    a: &Spectrum,
+    b: &Spectrum,
+    op: SpectralOp,
+    k: f64,
+) -> Option<Spectrum> {
+    if op == SpectralOp::Average {
+        return average_spectra(&[a, b]);
+    }
+    if a.kind != b.kind || a.x.is_empty() || b.x.is_empty() || !k.is_finite() {
+        return None;
+    }
+    let a_lin = to_linear_space(a);
+    let b_lin = to_linear_space(b);
+    let b_lo = *b.x.first()?;
+    let b_hi = *b.x.last()?;
+
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for (&x, &ya) in a.x.iter().zip(&a_lin) {
+        if x >= b_lo && x <= b_hi {
+            if let Some(yb) = interpolate_y(&b.x, &b_lin, x) {
+                let val = match op {
+                    SpectralOp::Subtract => ya - k * yb,
+                    SpectralOp::Add => ya + k * yb,
+                    SpectralOp::Ratio => ya / (k * yb).max(1e-6),
+                    SpectralOp::Average => unreachable!(),
+                };
+                xs.push(x);
+                ys.push(val);
+            }
+        }
+    }
+    if xs.len() < 2 {
+        return None;
+    }
+
+    let raw_y_unit = if matches!(a.kind, SpectrumKind::Ftir | SpectrumKind::UvVis) {
+        YUnit::Absorbance
+    } else {
+        YUnit::Intensity
+    };
+    let name = match op {
+        SpectralOp::Subtract => format!("{} - {:.2}*{}", a.name, k, b.name),
+        SpectralOp::Add => format!("{} + {:.2}*{}", a.name, k, b.name),
+        SpectralOp::Ratio => format!("{} / ({:.2}*{})", a.name, k, b.name),
+        SpectralOp::Average => unreachable!(),
+    };
+    let op_desc = match op {
+        SpectralOp::Subtract => format!("{} - {:.4} * {}", a.name, k, b.name),
+        SpectralOp::Add => format!("{} + {:.4} * {}", a.name, k, b.name),
+        SpectralOp::Ratio => format!("{} / ({:.4} * {})", a.name, k, b.name),
+        SpectralOp::Average => unreachable!(),
+    };
+
+    Some(Spectrum {
+        name,
+        source_path: None,
+        kind: a.kind,
+        raw_y_unit,
+        x: xs,
+        y: ys,
+        visible: true,
+        color_idx: a.color_idx + 1,
+        metadata: vec![("Spectral Math".to_string(), op_desc)],
+    })
+}
+
+pub fn average_spectra(traces: &[&Spectrum]) -> Option<Spectrum> {
+    let first = *traces.first()?;
+    let compat: Vec<&Spectrum> = traces
+        .iter()
+        .copied()
+        .filter(|s| s.kind == first.kind && s.x.len() >= 2 && s.x.len() == s.y.len())
+        .collect();
+    if compat.is_empty() {
+        return None;
+    }
+
+    let lin_vecs: Vec<Vec<f64>> = compat.iter().map(|s| to_linear_space(s)).collect();
+    let mut lo = f64::NEG_INFINITY;
+    let mut hi = f64::INFINITY;
+    for s in &compat {
+        if let (Some(&s_lo), Some(&s_hi)) = (s.x.first(), s.x.last()) {
+            lo = lo.max(s_lo);
+            hi = hi.min(s_hi);
+        }
+    }
+    if lo >= hi {
+        return None;
+    }
+
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let count = compat.len() as f64;
+    for &x in &first.x {
+        if x >= lo && x <= hi {
+            let mut sum = 0.0;
+            let mut ok = true;
+            for (s, lin) in compat.iter().zip(&lin_vecs) {
+                if let Some(yv) = interpolate_y(&s.x, lin, x) {
+                    sum += yv;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let avg = sum / count;
+                let out_y = if first.raw_y_unit == YUnit::Transmittance {
+                    absorbance_to_transmittance(avg)
+                } else {
+                    avg
+                };
+                xs.push(x);
+                ys.push(out_y);
+            }
+        }
+    }
+    if xs.len() < 2 {
+        return None;
+    }
+
+    Some(Spectrum {
+        name: format!("Avg ({} traces)", compat.len()),
+        source_path: None,
+        kind: first.kind,
+        raw_y_unit: first.raw_y_unit,
+        x: xs,
+        y: ys,
+        visible: true,
+        color_idx: first.color_idx + 1,
+        metadata: vec![(
+            "Spectral Math".to_string(),
+            format!("Average of {} {} traces", compat.len(), first.kind.display_name()),
+        )],
+    })
 }

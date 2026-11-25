@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod data;
+mod deconv;
 mod digitize;
 mod export;
 mod io;
@@ -36,7 +37,8 @@ use crate::io::{
     LibraryEntry,
 };
 use crate::processing::{
-    detect_peaks, process_trace, BaselineMode, ProcessConfig, SmoothLevel, YAxisPreference,
+    detect_peaks, process_trace, BaselineMode, DerivOrder, NormMode, OpticsMode, ProcessConfig,
+    SmoothLevel, YAxisPreference,
 };
 
 /// Positional CLI arguments are usually file paths, but `spectra butane` is a
@@ -267,7 +269,9 @@ fn print_help() {
            spectra init-samples [--dir samples]\n  \
            spectra fetch <nist|nmr|nmr-search|import|list|pack> [ARGS...]\n  \
            spectra export <FILES...> -o <OUT.svg|png|pdf> [--style acs|rsc|everforest]\n                 \
-                   [--stacked] [--absorbance] [--baseline (AsLS) | --rubberband]\n                 \
+                   [--stacked] [--absorbance] [--baseline (AsLS) | --rubberband | --arpls]\n                 \
+                   [--atr diamond|znse|ge|si | --km] [--deriv 1|2]\n                 \
+                   [--norm minmax|snv|area] [--no-co2]\n                 \
                    [--smooth 0|5|9|15] [--title \"...\"] [--dpi 600]\n\n\
          SVG figures are rendered natively in Rust; PNG/PDF use the Python helper.\n",
         env!("CARGO_PKG_VERSION")
@@ -283,6 +287,11 @@ fn run_headless_export(
     absorbance: bool,
     baseline: bool,
     rubberband: bool,
+    arpls: bool,
+    optics: OpticsMode,
+    deriv: DerivOrder,
+    norm: NormMode,
+    atm_co2: bool,
     smooth: usize,
     title: String,
     dpi: u32,
@@ -304,13 +313,19 @@ fn run_headless_export(
         },
         baseline: if rubberband {
             BaselineMode::Rubberband
+        } else if arpls {
+            BaselineMode::Arpls
         } else if baseline {
             BaselineMode::Asls
         } else {
             BaselineMode::Off
         },
         smooth: smooth_lvl,
-        normalize: false,
+        norm,
+        optics,
+        deriv,
+        atm_co2,
+
     };
 
     let mut traces = Vec::new();
@@ -469,6 +484,11 @@ fn main() -> Result<()> {
         let mut absorbance = false;
         let mut baseline = false;
         let mut rubberband = false;
+        let mut arpls = false;
+        let mut optics = OpticsMode::Off;
+        let mut deriv = DerivOrder::Raw;
+        let mut norm = NormMode::Off;
+        let mut atm_co2 = false;
         let mut smooth: usize = 0;
         let mut title = String::new();
         let mut dpi: u32 = 600;
@@ -494,6 +514,46 @@ fn main() -> Result<()> {
                 "--absorbance" => absorbance = true,
                 "--baseline" => baseline = true,
                 "--rubberband" => rubberband = true,
+                "--arpls" => arpls = true,
+                "--km" => optics = OpticsMode::KubelkaMunk,
+                "--atr" => {
+                    i += 1;
+                    if i >= args.len() {
+                        bail!("Missing value after --atr");
+                    }
+                    optics = match args[i].to_ascii_lowercase().as_str() {
+                        "diamond" | "dia" => OpticsMode::AtrDiamond,
+                        "znse" => OpticsMode::AtrZnSe,
+                        "ge" | "germanium" => OpticsMode::AtrGe,
+                        "si" | "silicon" => OpticsMode::AtrSi,
+                        other => bail!("Unknown ATR crystal '{}' (diamond|znse|ge|si)", other),
+                    };
+                }
+                "--deriv" => {
+                    i += 1;
+                    if i >= args.len() {
+                        bail!("Missing value after --deriv");
+                    }
+                    deriv = match args[i].as_str() {
+                        "1" => DerivOrder::First,
+                        "2" => DerivOrder::Second,
+                        other => bail!("Unknown derivative order '{}' (1|2)", other),
+                    };
+                }
+                "--norm" => {
+                    i += 1;
+                    if i >= args.len() {
+                        bail!("Missing value after --norm");
+                    }
+                    norm = match args[i].to_ascii_lowercase().as_str() {
+                        "minmax" => NormMode::MinMax,
+                        "snv" | "vector" => NormMode::VectorSnv,
+                        "area" => NormMode::Area,
+                        "off" | "none" => NormMode::Off,
+                        other => bail!("Unknown normalization '{}' (minmax|snv|area)", other),
+                    };
+                }
+                "--no-co2" => atm_co2 = true,
                 "--smooth" => {
                     i += 1;
                     if i >= args.len() {
@@ -522,7 +582,8 @@ fn main() -> Result<()> {
         }
 
         return run_headless_export(
-            files, output, style, stacked, absorbance, baseline, rubberband, smooth, title, dpi,
+            files, output, style, stacked, absorbance, baseline, rubberband, arpls, optics,
+            deriv, norm, atm_co2, smooth, title, dpi,
         );
     }
 
@@ -572,6 +633,11 @@ mod tests {
         rubberband_baseline, savitzky_golay, tacticity_stats, transmittance_to_absorbance,
         TaucMode,
     };
+    use crate::processing::{
+        advanced_atr_correction, arpls_baseline, compute_spectral_math, kubelka_munk_transform,
+        optimal_subtraction_factor, NormMode, SpectralOp,
+    };
+    use crate::deconv::{deconvolve_window, DeconvConfig, PeakShape};
 
     #[test]
     fn test_csv_eu_decimal_and_headers() {
@@ -1085,8 +1151,8 @@ mod tests {
     }
 
     #[test]
-    fn test_version_is_0_6() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
+    fn test_version_is_0_7() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.7.0");
     }
 
     #[test]
@@ -1105,6 +1171,8 @@ mod tests {
         assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Rubberband);
         app.handle_key(key_b);
         assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Asls);
+        app.handle_key(key_b);
+        assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Arpls);
         app.handle_key(key_b);
         assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Off);
 
@@ -1773,6 +1841,405 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp_ftir);
         let _ = std::fs::remove_file(&tmp_uv);
+    }
+
+    fn test_spectrum(
+        name: &str,
+        kind: SpectrumKind,
+        raw_y_unit: YUnit,
+        x: Vec<f64>,
+        y: Vec<f64>,
+    ) -> Spectrum {
+        Spectrum {
+            name: name.to_string(),
+            source_path: None,
+            kind,
+            raw_y_unit,
+            x,
+            y,
+            visible: true,
+            color_idx: 0,
+            metadata: Vec::new(),
+        }
+    }
+
+    fn lorentz(x: f64, center: f64, height: f64, fwhm: f64) -> f64 {
+        let z = 2.0 * (x - center) / fwhm.max(1e-9);
+        height / (1.0 + z * z)
+    }
+
+    #[test]
+    fn test_deconv_recovers_overlapping_voigt_peaks() {
+        let n = 420usize;
+        let x_lo = 1660.0;
+        let x_hi = 1775.0;
+        let xs: Vec<f64> = (0..n)
+            .map(|i| x_lo + (x_hi - x_lo) * i as f64 / (n - 1) as f64)
+            .collect();
+        let specs = [(1703.0, 0.62, 9.0), (1717.0, 0.30, 11.0), (1732.0, 0.47, 8.5)];
+        let ys: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let mut v = 0.035 + 0.00006 * (x - 1700.0);
+                for (c, h, w) in specs {
+                    v += lorentz(x, c, h, w);
+                }
+                // deterministic pseudo-noise, no RNG dependency
+                let noise = 0.0006 * (((i * 1103515245 + 12345) % 1000) as f64 / 500.0 - 1.0);
+                v + noise
+            })
+            .collect();
+
+        let cfg = DeconvConfig {
+            shape: PeakShape::PseudoVoigt,
+            max_peaks: 3,
+            fit_baseline: true,
+            manual_centers: Vec::new(),
+            max_iter: 150,
+        };
+        let res = deconvolve_window(
+            SpectrumKind::Ftir,
+            &xs,
+            &ys,
+            YUnit::Absorbance,
+            x_lo,
+            x_hi,
+            &cfg,
+            SolventId::Cdcl3,
+        )
+        .expect("deconvolution failed");
+
+        assert!(res.r_squared > 0.995, "R² too low: {:.6}", res.r_squared);
+        assert_eq!(res.peaks.len(), 3, "expected 3 peaks, got {}", res.peaks.len());
+        for target in [1703.0, 1717.0, 1732.0] {
+            assert!(
+                res.peaks.iter().any(|p| (p.center - target).abs() <= 1.5),
+                "peak at {} not recovered; fitted centers: {:?}",
+                target,
+                res.peaks.iter().map(|p| p.center).collect::<Vec<_>>()
+            );
+        }
+        let pct: f64 = res.peaks.iter().map(|p| p.area_pct).sum();
+        assert!((pct - 100.0).abs() < 0.1, "area percentages sum to {:.3}", pct);
+    }
+
+    #[test]
+    fn test_deconv_nmr_tacticity_lorentzian() {
+        let n = 640usize;
+        let x_lo = 0.65;
+        let x_hi = 1.40;
+        let xs: Vec<f64> = (0..n)
+            .map(|i| x_lo + (x_hi - x_lo) * i as f64 / (n - 1) as f64)
+            .collect();
+        let specs = [(1.21, 0.55, 0.030), (1.02, 0.55, 0.028), (0.85, 0.55, 0.032)];
+        let ys: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let mut v = 0.002;
+                for (c, h, w) in specs {
+                    v += lorentz(x, c, h, w);
+                }
+                v + 0.0004 * (((i * 2654435761 + 7) % 997) as f64 / 498.0 - 1.0)
+            })
+            .collect();
+
+        let cfg = DeconvConfig {
+            shape: PeakShape::Lorentzian,
+            max_peaks: 3,
+            fit_baseline: true,
+            manual_centers: Vec::new(),
+            max_iter: 150,
+        };
+        let res = deconvolve_window(
+            SpectrumKind::Hnmr,
+            &xs,
+            &ys,
+            YUnit::Intensity,
+            x_lo,
+            x_hi,
+            &cfg,
+            SolventId::Cdcl3,
+        )
+        .expect("NMR deconvolution failed");
+
+        assert!(res.r_squared > 0.995, "NMR R² too low: {:.6}", res.r_squared);
+        assert_eq!(res.peaks.len(), 3, "expected 3 triads, got {}", res.peaks.len());
+        for target in [1.21, 1.02, 0.85] {
+            assert!(
+                res.peaks.iter().any(|p| (p.center - target).abs() <= 0.01),
+                "triad at {} ppm not recovered; got {:?}",
+                target,
+                res.peaks.iter().map(|p| p.center).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_arpls_noisy_baseline_recovery() {
+        let n = 900usize;
+        let xs: Vec<f64> = (0..n)
+            .map(|i| 400.0 + (4000.0 - 400.0) * i as f64 / (n - 1) as f64)
+            .collect();
+        let truth_baseline = |x: f64| 0.06 + 0.20 * ((x - 2200.0) / 1800.0).powi(2);
+        let ys: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let peak1 = lorentz(x, 1728.0, 0.65, 26.0);
+                let peak2 = lorentz(x, 2940.0, 0.42, 45.0);
+                let noise = 0.004 * (((i * 1103515245 + 12345) % 10000) as f64 / 5000.0 - 1.0);
+                truth_baseline(x) + peak1 + peak2 + noise
+            })
+            .collect();
+
+        let corrected = arpls_baseline(&ys, 1e6, 1e-3, 40);
+        // Off-peak residual must be essentially flat and near zero.
+        for (i, &x) in xs.iter().enumerate() {
+            let off_peak = (x < 1600.0) || (x > 3200.0);
+            if off_peak {
+                assert!(
+                    corrected[i].abs() < 0.04,
+                    "off-peak residual {:.4} at {:.0} cm⁻¹ exceeds 0.04",
+                    corrected[i],
+                    x
+                );
+            }
+        }
+        let max_near = |center: f64| {
+            let i0 = xs.partition_point(|&v| v < center - 20.0);
+            let i1 = xs.partition_point(|&v| v <= center + 20.0);
+            corrected[i0..i1.max(i0 + 1)]
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max)
+        };
+        assert!(
+            max_near(1728.0) > 0.85 * 0.65,
+            "carbonyl peak lost: {:.4}",
+            max_near(1728.0)
+        );
+        assert!(
+            max_near(2940.0) > 0.85 * 0.42,
+            "C-H peak lost: {:.4}",
+            max_near(2940.0)
+        );
+    }
+
+    #[test]
+    fn test_advanced_atr_kk_recovers_dispersion_shift() {
+        #[derive(Clone, Copy)]
+        struct C {
+            re: f64,
+            im: f64,
+        }
+        impl C {
+            fn new(re: f64, im: f64) -> Self {
+                Self { re, im }
+            }
+            fn add(self, o: Self) -> Self {
+                Self::new(self.re + o.re, self.im + o.im)
+            }
+            fn sub(self, o: Self) -> Self {
+                Self::new(self.re - o.re, self.im - o.im)
+            }
+            fn mul(self, o: Self) -> Self {
+                Self::new(
+                    self.re * o.re - self.im * o.im,
+                    self.re * o.im + self.im * o.re,
+                )
+            }
+            fn div(self, o: Self) -> Self {
+                let den = (o.re * o.re + o.im * o.im).max(1e-30);
+                Self::new(
+                    (self.re * o.re + self.im * o.im) / den,
+                    (self.im * o.re - self.re * o.im) / den,
+                )
+            }
+            fn norm_sq(self) -> f64 {
+                self.re * self.re + self.im * self.im
+            }
+            fn sqrt(self) -> Self {
+                let r = self.re.hypot(self.im);
+                let re = ((r + self.re) * 0.5).max(0.0).sqrt();
+                let im = ((r - self.re) * 0.5).max(0.0).sqrt() * if self.im < 0.0 { -1.0 } else { 1.0 };
+                Self::new(re, im)
+            }
+        }
+        fn fresnel_abs(n1: f64, n2r: f64, k: f64, s: f64, c: f64) -> f64 {
+            let n2 = C::new(n2r, k.max(0.0));
+            let ratio = C::new(n1 * s, 0.0).div(n2);
+            let one_minus = C::new(1.0, 0.0).sub(ratio.mul(ratio));
+            let mut ct = one_minus.sqrt();
+            if n2.mul(ct).im < 0.0 {
+                ct = C::new(-ct.re, -ct.im);
+            }
+            let n1c = C::new(n1 * c, 0.0);
+            let n2ct = n2.mul(ct);
+            let rs = n1c.sub(n2ct).div(n1c.add(n2ct));
+            let n2c = n2.mul(C::new(c, 0.0));
+            let n1ct = ct.mul(C::new(n1, 0.0));
+            let rp = n2c.sub(n1ct).div(n2c.add(n1ct));
+            let r = (0.5 * (rs.norm_sq() + rp.norm_sq())).clamp(1e-6, 1.0);
+            -r.log10()
+        }
+
+        let n = 1800usize;
+        let wn: Vec<f64> = (0..n)
+            .map(|i| 400.0 + (4000.0 - 400.0) * i as f64 / (n - 1) as f64)
+            .collect();
+        let th = 45.0_f64.to_radians();
+        let (s, c) = (th.sin(), th.cos());
+        let center = 1728.0_f64;
+        let k0 = 0.28_f64;
+        let fwhm = 24.0_f64;
+
+        // Exact Lorentz oscillator anomalous dispersion: n(ν) = n_inf - k0 * z / (1 + z^2)
+        let raw: Vec<f64> = wn
+            .iter()
+            .map(|&x| {
+                let z = 2.0 * (x - center) / fwhm;
+                let denom = 1.0 + z * z;
+                let k = k0 / denom;
+                let n2_real = 1.50 - k0 * z / denom;
+                fresnel_abs(2.4, n2_real, k, s, c)
+            })
+            .collect();
+
+        let (raw_idx, _) = raw
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .expect("raw ATR empty");
+        let raw_peak = wn[raw_idx];
+        assert!(
+            raw_peak < center - 2.0,
+            "Expected synthetic Fresnel ATR peak to red-shift below {:.1} cm⁻¹, got {:.1}",
+            center - 2.0,
+            raw_peak
+        );
+
+        let corrected = advanced_atr_correction(&wn, &raw, 2.4, 1.50, 45.0);
+        let (idx, _) = corrected
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .expect("ATR correction returned empty");
+        let recovered = wn[idx];
+        assert!(
+            (recovered - center).abs() <= 4.0,
+            "ATR-corrected peak at {:.1} cm⁻¹ (raw was {:.1}), expected {:.1} ± 4",
+            recovered,
+            raw_peak,
+            center
+        );
+    }
+
+    #[test]
+    fn test_kubelka_munk_and_snv_normalization() {
+        let km = kubelka_munk_transform(&[50.0]);
+        assert!(
+            (km[0] - 0.25).abs() < 1e-12,
+            "KM F(50%R) should be 0.25, got {:.12}",
+            km[0]
+        );
+
+        let n = 300usize;
+        let xs: Vec<f64> = (0..n)
+            .map(|i| 190.0 + (900.0 - 190.0) * i as f64 / (n - 1) as f64)
+            .collect();
+        let ys: Vec<f64> = xs
+            .iter()
+            .map(|&x| 0.04 + 0.8 * (-((x - 420.0) / 55.0).powi(2)).exp())
+            .collect();
+        let spec = test_spectrum(
+            "SNV test",
+            SpectrumKind::UvVis,
+            YUnit::Absorbance,
+            xs,
+            ys,
+        );
+        let (_, yn, yu) = process_trace(
+            &spec,
+            ProcessConfig {
+                norm: NormMode::VectorSnv,
+                ..ProcessConfig::default()
+            },
+        );
+        assert_eq!(yu, YUnit::Absorbance);
+        let mean = yn.iter().sum::<f64>() / yn.len() as f64;
+        let var = yn.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / yn.len() as f64;
+        assert!(mean.abs() < 1e-9, "SNV mean = {:.3e}", mean);
+        assert!((var.sqrt() - 1.0).abs() < 1e-9, "SNV std = {:.6}", var.sqrt());
+    }
+
+    #[test]
+    fn test_spectral_subtraction_optimal_k_derivative() {
+        let n = 600usize;
+        let xs: Vec<f64> = (0..n)
+            .map(|i| 170.0 + (700.0 - 170.0) * i as f64 / (n - 1) as f64)
+            .collect();
+        let b_y: Vec<f64> = xs
+            .iter()
+            .map(|&x| 0.05 + 0.7 * (-((x - 300.0) / 30.0).powi(2)).exp())
+            .collect();
+        let additive: Vec<f64> = xs
+            .iter()
+            .map(|&x| 0.22 * (-((x - 470.0) / 20.0).powi(2)).exp())
+            .collect();
+        let a_y: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                0.72 * b_y[i] + additive[i] + 0.00025 * (x - 435.0)
+            })
+            .collect();
+        let a = test_spectrum(
+            "Sample A",
+            SpectrumKind::UvVis,
+            YUnit::Absorbance,
+            xs.clone(),
+            a_y,
+        );
+        let b = test_spectrum(
+            "Component B",
+            SpectrumKind::UvVis,
+            YUnit::Absorbance,
+            xs.clone(),
+            b_y,
+        );
+
+        let k = optimal_subtraction_factor(&a, &b, 170.0, 700.0).expect("no optimal k");
+        assert!(
+            (k - 0.72).abs() <= 0.02,
+            "optimal k* should be ~0.72, got {:.4}",
+            k
+        );
+
+        let diff = compute_spectral_math(&a, &b, SpectralOp::Subtract, k).expect("spectral math");
+        assert_eq!(diff.kind, SpectrumKind::UvVis);
+        assert_eq!(diff.raw_y_unit, YUnit::Absorbance);
+        let i_peak = diff
+            .x
+            .iter()
+            .position(|&x| x >= 470.0)
+            .expect("isolation peak missing");
+        assert!(
+            diff.y[i_peak] > 0.15,
+            "subtraction did not isolate additive peak (y = {:.4})",
+            diff.y[i_peak]
+        );
+        let i_flat = diff
+            .x
+            .iter()
+            .position(|&x| x >= 250.0)
+            .expect("flat region missing");
+        assert!(
+            diff.y[i_flat].abs() < 0.05,
+            "baseline not cancelled off-peak (y = {:.4})",
+            diff.y[i_flat]
+        );
     }
 }
 

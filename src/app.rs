@@ -14,16 +14,22 @@ use crate::data::{
     match_uvvis, synthesize_polymer_reference, uvvis_color_info, DemoPreset, SolventId, Spectrum,
     SpectrumKind, YUnit, CNMR_DB, FTIR_DB, HNMR_DB, POLYMERS_DB, SOLVENT_IMPURITIES, UVVIS_DB,
 };
+use crate::deconv::{
+    deconvolve_window, format_deconv_csv, format_deconv_markdown, DeconvConfig, DeconvResult,
+    PeakShape,
+};
 use crate::export::{
     open_exported_file, run_export, ExportFormat, ExportPayload, ExportPeak, ExportPeakMode,
     ExportStyle, ExportTrace,
 };
 use crate::io::{expand_tilde, load_spectrum_file, parse_pasted_paths, search_library};
 use crate::processing::{
-    auto_ftir_conversion, beer_lambert_conc, compute_tauc_band_gap, detect_peaks,
-    ftir_conversion_percent, interpolate_y, nmr_mn_dpn, process_trace, pu_hydrogen_bond_index,
-    pvdf_beta_fraction, tacticity_stats, BaselineMode, ConversionResult, HydrogenBondIndex, Peak,
-    ProcessConfig, SmoothLevel, TacticityResult, TaucMode, TaucResult, YAxisPreference,
+    auto_ftir_conversion, average_spectra, beer_lambert_conc, compute_spectral_math,
+    compute_tauc_band_gap_with_optics, detect_peaks, ftir_conversion_percent, interpolate_y,
+    nmr_mn_dpn, optimal_subtraction_factor, process_trace, pu_hydrogen_bond_index,
+    pvdf_beta_fraction, tacticity_stats, BaselineMode, ConversionResult, HydrogenBondIndex,
+    OpticsMode, Peak, ProcessConfig, SmoothLevel, SpectralOp,
+    TacticityResult, TaucMode, TaucResult, YAxisPreference,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +295,36 @@ pub struct BusyState {
     pub started: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct DeconvOverlay {
+    pub trace_idx: usize,
+    pub result: DeconvResult,
+    pub show_components: bool,
+    pub show_residual: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeconvModalState {
+    pub field_idx: usize,
+    pub shape: PeakShape,
+    pub max_peaks: usize,
+    pub fit_baseline: bool,
+    pub x_lo: String,
+    pub x_hi: String,
+    pub result: Option<DeconvResult>,
+    pub feedback: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpectralMathState {
+    pub field_idx: usize,
+    pub op: SpectralOp,
+    pub trace_a: usize,
+    pub trace_b: usize,
+    pub factor_k: f64,
+    pub feedback: Option<String>,
+}
+
 pub enum TaskOutcome {
     Loaded {
         specs: Vec<Spectrum>,
@@ -298,6 +334,7 @@ pub enum TaskOutcome {
     LibraryMatch(Vec<crate::matcher::LibraryMatch>),
     Export(std::result::Result<PathBuf, String>),
     LibraryDownload(std::result::Result<String, String>),
+    Deconv(std::result::Result<DeconvResult, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +351,8 @@ pub enum Modal {
     CandidatePicker(CandidatePickerState),
     Busy(BusyState),
     LibrarySetup(LibrarySetupState),
+    Deconv(DeconvModalState),
+    SpectralMath(SpectralMathState),
 }
 
 #[derive(Debug, Clone)]
@@ -489,6 +528,10 @@ pub struct App {
     pub pending: Option<Receiver<TaskOutcome>>,
     /// Export settings preserved while the Python figure is generated.
     pub pending_export: Option<ExportModalState>,
+    /// Active multi-peak deconvolution overlay on the spectrum plot.
+    pub deconv_overlay: Option<DeconvOverlay>,
+    /// Deconvolution modal state preserved while LM fitting runs in background.
+    pub pending_deconv: Option<DeconvModalState>,
 
     // Cached layout geometry for accurate mouse interactions
     pub topbar_rect: Rect,
@@ -605,6 +648,8 @@ impl App {
             help_scroll: 0,
             pending: None,
             pending_export: None,
+            deconv_overlay: None,
+            pending_deconv: None,
             topbar_rect: Rect::default(),
             tab_hitboxes: Vec::new(),
             plot_rect: Rect::default(),
@@ -772,6 +817,7 @@ impl App {
         self.traces = generate_demo_preset(preset);
         self.active_trace = 0;
         self.pinned_peaks.clear();
+        self.deconv_overlay = None;
         self.tab = ActiveTab::from_kind(preset.kind());
         self.recompute_processing();
         self.reset_zoom();
@@ -855,6 +901,7 @@ impl App {
                 let new_kind = other[0].kind;
                 self.traces.clear();
                 self.pinned_peaks.clear();
+                self.deconv_overlay = None;
                 for (k, mut spec) in other
                     .into_iter()
                     .filter(|s| s.kind == new_kind)
@@ -916,6 +963,7 @@ impl App {
             self.traces = replacement;
             self.active_trace = 0;
             self.pinned_peaks.clear();
+            self.deconv_overlay = None;
             if skipped > 0 {
                 notes.push(format!(
                     "skipped {} trace(s) of a different spectroscopy mode",
@@ -1025,6 +1073,43 @@ impl App {
                             feedback: Some(format!("Error: {}", e)),
                         });
                         self.status_msg = format!("Library download failed: {}", e);
+                    }
+                }
+            }
+            TaskOutcome::Deconv(result) => {
+                let mut st = self.pending_deconv.take().unwrap_or(DeconvModalState {
+                    field_idx: 0,
+                    shape: PeakShape::PseudoVoigt,
+                    max_peaks: 3,
+                    fit_baseline: true,
+                    x_lo: format!("{:.2}", self.view_x_min),
+                    x_hi: format!("{:.2}", self.view_x_max),
+                    result: None,
+                    feedback: None,
+                });
+                match result {
+                    Ok(res) => {
+                        let summary = format!(
+                            "Fitted {} peak(s) | R² = {:.5} | RMSE = {:.4}",
+                            res.peaks.len(),
+                            res.r_squared,
+                            res.rmse
+                        );
+                        st.result = Some(res.clone());
+                        st.feedback = Some(summary.clone());
+                        self.deconv_overlay = Some(DeconvOverlay {
+                            trace_idx: self.active_trace,
+                            result: res,
+                            show_components: true,
+                            show_residual: false,
+                        });
+                        self.status_msg = format!("Deconvolution: {}", summary);
+                        self.modal = Modal::Deconv(st);
+                    }
+                    Err(e) => {
+                        st.feedback = Some(format!("Fit error: {}", e));
+                        self.status_msg = format!("Deconvolution failed: {}", e);
+                        self.modal = Modal::Deconv(st);
                     }
                 }
             }
@@ -1143,6 +1228,7 @@ impl App {
                 }
                 return;
             }
+            Modal::Deconv(_) | Modal::SpectralMath(_) => return,
             Modal::FilePicker(_) => {
                 self.paste_into_file_picker(pasted);
                 return;
@@ -1603,7 +1689,7 @@ impl App {
             y_pref: YAxisPreference::Swapped,
             baseline: BaselineMode::Asls,
             smooth: SmoothLevel::Off,
-            normalize: false,
+            ..ProcessConfig::default()
         };
         let (x, y, _) = process_trace(spec, cfg);
         let i0 = x.partition_point(|&v| v < center - half);
@@ -1659,7 +1745,7 @@ impl App {
         } else {
             TaucMode::Indirect
         };
-        compute_tauc_band_gap(spec, mode)
+        compute_tauc_band_gap_with_optics(spec, mode, self.process_cfg.optics)
     }
 
     /// Absorbance for Beer-Lambert: manual input, else the processed value at
@@ -1907,6 +1993,7 @@ impl App {
         let idx = self.active_trace.min(self.traces.len() - 1);
         let removed = self.traces.remove(idx);
         self.active_trace = idx.min(self.traces.len().saturating_sub(1));
+        self.deconv_overlay = None;
 
         if self.traces.is_empty() {
             self.pinned_peaks.clear();
@@ -1937,6 +2024,33 @@ impl App {
             KeyCode::Char('0') | KeyCode::Char('r') => {
                 self.reset_zoom();
                 self.status_msg = "Reset zoom to full spectrum".into();
+            }
+            KeyCode::Char('A') | KeyCode::Char('a') if shift || key.code == KeyCode::Char('A') => {
+                match self.current_kind() {
+                    SpectrumKind::Ftir => {
+                        self.process_cfg.optics = self.process_cfg.optics.next();
+                        self.recompute_processing();
+                        self.status_msg = format!(
+                            "Optical Physics Correction: {}",
+                            self.process_cfg.optics.label()
+                        );
+                    }
+                    SpectrumKind::UvVis => {
+                        self.process_cfg.optics = if self.process_cfg.optics == OpticsMode::KubelkaMunk {
+                            OpticsMode::Off
+                        } else {
+                            OpticsMode::KubelkaMunk
+                        };
+                        self.recompute_processing();
+                        self.status_msg = format!(
+                            "Optical Physics Correction: {}",
+                            self.process_cfg.optics.label()
+                        );
+                    }
+                    SpectrumKind::Hnmr | SpectrumKind::Cnmr => {
+                        self.status_msg = "ATR / Kubelka-Munk optics apply to FTIR and UV-Vis".into();
+                    }
+                }
             }
             KeyCode::Char('a') => {
                 if matches!(
@@ -1978,12 +2092,14 @@ impl App {
                 self.status_msg = format!("Savitzky-Golay Smoothing: {}", self.process_cfg.smooth.label());
             }
             KeyCode::Char('w') => {
-                self.process_cfg.normalize = !self.process_cfg.normalize;
+                self.process_cfg.norm = self.process_cfg.norm.next();
                 self.recompute_processing();
-                self.status_msg = format!(
-                    "Min-Max Normalization: {}",
-                    if self.process_cfg.normalize { "ON" } else { "OFF" }
-                );
+                self.status_msg = format!("Normalization: {}", self.process_cfg.norm.label());
+            }
+            KeyCode::Char('t') => {
+                self.process_cfg.deriv = self.process_cfg.deriv.next();
+                self.recompute_processing();
+                self.status_msg = format!("Derivative View: {}", self.process_cfg.deriv.label());
             }
             KeyCode::Char('s') => {
                 self.stacked = !self.stacked;
@@ -1999,6 +2115,35 @@ impl App {
                         "Braille (Classic)"
                     }
                 );
+            }
+            KeyCode::Char('P') | KeyCode::Char('p') if shift || key.code == KeyCode::Char('P') => {
+                if self.traces.get(self.active_trace).is_some() {
+                    let prev_res = self
+                        .deconv_overlay
+                        .as_ref()
+                        .filter(|ov| ov.trace_idx == self.active_trace)
+                        .map(|ov| ov.result.clone());
+                    let shape = prev_res
+                        .as_ref()
+                        .map(|r| r.shape)
+                        .unwrap_or(PeakShape::PseudoVoigt);
+                    let max_peaks = prev_res
+                        .as_ref()
+                        .map(|r| r.peaks.len().clamp(1, 8))
+                        .unwrap_or(3);
+                    self.modal = Modal::Deconv(DeconvModalState {
+                        field_idx: 0,
+                        shape,
+                        max_peaks,
+                        fit_baseline: true,
+                        x_lo: format!("{:.2}", self.view_x_min),
+                        x_hi: format!("{:.2}", self.view_x_max),
+                        result: prev_res,
+                        feedback: None,
+                    });
+                } else {
+                    self.status_msg = "Load a spectrum before opening Peak Deconvolution Studio".into();
+                }
             }
             KeyCode::Char('p') => {
                 self.show_peaks = !self.show_peaks;
@@ -2029,7 +2174,42 @@ impl App {
                 }
             }
             KeyCode::Char('x') => self.toggle_pin_at_cursor(),
+            KeyCode::Char('C') | KeyCode::Char('c') if shift || key.code == KeyCode::Char('C') => {
+                if self.current_kind() == SpectrumKind::Ftir {
+                    self.process_cfg.atm_co2 = !self.process_cfg.atm_co2;
+                    self.recompute_processing();
+                    self.status_msg = format!(
+                        "Atmospheric CO₂ Suppression (2280–2410 cm⁻¹): {}",
+                        if self.process_cfg.atm_co2 { "ON" } else { "OFF" }
+                    );
+                } else {
+                    self.status_msg = "CO₂ suppression applies to FTIR spectra".into();
+                }
+            }
             KeyCode::Char('c') => self.copy_cursor_summary(),
+            KeyCode::Char('o') => {
+                if self.traces.len() >= 2 {
+                    let ta = self.active_trace.min(self.traces.len() - 1);
+                    let tb = (ta + 1) % self.traces.len();
+                    let k_opt = optimal_subtraction_factor(
+                        &self.traces[ta],
+                        &self.traces[tb],
+                        self.view_x_min,
+                        self.view_x_max,
+                    )
+                    .unwrap_or(1.0);
+                    self.modal = Modal::SpectralMath(SpectralMathState {
+                        field_idx: 0,
+                        op: SpectralOp::Subtract,
+                        trace_a: ta,
+                        trace_b: tb,
+                        factor_k: k_opt,
+                        feedback: None,
+                    });
+                } else {
+                    self.status_msg = "Spectral Math requires at least 2 traces in workspace".into();
+                }
+            }
             KeyCode::Char('S') => {
                 self.nmr_solvent = self.nmr_solvent.next();
                 self.solvents_tab.solvent = self.nmr_solvent;
@@ -3027,6 +3207,216 @@ impl App {
                         st.feedback = None;
                         self.modal = Modal::LibrarySetup(st);
                     }
+                }
+            }
+            Modal::Deconv(mut st) => {
+                let editing = (3..=4).contains(&st.field_idx);
+                match key.code {
+                    KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        st.field_idx = (st.field_idx + 4) % 5;
+                        self.modal = Modal::Deconv(st);
+                    }
+                    KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                        st.field_idx = (st.field_idx + 1) % 5;
+                        self.modal = Modal::Deconv(st);
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if st.field_idx < 3 => {
+                        let forward = matches!(key.code, KeyCode::Right | KeyCode::Char(' '));
+                        match st.field_idx {
+                            0 => {
+                                st.shape = if forward { st.shape.next() } else { st.shape.prev() };
+                            }
+                            1 => {
+                                st.max_peaks = if forward {
+                                    (st.max_peaks + 1).min(8)
+                                } else {
+                                    st.max_peaks.saturating_sub(1).max(1)
+                                };
+                            }
+                            2 => st.fit_baseline = !st.fit_baseline,
+                            _ => {}
+                        }
+                        self.modal = Modal::Deconv(st);
+                    }
+                    KeyCode::Char(c) if editing && (c.is_ascii_digit() || c == '.' || c == '-') => {
+                        let buf = if st.field_idx == 3 { &mut st.x_lo } else { &mut st.x_hi };
+                        if c != '-' || buf.is_empty() {
+                            buf.push(c);
+                        }
+                        self.modal = Modal::Deconv(st);
+                    }
+                    KeyCode::Backspace if editing => {
+                        if st.field_idx == 3 {
+                            st.x_lo.pop();
+                        } else {
+                            st.x_hi.pop();
+                        }
+                        self.modal = Modal::Deconv(st);
+                    }
+                    KeyCode::Enter => {
+                        let Some(spec) = self.traces.get(self.active_trace).cloned() else {
+                            st.feedback = Some("No active spectrum to fit".into());
+                            self.modal = Modal::Deconv(st);
+                            return;
+                        };
+                        let Some(proc_t) = self.processed.get(self.active_trace).cloned() else {
+                            st.feedback = Some("No processed data available".into());
+                            self.modal = Modal::Deconv(st);
+                            return;
+                        };
+                        let (Ok(x_lo), Ok(x_hi)) = (st.x_lo.trim().parse::<f64>(), st.x_hi.trim().parse::<f64>()) else {
+                            st.feedback = Some("Enter valid numeric X window bounds".into());
+                            self.modal = Modal::Deconv(st);
+                            return;
+                        };
+                        let cfg = DeconvConfig {
+                            shape: st.shape,
+                            max_peaks: st.max_peaks.clamp(1, 8),
+                            fit_baseline: st.fit_baseline,
+                            manual_centers: Vec::new(),
+                            max_iter: 150,
+                        };
+                        let solvent = self.nmr_solvent;
+                        self.pending_deconv = Some(st);
+                        self.start_task("Running Levenberg-Marquardt peak deconvolution…", move || {
+                            let result = deconvolve_window(
+                                spec.kind,
+                                &proc_t.x,
+                                &proc_t.y,
+                                proc_t.y_unit,
+                                x_lo,
+                                x_hi,
+                                &cfg,
+                                solvent,
+                            )
+                            .map_err(|e| e.to_string());
+                            TaskOutcome::Deconv(result)
+                        });
+                    }
+                    KeyCode::Char('c') if st.field_idx < 3 => {
+                        if let Some(res) = &st.result {
+                            match copy_text(&format_deconv_markdown(res)) {
+                                Ok(_) => st.feedback = Some("Copied fit report to clipboard".into()),
+                                Err(e) => st.feedback = Some(format!("Clipboard error: {}", e)),
+                            }
+                        }
+                        self.modal = Modal::Deconv(st);
+                    }
+                    KeyCode::Char('s') if st.field_idx < 3 => {
+                        if let Some(res) = &st.result {
+                            let saved = (|| -> std::io::Result<PathBuf> {
+                                let dir = PathBuf::from("exports");
+                                fs::create_dir_all(&dir)?;
+                                let stamp = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let path = dir.join(format!("deconv_fit_{}.csv", stamp));
+                                fs::write(&path, format_deconv_csv(res))?;
+                                Ok(path)
+                            })();
+                            st.feedback = Some(match saved {
+                                Ok(path) => format!("Saved CSV: {}", path.display()),
+                                Err(e) => format!("CSV save failed: {}", e),
+                            });
+                        }
+                        self.modal = Modal::Deconv(st);
+                    }
+                    KeyCode::Char('r') if st.field_idx < 3 => {
+                        match &mut self.deconv_overlay {
+                            Some(ov) => {
+                                ov.show_residual = !ov.show_residual;
+                                st.feedback = Some(format!(
+                                    "Residual inset {}",
+                                    if ov.show_residual { "shown" } else { "hidden" }
+                                ));
+                            }
+                            None => st.feedback = Some("Fit the window first to show a residual".into()),
+                        }
+                        self.modal = Modal::Deconv(st);
+                    }
+                    KeyCode::Char('x') if st.field_idx < 3 => {
+                        self.deconv_overlay = None;
+                        st.result = None;
+                        st.feedback = Some("Deconvolution overlay cleared".into());
+                        self.modal = Modal::Deconv(st);
+                    }
+                    _ => self.modal = Modal::Deconv(st),
+                }
+            }
+            Modal::SpectralMath(mut st) => {
+                match key.code {
+                    KeyCode::Up | KeyCode::BackTab => {
+                        st.field_idx = (st.field_idx + 3) % 4;
+                        self.modal = Modal::SpectralMath(st);
+                    }
+                    KeyCode::Down | KeyCode::Tab => {
+                        st.field_idx = (st.field_idx + 1) % 4;
+                        self.modal = Modal::SpectralMath(st);
+                    }
+                    KeyCode::Left | KeyCode::Right => {
+                        let forward = key.code == KeyCode::Right;
+                        match st.field_idx {
+                            0 => st.op = if forward { st.op.next() } else { st.op.prev() },
+                            1 if !self.traces.is_empty() => {
+                                let len = self.traces.len();
+                                st.trace_a = if forward {
+                                    (st.trace_a + 1) % len
+                                } else {
+                                    (st.trace_a + len - 1) % len
+                                };
+                            }
+                            2 if !self.traces.is_empty() => {
+                                let len = self.traces.len();
+                                st.trace_b = if forward {
+                                    (st.trace_b + 1) % len
+                                } else {
+                                    (st.trace_b + len - 1) % len
+                                };
+                            }
+                            3 => {
+                                let step = if key.modifiers.contains(KeyModifiers::SHIFT) { 0.01 } else { 0.05 };
+                                st.factor_k = (st.factor_k + if forward { step } else { -step }).clamp(0.0, 20.0);
+                            }
+                            _ => {}
+                        }
+                        self.modal = Modal::SpectralMath(st);
+                    }
+                    KeyCode::Char('k') => {
+                        if let (Some(a), Some(b)) = (self.traces.get(st.trace_a), self.traces.get(st.trace_b)) {
+                            if let Some(k) = optimal_subtraction_factor(a, b, self.view_x_min, self.view_x_max) {
+                                st.factor_k = k;
+                                st.feedback = Some(format!("Auto-optimal k* = {:.4}", k));
+                            } else {
+                                st.feedback = Some("Could not estimate k* in the selected overlap".into());
+                            }
+                        }
+                        self.modal = Modal::SpectralMath(st);
+                    }
+                    KeyCode::Enter => {
+                        let result = if st.op == SpectralOp::Average {
+                            let refs: Vec<&Spectrum> = self.traces.iter().filter(|t| t.visible).collect();
+                            average_spectra(&refs)
+                        } else {
+                            self.traces.get(st.trace_a).zip(self.traces.get(st.trace_b))
+                                .and_then(|(a, b)| compute_spectral_math(a, b, st.op, st.factor_k))
+                        };
+                        if let Some(mut spec) = result {
+                            spec.color_idx = self.traces.len();
+                            let name = spec.name.clone();
+                            self.traces.push(spec);
+                            self.active_trace = self.traces.len() - 1;
+                            self.deconv_overlay = None;
+                            self.recompute_processing();
+                            self.reset_zoom();
+                            self.modal = Modal::None;
+                            self.status_msg = format!("Spectral Math result added: {}", name);
+                        } else {
+                            st.feedback = Some("No compatible overlapping data for this operation".into());
+                            self.modal = Modal::SpectralMath(st);
+                        }
+                    }
+                    _ => self.modal = Modal::SpectralMath(st),
                 }
             }
             Modal::Busy(busy) => {

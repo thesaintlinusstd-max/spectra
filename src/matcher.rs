@@ -238,7 +238,7 @@ fn prepare_ftir(spec: &Spectrum, cfg: ProcessConfig) -> Option<(Vec<f64>, Vec<f6
         y_pref: YAxisPreference::Swapped,
         baseline: BaselineMode::Off,
         smooth: cfg.smooth,
-        normalize: false,
+        ..ProcessConfig::default()
     };
     let (xs, raw, _) = process_trace(spec, abs_cfg);
     if xs.len() < 2 {
@@ -258,7 +258,7 @@ fn prepare_uvvis(spec: &Spectrum, cfg: ProcessConfig) -> Option<(Vec<f64>, Vec<f
         y_pref: YAxisPreference::Native,
         baseline: BaselineMode::Off,
         smooth: cfg.smooth,
-        normalize: false,
+        ..ProcessConfig::default()
     };
     let (xs, raw, _) = process_trace(spec, abs_cfg);
     if xs.len() < 2 {
@@ -278,7 +278,7 @@ fn prepare_nmr(spec: &Spectrum, cfg: ProcessConfig, g: &[f64]) -> Option<(Vec<f6
         y_pref: YAxisPreference::Native,
         baseline: BaselineMode::Off,
         smooth: cfg.smooth,
-        normalize: false,
+        ..ProcessConfig::default()
     };
     let (xs, raw, _) = process_trace(spec, nmr_cfg);
     if xs.len() < 2 {
@@ -556,7 +556,7 @@ fn cached_library_entries(kind: SpectrumKind) -> Vec<CachedFingerprint> {
         y_pref: YAxisPreference::Native,
         baseline: BaselineMode::Off,
         smooth: SmoothLevel::Off,
-        normalize: false,
+        ..ProcessConfig::default()
     };
 
     let mut entries = Vec::with_capacity(paths.len());

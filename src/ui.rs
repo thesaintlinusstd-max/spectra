@@ -6,7 +6,9 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
-use crate::app::{ActiveTab, App, Modal, PolymerSubTab, MONOMER_PRESETS};
+use crate::app::{
+    ActiveTab, App, DeconvModalState, Modal, PolymerSubTab, SpectralMathState, MONOMER_PRESETS,
+};
 use crate::data::{
     match_cnmr, match_ftir_with_context, match_hnmr, match_polymers,
     match_solvent_impurities, match_uvvis, photon_energy_ev, spectral_zone_name,
@@ -476,6 +478,97 @@ fn draw_spectrum_canvas(frame: &mut Frame, app: &mut App, area: Rect) {
             // Plot spectrum traces
             for &(x1, y1, x2, y2, color) in &segments {
                 ctx.draw(&CanvasLine { x1, y1, x2, y2, color });
+            }
+
+            if let Some(ov) = app
+                .deconv_overlay
+                .as_ref()
+                .filter(|ov| ov.trace_idx == app.active_trace)
+            {
+                let display_y = |v: f64| {
+                    if y_unit == YUnit::Transmittance {
+                        crate::processing::absorbance_to_transmittance(v)
+                    } else {
+                        v
+                    }
+                };
+                if ov.show_components {
+                    for (ci, comp) in ov.result.components.iter().enumerate() {
+                        let color = trace_color(ci + 1);
+                        let mut prev: Option<(f64, f64)> = None;
+                        for i in 0..ov.result.x.len().min(comp.len()) {
+                            let x = ov.result.x[i];
+                            if x < x_lo || x > x_hi {
+                                prev = None;
+                                continue;
+                            }
+                            let u = u_from_x(x);
+                            let y = display_y(comp[i]) + active_stack_offset;
+                            if let Some((pu, py)) = prev {
+                                ctx.draw(&CanvasLine { x1: pu, y1: py, x2: u, y2: y, color });
+                            }
+                            prev = Some((u, y));
+                        }
+                    }
+                }
+                let mut prev: Option<(f64, f64)> = None;
+                for i in 0..ov.result.x.len().min(ov.result.y_fit.len()) {
+                    let x = ov.result.x[i];
+                    if x < x_lo || x > x_hi {
+                        prev = None;
+                        continue;
+                    }
+                    let u = u_from_x(x);
+                    let y = display_y(ov.result.y_fit[i]) + active_stack_offset;
+                    if let Some((pu, py)) = prev {
+                        ctx.draw(&CanvasLine {
+                            x1: pu,
+                            y1: py,
+                            x2: u,
+                            y2: y,
+                            color: ACCENT_YELLOW,
+                        });
+                    }
+                    prev = Some((u, y));
+                }
+
+                if ov.show_residual {
+                    let max_abs = ov
+                        .result
+                        .y_residual
+                        .iter()
+                        .fold(0.0_f64, |m, v| m.max(v.abs()))
+                        .max(1e-12);
+                    let base = plot_y_min + y_total_span * 0.16;
+                    let amp = y_total_span * 0.10;
+                    ctx.draw(&CanvasLine {
+                        x1: 0.0,
+                        y1: base,
+                        x2: 1.0,
+                        y2: base,
+                        color: TEXT_MUTED,
+                    });
+                    let mut prev: Option<(f64, f64)> = None;
+                    for i in 0..ov.result.x.len().min(ov.result.y_residual.len()) {
+                        let x = ov.result.x[i];
+                        if x < x_lo || x > x_hi {
+                            prev = None;
+                            continue;
+                        }
+                        let u = u_from_x(x);
+                        let y = base + amp * (ov.result.y_residual[i] / max_abs);
+                        if let Some((pu, py)) = prev {
+                            ctx.draw(&CanvasLine {
+                                x1: pu,
+                                y1: py,
+                                x2: u,
+                                y2: y,
+                                color: ACCENT_CORAL,
+                            });
+                        }
+                        prev = Some((u, y));
+                    }
+                }
             }
 
             // Active crosshair line
@@ -1573,21 +1666,36 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(app.status_msg.clone(), Style::default().fg(TEXT_PRIMARY)),
         Span::styled("   │ ", Style::default().fg(TEXT_MUTED)),
         Span::styled(
-            format!(
-                "Y:{}  View:{}  Base:{}  Smooth:{}  Norm:{}  Stack:{}",
-                y_status,
-                if app.hd_mode { "HD" } else { "Braille" },
-                app.process_cfg.baseline.label(),
-                app.process_cfg.smooth.label(),
-                if app.process_cfg.normalize { "ON" } else { "OFF" },
-                if app.stacked { "ON" } else { "OFF" },
-            ),
+            {
+                let mut flags = format!(
+                    "Y:{}  View:{}  Base:{}  Smooth:{}  Norm:{}",
+                    y_status,
+                    if app.hd_mode { "HD" } else { "Braille" },
+                    app.process_cfg.baseline.label(),
+                    app.process_cfg.smooth.label(),
+                    app.process_cfg.norm.label(),
+                );
+                if app.process_cfg.optics != crate::processing::OpticsMode::Off {
+                    flags.push_str(&format!("  Opt:{}", app.process_cfg.optics.label()));
+                }
+                if app.process_cfg.deriv != crate::processing::DerivOrder::Raw {
+                    flags.push_str(&format!("  Deriv:{}", app.process_cfg.deriv.label()));
+                }
+                if app.process_cfg.atm_co2 {
+                    flags.push_str("  CO2:Cut");
+                }
+                flags.push_str(&format!(
+                    "  Stack:{}",
+                    if app.stacked { "ON" } else { "OFF" }
+                ));
+                flags
+            },
             Style::default().fg(ACCENT_AMBER),
         ),
     ]);
 
     let hints = TextLine::from(Span::styled(
-        " Click/Drag:Cursor/Zoom | Wheel/+/-:Zoom | h/l:Move | g:GoTo | v:HD/Dots | a:%T↔Abs | b:Base | m:Smooth | w:Norm | s:Stack | p:Peaks | M:Library | n/N:Jump | x:Pin | c:Copy | e:Export | D:Libraries",
+        " Click/Drag:Cursor/Zoom | h/l:Move | a:%T↔Abs | b:Base | w:Norm | A:ATR/KM | t:Deriv | C:CO₂ | P:Deconv | o:Math | m:Smooth | s:Stack | p:Peaks | x:Pin | c:Copy",
         Style::default().fg(TEXT_MUTED),
     ));
 
@@ -2388,7 +2496,236 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                 },
             );
         }
+        Modal::Deconv(st) => draw_deconv_modal(frame, st, area),
+        Modal::SpectralMath(st) => draw_spectral_math_modal(frame, app, st, area),
     }
+}
+
+fn field_line(label: &str, value: String, cursor: bool, active: bool) -> TextLine<'static> {
+    let base = if active {
+        Style::default().fg(DARK_TEXT).bg(ACCENT_GREEN)
+    } else {
+        Style::default().fg(TEXT_PRIMARY)
+    };
+    TextLine::from(Span::styled(
+        format!(
+            "  {:<14}{}{}",
+            label,
+            value,
+            if cursor { "█" } else { " " }
+        ),
+        base.add_modifier(if active { Modifier::BOLD } else { Modifier::empty() }),
+    ))
+}
+
+fn draw_deconv_modal(frame: &mut Frame, st: &DeconvModalState, area: Rect) {
+    let rect = centered_rect(88, 78, area);
+    frame.render_widget(Clear, rect);
+    let block = modal_block("Peak Deconvolution Studio [P] · Levenberg–Marquardt", ACCENT_YELLOW);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height < 10 {
+        return;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),
+            Constraint::Min(8),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let mut cfg_lines = vec![
+        field_line(
+            "Shape",
+            format!("◀ {} ▶", st.shape.label()),
+            false,
+            st.field_idx == 0,
+        ),
+        field_line(
+            "Max Peaks",
+            format!("◀ {} ▶", st.max_peaks),
+            false,
+            st.field_idx == 1,
+        ),
+        field_line(
+            "Linear Baseline",
+            format!("◀ {} ▶", if st.fit_baseline { "ON" } else { "OFF" }),
+            false,
+            st.field_idx == 2,
+        ),
+        field_line("Window X Min", st.x_lo.clone(), st.field_idx == 3, st.field_idx == 3),
+        field_line("Window X Max", st.x_hi.clone(), st.field_idx == 4, st.field_idx == 4),
+    ];
+    if let Some(fb) = &st.feedback {
+        cfg_lines.push(TextLine::from(""));
+        cfg_lines.push(TextLine::from(Span::styled(
+            format!("  {}", fb),
+            Style::default().fg(ACCENT_AMBER).add_modifier(Modifier::BOLD),
+        )));
+    }
+    frame.render_widget(Paragraph::new(cfg_lines), rows[0]);
+
+    if let Some(res) = &st.result {
+        let res_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(5)])
+            .split(rows[1]);
+
+        let metrics = Paragraph::new(vec![
+            TextLine::from(Span::styled(
+                format!(
+                    "  R² = {:.6}   Adj-R² = {:.6}   RMSE = {:.5}   χ²_ν = {:.5}   Iters = {} ({})",
+                    res.r_squared,
+                    res.adj_r_squared,
+                    res.rmse,
+                    res.reduced_chi2,
+                    res.iterations,
+                    if res.converged { "converged" } else { "max-iter" }
+                ),
+                Style::default().fg(ACCENT_AQUA).add_modifier(Modifier::BOLD),
+            )),
+            TextLine::from(""),
+        ]);
+        frame.render_widget(metrics, res_rows[0]);
+
+        let header = Row::new(vec![
+            Cell::from("#"),
+            Cell::from("Center ± SE"),
+            Cell::from("FWHM ± SE"),
+            Cell::from("Height"),
+            Cell::from("Area"),
+            Cell::from("Area %"),
+            Cell::from("η"),
+            Cell::from("Assignment"),
+        ])
+        .style(Style::default().fg(ACCENT_AMBER).add_modifier(Modifier::BOLD));
+        let list: Vec<Row> = res
+            .peaks
+            .iter()
+            .enumerate()
+            .map(|(i, pk)| {
+                Row::new(vec![
+                    Cell::from(format!("{}", i + 1)),
+                    Cell::from(format!("{:.2} ± {:.2}", pk.center, pk.err_center)),
+                    Cell::from(format!("{:.2} ± {:.2}", pk.fwhm, pk.err_fwhm)),
+                    Cell::from(format!("{:.4}", pk.height)),
+                    Cell::from(format!("{:.4}", pk.area)),
+                    Cell::from(format!("{:.1}%", pk.area_pct)),
+                    Cell::from(format!("{:.2}", pk.eta)),
+                    Cell::from(pk.label.clone()),
+                ])
+            })
+            .collect();
+        let table = Table::new(
+            list,
+            [
+                Constraint::Length(3),
+                Constraint::Length(18),
+                Constraint::Length(17),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(8),
+                Constraint::Length(5),
+                Constraint::Min(18),
+            ],
+        )
+        .header(header)
+        .column_spacing(1);
+        frame.render_widget(table, res_rows[1]);
+    } else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                TextLine::from(""),
+                TextLine::from(Span::styled(
+                    "  Press [Enter] to fit the active zoom window.",
+                    Style::default().fg(TEXT_MUTED),
+                )),
+                TextLine::from(Span::styled(
+                    "  Hidden shoulders are auto-seeded from the 2nd derivative.",
+                    Style::default().fg(TEXT_MUTED),
+                )),
+            ]),
+            rows[1],
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(TextLine::from(Span::styled(
+            "  [Enter] Fit & Overlay | [r] Residual | [c] Copy Table | [s] Save CSV | [x] Clear Overlay | [Esc] Close",
+            Style::default().fg(TEXT_MUTED),
+        ))),
+        rows[2],
+    );
+}
+
+fn draw_spectral_math_modal(frame: &mut Frame, app: &App, st: &SpectralMathState, area: Rect) {
+    let rect = centered_rect(68, 46, area);
+    frame.render_widget(Clear, rect);
+    let block = modal_block("Interactive Spectral Math [o]", ACCENT_AQUA);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let trace_name = |idx: usize| -> String {
+        app.traces
+            .get(idx)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "(none)".to_string())
+    };
+
+    let mut lines = vec![
+        field_line(
+            "Operation",
+            format!("◀ {} ▶", st.op.label()),
+            false,
+            st.field_idx == 0,
+        ),
+        field_line(
+            "Trace A",
+            format!(
+                "◀ {} : {} ▶",
+                st.trace_a + 1,
+                trace_name(st.trace_a)
+            ),
+            false,
+            st.field_idx == 1,
+        ),
+        field_line(
+            "Trace B",
+            format!(
+                "◀ {} : {} ▶",
+                st.trace_b + 1,
+                trace_name(st.trace_b)
+            ),
+            false,
+            st.field_idx == 2,
+        ),
+        field_line(
+            "Scale factor k",
+            format!("◀ {:.4} ▶", st.factor_k),
+            false,
+            st.field_idx == 3,
+        ),
+        TextLine::from(""),
+        TextLine::from(Span::styled(
+            "  [k] Auto-Optimal k*  (1st-deriv baseline-invariant least squares)",
+            Style::default().fg(ACCENT_GREEN),
+        )),
+    ];
+    if let Some(fb) = &st.feedback {
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(Span::styled(
+            format!("  {}", fb),
+            Style::default().fg(ACCENT_AMBER).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(TextLine::from(""));
+    lines.push(TextLine::from(Span::styled(
+        "  [Enter] Add Result Trace   [←/→] Cycle / k ±0.05 (Shift ±0.01)   [Esc] Close",
+        Style::default().fg(TEXT_MUTED),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Wrap guide rows to the available terminal width, preserving each row's
@@ -2467,7 +2804,7 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("               UV-Vis: shows photon energy (eV) + absorbed/observed color."),
         TextLine::from("   Peaks       Auto-detected peaks: n/N jump, x pins, [ ] threshold."),
         TextLine::from("   Traces      Loaded spectra: Tab = active, Space = hide, Del = remove,"),
-        TextLine::from("               s = stack, w = normalize heights."),
+        TextLine::from("               s = stack; w cycles OFF/MinMax/SNV/Area normalization."),
         TextLine::from("   Status bar  One-line feedback for every action you take."),
         TextLine::from(""),
         section("  THE SIX TABS"),
@@ -2496,9 +2833,14 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from(""),
         section("  SIGNAL PROCESSING (SPECTRUM TABS)"),
         TextLine::from("   a                FTIR & UV-Vis: %Transmittance ↔ Absorbance (Beer-Lambert)"),
-        TextLine::from("   b                Baseline correction: OFF → Rubberband → AsLS"),
+        TextLine::from("   b                Baseline: OFF → Rubberband → AsLS → arPLS"),
         TextLine::from("   m                Savitzky-Golay smoothing: OFF → 5 → 9 → 15 points"),
-        TextLine::from("   w                Min-max normalization (helps when overlaying traces)"),
+        TextLine::from("   w                Normalization: OFF → MinMax → SNV → Area"),
+        TextLine::from("   A                Cycle ATR crystal / Kubelka-Munk optical correction"),
+        TextLine::from("   t                Derivative spectroscopy: Raw → 1st → 2nd derivative"),
+        TextLine::from("   C                Toggle FTIR atmospheric CO₂ suppression (2280–2410 cm⁻¹)"),
+        TextLine::from("   P                Open Peak Deconvolution Studio (multi-peak LM fit)"),
+        TextLine::from("   o                Open Interactive Spectral Math (subtract/add/ratio/average)"),
         TextLine::from("   s                Overlay ↔ stacked-offset layout"),
         TextLine::from("   v                HD Kitty graphics ↔ portable Braille rendering"),
         TextLine::from("   p                Show/hide auto peak markers"),
