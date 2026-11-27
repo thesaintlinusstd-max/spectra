@@ -319,6 +319,15 @@ pub const FTIR_DB: &[FtirBand] = &[
     FtirBand { min: 3580.0, max: 3650.0, group: "O–H (free alcohol/phenol)", mode: "ν(O–H) stretch", intensity: "Sharp, Med", note: "Unbonded hydroxyl; epoxy/PHEMA end-groups", confirm: "Confirm sharp 3640; compare H-bonded O–H 3200–3550 cm⁻¹" },
     FtirBand { min: 3200.0, max: 3550.0, group: "O–H (H-bonded alcohol/moisture)", mode: "ν(O–H) stretch", intensity: "Very Broad, Strong", note: "PVA, PEG end-groups, cured epoxy, absorbed H₂O", confirm: "Confirm C–O stretch 1050–1150 cm⁻¹" },
     FtirBand { min: 3300.0, max: 3500.0, group: "N–H (amide / amine / urethane)", mode: "ν(N–H) stretch", intensity: "Med–Strong", note: "Nylon-6,6 (~3300), Polyurethane (~3330), primary amine doublet", confirm: "Confirm Amide I 1630–1685 & Amide II 1515–1570 cm⁻¹" },
+    FtirBand {
+        min: 1625.0,
+        max: 1652.0,
+        group: "H₂O (adsorbed moisture bend)",
+        mode: "δ(H–O–H) bend",
+        intensity: "Med, Broad",
+        note: "Adsorbed water in KBr pellets, wood, cellulose, clays & hygroscopic polymers",
+        confirm: "Confirm broad O–H stretch 3200–3550 cm⁻¹",
+    },
     FtirBand { min: 3260.0, max: 3330.0, group: "≡C–H (terminal alkyne)", mode: "ν(≡C–H) stretch", intensity: "Strong, Sharp", note: "Click-chemistry propargyl polymer end-groups", confirm: "Confirm C≡C 2100–2160 cm⁻¹" },
     FtirBand { min: 3000.0, max: 3110.0, group: "=C–H (aromatic / vinyl sp²)", mode: "ν(=C–H) stretch", intensity: "Weak–Med", note: "Polystyrene (3026, 3060, 3082), PET, vinyl monomers", confirm: "Confirm out-of-plane Ar–H 690–760 cm⁻¹" },
     FtirBand { min: 2945.0, max: 2995.0, group: "C–H (CH₃ asym / sp³)", mode: "ν_as(CH₃)", intensity: "Med–Strong", note: "PMMA, PP, PDMS (2962 cm⁻¹)", confirm: "Confirm δ_s(CH₃) umbrella 1365–1395 cm⁻¹" },
@@ -1407,6 +1416,18 @@ pub fn ftir_band_rule(band: &FtirBand) -> FtirBandRule {
     if g.starts_with("Free N–H") || g.starts_with("H-bonded N–H") {
         return FtirBandRule { tier: BandTier::Specific, short_label: "ν(N–H)", requires: &[(1515.0, 1570.0)], forbids: &[] };
     }
+    if g.starts_with("O–H (H-bonded") {
+        return FtirBandRule { tier: BandTier::Generic, short_label: "O–H (H-bonded)", requires: &[(1000.0, 1160.0), (1620.0, 1655.0)], forbids: &[] };
+    }
+    if g.starts_with("N–H (amide") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "N–H", requires: &[(1515.0, 1575.0)], forbids: &[] };
+    }
+    if g.starts_with("H₂O (adsorbed") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "δ(H₂O)", requires: &[(3200.0, 3550.0)], forbids: &[(800.0, 995.0)] };
+    }
+    if g.starts_with("≡C–H") {
+        return FtirBandRule { tier: BandTier::Specific, short_label: "≡C–H", requires: &[(2100.0, 2160.0)], forbids: &[] };
+    }
     if g.starts_with("PE crystalline") || g.starts_with("LDPE ") {
         return FtirBandRule { tier: BandTier::Specific, short_label: "PE CH₂", requires: &[(2905.0, 2935.0), (2840.0, 2865.0), (715.0, 735.0)], forbids: &[(1680.0, 1775.0)] };
     }
@@ -1500,7 +1521,7 @@ pub fn match_ftir_with_context(wn: f64, spectrum_peaks: &[f64]) -> Vec<ScoredFti
             let center_dist = (wn - 0.5 * (b.min + b.max)).abs() / (0.5 * width);
             let base = center_dist + 0.0012 * width;
 
-            let (confirmed, score) = if !spectrum_peaks.is_empty() {
+            let (confirmed, mut score) = if !spectrum_peaks.is_empty() {
                 match rule.tier {
                     BandTier::Specific => {
                         let forb_hit = rule.forbids.iter().any(|&(lo, hi)| has_peak(lo, hi));
@@ -1528,6 +1549,16 @@ pub fn match_ftir_with_context(wn: f64, spectrum_peaks: &[f64]) -> Vec<ScoredFti
                     BandTier::Specific => (false, base + 0.35),
                 }
             };
+
+            // Without Amide II evidence, broad H-bonded O–H is the natural
+            // assignment; with Amide II present the N–H stretch is supported.
+            if rule.short_label == "O–H (H-bonded)" && !spectrum_peaks.is_empty() {
+                if has_peak(1515.0, 1575.0) {
+                    score += 0.50;
+                } else {
+                    score -= 0.15;
+                }
+            }
 
             ScoredFtirBand {
                 band: b,

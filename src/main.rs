@@ -1876,6 +1876,59 @@ mod tests {
     }
 
     #[test]
+    fn test_wood_cellulose_oh_and_water_bend_labels() {
+        let wood = [3430.0, 2920.0, 1633.0, 1045.0];
+
+        let oh = crate::data::match_ftir_with_context(3430.0, &wood);
+        assert!(!oh.is_empty(), "expected FTIR assignments at 3430 cm⁻¹");
+        assert!(
+            oh[0].short_label.contains("O–H") || oh[0].band.group.contains("O–H"),
+            "broad wood/cellulose O–H must outrank N–H, got: {} ({})",
+            oh[0].short_label,
+            oh[0].band.group
+        );
+        assert!(
+            !oh[0].short_label.contains("N–H") && !oh[0].band.group.contains("N–H"),
+            "wood/cellulose 3430 cm⁻¹ must not be mislabeled N–H, got: {} ({})",
+            oh[0].short_label,
+            oh[0].band.group
+        );
+
+        let water = crate::data::match_ftir_with_context(1633.0, &wood);
+        assert!(!water.is_empty(), "expected FTIR assignments at 1633 cm⁻¹");
+        assert!(
+            water[0].short_label.contains("H₂O") || water[0].band.group.contains("H₂O"),
+            "wood/cellulose 1633 cm⁻¹ must be assigned to adsorbed water, got: {} ({})",
+            water[0].short_label,
+            water[0].band.group
+        );
+        assert!(
+            !water[0].short_label.contains("vinyl") && !water[0].band.group.contains("vinyl"),
+            "wood/cellulose 1633 cm⁻¹ must not be labeled vinyl C=C, got: {} ({})",
+            water[0].short_label,
+            water[0].band.group
+        );
+
+        // Nylon-6,6: Amide II at 1540 cm⁻¹ confirms the N–H stretch.
+        let nylon = crate::data::match_ftir_with_context(3300.0, &[3300.0, 2932.0, 1640.0, 1540.0]);
+        assert!(
+            nylon[0].short_label.contains("N–H") || nylon[0].band.group.contains("N–H"),
+            "Nylon-6,6 3300 cm⁻¹ should identify N–H, got: {} ({})",
+            nylon[0].short_label,
+            nylon[0].band.group
+        );
+
+        // MMA monomer: vinyl =CH₂ out-of-plane peaks keep 1638 cm⁻¹ as C=C.
+        let mma = crate::data::match_ftir_with_context(1638.0, &[1722.0, 1638.0, 940.0, 814.0]);
+        assert!(
+            mma[0].short_label.contains("vinyl") || mma[0].band.group.contains("vinyl"),
+            "MMA 1638 cm⁻¹ should remain C=C (vinyl), got: {} ({})",
+            mma[0].short_label,
+            mma[0].band.group
+        );
+    }
+
+    #[test]
     fn test_asls_recovers_curved_baseline() {
         let n = 1000;
         let mut baseline = Vec::with_capacity(n);
