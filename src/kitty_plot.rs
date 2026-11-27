@@ -375,6 +375,9 @@ fn compute_plot_hash(app: &App) -> u64 {
     app.process_cfg.optics.hash(&mut h);
     app.process_cfg.deriv.hash(&mut h);
     app.process_cfg.atm_co2.hash(&mut h);
+    app.process_cfg.clamp_non_negative.hash(&mut h);
+    app.process_cfg.atr_n_sample_milli.hash(&mut h);
+    app.process_cfg.atr_angle_deci_deg.hash(&mut h);
     app.deconv_overlay.as_ref().map(|ov| {
         ov.trace_idx.hash(&mut h);
         ov.result.r_squared.to_bits().hash(&mut h);

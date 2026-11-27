@@ -432,6 +432,25 @@ fn run_convert_cli(args: &[String]) -> Result<()> {
                 };
             }
             "--km" => cfg.optics = OpticsMode::KubelkaMunk,
+            "--atr-n" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --atr-n"))?;
+                let n: f64 = raw.trim().parse()?;
+                if !(1.10..=2.50).contains(&n) {
+                    bail!("--atr-n must be between 1.10 and 2.50");
+                }
+                cfg.atr_n_sample_milli = (n * 1000.0).round() as u16;
+            }
+            "--atr-angle" => {
+                i += 1;
+                let raw = args.get(i).ok_or_else(|| anyhow::anyhow!("Missing value after --atr-angle"))?;
+                let deg: f64 = raw.trim().parse()?;
+                if !(20.0..=80.0).contains(&deg) {
+                    bail!("--atr-angle must be between 20.0 and 80.0");
+                }
+                cfg.atr_angle_deci_deg = (deg * 10.0).round() as u16;
+            }
+            "--clamp-zero" => cfg.clamp_non_negative = true,
             "--arpls" => cfg.baseline = BaselineMode::Arpls,
             "--rubberband" => cfg.baseline = BaselineMode::Rubberband,
             "--baseline" => cfg.baseline = BaselineMode::Asls,
@@ -519,12 +538,13 @@ fn print_help() {
                    [--peaks N] [--no-baseline] [-o fit.csv]\n  \
            spectra mix <FILE> [--components 1|2|3] [--solvent cdcl3|dmso|d2o|...]\n  \
            spectra convert <INPUT> -o <OUT.csv|OUT.jdx> [--atr diamond|znse|ge|si | --km]\n                 \
+                   [--atr-n FLOAT] [--atr-angle DEG] [--clamp-zero]\n                 \
                    [--baseline | --rubberband | --arpls] [--smooth 0|5|9|15]\n                 \
                    [--absorbance] [--deriv 1|2] [--norm minmax|snv|area]\n  \
            spectra export <FILES...> -o <OUT.svg|png|pdf> [--style acs|rsc|everforest]\n                 \
                    [--stacked] [--absorbance] [--baseline (AsLS) | --rubberband | --arpls]\n                 \
-                   [--atr diamond|znse|ge|si | --km] [--deriv 1|2]\n                 \
-                   [--norm minmax|snv|area] [--no-co2]\n                 \
+                   [--atr diamond|znse|ge|si | --km] [--atr-n FLOAT] [--atr-angle DEG]\n                 \
+                   [--clamp-zero] [--deriv 1|2] [--norm minmax|snv|area] [--no-co2]\n                 \
                    [--smooth 0|5|9|15] [--title \"...\"] [--dpi 600]\n\n\
          SVG figures are rendered natively in Rust; PNG/PDF use the Python helper.\n",
         env!("CARGO_PKG_VERSION")
@@ -542,6 +562,9 @@ fn run_headless_export(
     rubberband: bool,
     arpls: bool,
     optics: OpticsMode,
+    atr_n_sample_milli: u16,
+    atr_angle_deci_deg: u16,
+    clamp_non_negative: bool,
     deriv: DerivOrder,
     norm: NormMode,
     atm_co2: bool,
@@ -578,7 +601,9 @@ fn run_headless_export(
         optics,
         deriv,
         atm_co2,
-
+        clamp_non_negative,
+        atr_n_sample_milli,
+        atr_angle_deci_deg,
     };
 
     let mut traces = Vec::new();
@@ -752,6 +777,9 @@ fn main() -> Result<()> {
         let mut rubberband = false;
         let mut arpls = false;
         let mut optics = OpticsMode::Off;
+        let mut atr_n_sample_milli: u16 = 1500;
+        let mut atr_angle_deci_deg: u16 = 450;
+        let mut clamp_non_negative = false;
         let mut deriv = DerivOrder::Raw;
         let mut norm = NormMode::Off;
         let mut atm_co2 = false;
@@ -795,6 +823,29 @@ fn main() -> Result<()> {
                         other => bail!("Unknown ATR crystal '{}' (diamond|znse|ge|si)", other),
                     };
                 }
+                "--atr-n" => {
+                    i += 1;
+                    if i >= args.len() {
+                        bail!("Missing value after --atr-n");
+                    }
+                    let n: f64 = args[i].trim().parse()?;
+                    if !(1.10..=2.50).contains(&n) {
+                        bail!("--atr-n must be between 1.10 and 2.50");
+                    }
+                    atr_n_sample_milli = (n * 1000.0).round() as u16;
+                }
+                "--atr-angle" => {
+                    i += 1;
+                    if i >= args.len() {
+                        bail!("Missing value after --atr-angle");
+                    }
+                    let deg: f64 = args[i].trim().parse()?;
+                    if !(20.0..=80.0).contains(&deg) {
+                        bail!("--atr-angle must be between 20.0 and 80.0");
+                    }
+                    atr_angle_deci_deg = (deg * 10.0).round() as u16;
+                }
+                "--clamp-zero" => clamp_non_negative = true,
                 "--deriv" => {
                     i += 1;
                     if i >= args.len() {
@@ -848,8 +899,24 @@ fn main() -> Result<()> {
         }
 
         return run_headless_export(
-            files, output, style, stacked, absorbance, baseline, rubberband, arpls, optics,
-            deriv, norm, atm_co2, smooth, title, dpi,
+            files,
+            output,
+            style,
+            stacked,
+            absorbance,
+            baseline,
+            rubberband,
+            arpls,
+            optics,
+            atr_n_sample_milli,
+            atr_angle_deci_deg,
+            clamp_non_negative,
+            deriv,
+            norm,
+            atm_co2,
+            smooth,
+            title,
+            dpi,
         );
     }
 
@@ -3191,6 +3258,224 @@ mod tests {
                 pk.label
             );
         }
+    }
+
+    #[test]
+    fn test_unbiased_baseline_and_integration_zero_mean_noise() {
+        use crate::processing::{
+            arpls_baseline_ex, asls_baseline, integrate_region, integrate_region_ex,
+        };
+
+        // Flat zero-mean oscillating signal (no real peak)
+        let n = 400usize;
+        let _xs: Vec<f64> = (0..n).map(|i| 1000.0 + i as f64).collect();
+        let ys: Vec<f64> = (0..n)
+            .map(|i| 0.02 * ((i as f64 * 0.7).sin()))
+            .collect();
+
+        let asls_unbiased = asls_baseline(&ys, 1e6, 0.5, 10);
+        let asls_mean = asls_unbiased.iter().sum::<f64>() / n as f64;
+        assert!(
+            asls_mean.abs() < 0.005,
+            "unbiased AsLS mean should be near 0, got {}",
+            asls_mean
+        );
+
+        let arpls_unbiased = arpls_baseline(&ys, 1e6, 1e-3, 40);
+        let arpls_mean = arpls_unbiased.iter().sum::<f64>() / n as f64;
+        assert!(
+            arpls_mean.abs() < 0.005,
+            "unbiased arPLS mean should be near 0, got {}",
+            arpls_mean
+        );
+
+        let arpls_clamped = arpls_baseline_ex(&ys, 1e6, 1e-3, 40, true);
+        let clamped_mean = arpls_clamped.iter().sum::<f64>() / n as f64;
+        assert!(
+            clamped_mean > 0.002,
+            "clamped arPLS should show positive rectification bias, got {}",
+            clamped_mean
+        );
+
+        // Symmetric zero-mean alternating noise around y = 0 (49 positive, 49 negative interior points)
+        let noise_x: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let noise_y: Vec<f64> = (0..100)
+            .map(|i| if i == 0 || i == 99 { 0.0 } else if i % 2 == 1 { 0.05 } else { -0.05 })
+            .collect();
+        let (area_unbiased, _) = integrate_region(&noise_x, &noise_y, 0.0, 99.0).unwrap();
+        assert!(
+            area_unbiased.abs() < 1e-6,
+            "unbiased integration over zero-mean noise should cancel, got {}",
+            area_unbiased
+        );
+        let (area_clamped, _) = integrate_region_ex(&noise_x, &noise_y, 0.0, 99.0, true).unwrap();
+        assert!(
+            area_clamped > 1.0,
+            "clamped integration should produce positive bias, got {}",
+            area_clamped
+        );
+    }
+
+    #[test]
+    fn test_atr_configurable_ri_and_angle_fluoropolymer_and_tir_guard() {
+        use crate::processing::atr_penetration_depth_um;
+
+        let dp_pe = atr_penetration_depth_um(1000.0, 2.40, 1.50, 45.0).unwrap();
+        assert!((dp_pe - 2.01).abs() < 0.08, "expected ~2.01 µm, got {}", dp_pe);
+
+        let dp_ptfe = atr_penetration_depth_um(1000.0, 2.40, 1.35, 45.0).unwrap();
+        assert!(
+            (dp_ptfe - 1.47).abs() < 0.08 && dp_ptfe < dp_pe,
+            "expected PTFE d_p ~1.47 µm < PE d_p, got {}",
+            dp_ptfe
+        );
+
+        let dp_60 = atr_penetration_depth_um(1000.0, 2.40, 1.50, 60.0).unwrap();
+        assert!(dp_60 < dp_pe, "expected d_p at 60° ({}) < 45° ({})", dp_60, dp_pe);
+
+        // Sub-critical angle: n1=2.40, n_sample=1.50 => theta_c ~ 38.7 deg; 30 deg has no TIR
+        assert!(atr_penetration_depth_um(1000.0, 2.40, 1.50, 30.0).is_none());
+
+        let wn: Vec<f64> = (0..100).map(|i| 600.0 + i as f64 * 10.0).collect();
+        let abs_ys: Vec<f64> = wn.iter().map(|&w| 0.4 * (-((w - 1100.0) / 40.0).powi(2)).exp()).collect();
+        let sub_crit = advanced_atr_correction(&wn, &abs_ys, 2.40, 1.50, 30.0);
+        assert_eq!(sub_crit.len(), abs_ys.len());
+        assert!(sub_crit.iter().all(|v| v.is_finite()));
+        assert!((sub_crit[50] - abs_ys[50]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_all_loaders_and_generators_guarantee_strictly_ascending_x() {
+        use crate::data::synthesize_polymer_reference;
+        use crate::processing::is_strictly_ascending;
+
+        // Descending FTIR CSV (4000 -> 400)
+        let csv_ftir = "Wavenumber,Absorbance\n4000,0.01\n1725,0.85\n400,0.02\n";
+        let s_ftir = parse_delimited(csv_ftir, "ftir".into(), None).unwrap();
+        assert!(is_strictly_ascending(&s_ftir.x));
+
+        // Descending JCAMP-DX
+        let jdx = "##TITLE=Desc\n##JCAMP-DX=5.01\n##XUNITS=1/CM\n##YUNITS=ABSORBANCE\n##FIRSTX=4000\n##LASTX=400\n##NPOINTS=3\n##XYDATA=(X++(Y..Y))\n4000 0.01\n2200 0.10\n400 0.02\n##END=\n";
+        let s_jdx = parse_jcamp_dx(jdx, "jdx".into(), None).unwrap();
+        assert!(is_strictly_ascending(&s_jdx.x));
+
+        // Descending 1H NMR CSV (12 -> 0)
+        let csv_nmr = "ppm,Intensity\n12.0,0.0\n7.26,1.0\n0.0,0.5\n";
+        let s_nmr = parse_delimited(csv_nmr, "nmr".into(), Some(SpectrumKind::Hnmr)).unwrap();
+        assert!(is_strictly_ascending(&s_nmr.x));
+
+        // Synthetic descending binary .spc, .0 OPUS, .spa
+        let spc_bytes = build_synthetic_spc_f32(
+            "Desc SPC",
+            &[4000.0_f32, 2200.0, 400.0],
+            &[0.01_f32, 0.25, 0.02],
+        );
+        let opus_bytes = build_synthetic_opus(4000.0, 400.0, 1.0, &[0.01_f32, 0.25, 0.02]);
+        let spa_bytes = build_synthetic_spa("Desc SPA", 4000.0, 400.0, &[0.01_f32, 0.25, 0.02]);
+
+        let tmp = std::env::temp_dir();
+        let p_spc = tmp.join("spectra_test_asc.spc");
+        let p_opus = tmp.join("spectra_test_asc.0");
+        let p_spa = tmp.join("spectra_test_asc.spa");
+        std::fs::write(&p_spc, spc_bytes).unwrap();
+        std::fs::write(&p_opus, opus_bytes).unwrap();
+        std::fs::write(&p_spa, spa_bytes).unwrap();
+
+        assert!(is_strictly_ascending(&load_spectrum_file(&p_spc, None).unwrap().x));
+        assert!(is_strictly_ascending(&load_spectrum_file(&p_opus, None).unwrap().x));
+        assert!(is_strictly_ascending(&load_spectrum_file(&p_spa, None).unwrap().x));
+
+        let _ = std::fs::remove_file(&p_spc);
+        let _ = std::fs::remove_file(&p_opus);
+        let _ = std::fs::remove_file(&p_spa);
+
+        // All DemoPreset::ALL
+        for preset in DemoPreset::ALL {
+            for spec in crate::data::generate_demo_preset(preset) {
+                assert!(
+                    is_strictly_ascending(&spec.x),
+                    "DemoPreset {:?} / {} not strictly ascending",
+                    preset,
+                    spec.name
+                );
+            }
+        }
+
+        // synthesize_polymer_reference
+        let poly = &crate::data::POLYMERS_DB[0];
+        let ref_spec = synthesize_polymer_reference(poly, SpectrumKind::Ftir);
+        assert!(is_strictly_ascending(&ref_spec.x));
+    }
+
+    #[test]
+    fn test_hqi_linear_r_and_commercial_r2_relation() {
+        use crate::matcher::match_ftir_library;
+
+        let pmma = pmma_polymer_spectrum();
+        let hits = match_ftir_library(&pmma, ProcessConfig::default());
+        assert!(!hits.is_empty());
+        for h in &hits {
+            assert!(
+                h.hqi_r2_pct >= 0.0 && h.hqi_r2_pct <= h.hqi_pct + 1e-6,
+                "expected 0 <= r2 ({}) <= r ({})",
+                h.hqi_r2_pct,
+                h.hqi_pct
+            );
+        }
+        if let Some(sub) = hits.iter().find(|h| h.hqi_pct > 10.0 && h.hqi_pct < 99.0) {
+            assert!(
+                sub.hqi_r2_pct < sub.hqi_pct,
+                "expected r2 ({}) < r ({}) for r in (0, 1)",
+                sub.hqi_r2_pct,
+                sub.hqi_pct
+            );
+        }
+    }
+
+    #[test]
+    fn test_pu_hbi_with_molar_extinction_ratio() {
+        use crate::processing::pu_hydrogen_bond_index_with_ratio;
+
+        let h_default = pu_hydrogen_bond_index(1.20, 1.00).unwrap();
+        assert!((h_default.eps_ratio - 1.0).abs() < 1e-9);
+        assert!((h_default.bonded_pct - 54.545454).abs() < 0.01);
+
+        let h_ratio = pu_hydrogen_bond_index_with_ratio(1.20, 1.00, 1.20).unwrap();
+        assert!((h_ratio.bonded_pct - 50.0).abs() < 1e-9);
+
+        assert!(pu_hydrogen_bond_index_with_ratio(1.20, 1.00, 0.0).is_none());
+        assert!(pu_hydrogen_bond_index_with_ratio(1.20, 1.00, -1.0).is_none());
+    }
+
+    #[test]
+    fn test_optics_config_process_trace_respects_custom_atr_params() {
+        let pmma = pmma_polymer_spectrum();
+        let cfg_ptfe = ProcessConfig {
+            optics: OpticsMode::AtrDiamond,
+            atr_n_sample_milli: 1350,
+            atr_angle_deci_deg: 450,
+            ..ProcessConfig::ftir_absorbance()
+        };
+        let cfg_ps = ProcessConfig {
+            optics: OpticsMode::AtrDiamond,
+            atr_n_sample_milli: 1590,
+            atr_angle_deci_deg: 450,
+            ..ProcessConfig::ftir_absorbance()
+        };
+        let (_, y_ptfe, _) = process_trace(&pmma, cfg_ptfe);
+        let (_, y_ps, _) = process_trace(&pmma, cfg_ps);
+        assert!(y_ptfe.iter().all(|v| v.is_finite()));
+        assert!(y_ps.iter().all(|v| v.is_finite()));
+        let max_diff = y_ptfe
+            .iter()
+            .zip(&y_ps)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff > 1e-3,
+            "expected PTFE (n=1.35) vs PS (n=1.59) ATR traces to differ, max_diff={}",
+            max_diff
+        );
     }
 }
 

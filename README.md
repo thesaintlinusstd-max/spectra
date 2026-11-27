@@ -6,6 +6,22 @@ Built in **Rust** (`ratatui` + `crossterm`) with optional **Python** (`matplotli
 
 ---
 
+## What's New in v0.7.2 (Scientific Accuracy)
+
+- **Unbiased signed baseline & integration** — AsLS, arPLS, Rubberband (Absorbance/NMR), and local trapezoidal integration now preserve signed zero-mean noise residuals by default instead of rectifying noise into a positive area bias (`[O]` or `--clamp-zero` toggles legacy `≥ 0` clamping; NNLS mixture modeling retains strictly non-negative envelopes internally).
+- **Configurable ATR optics & TIR guard (`O`)** — Configure sample refractive index $n_2$ (with quick presets for PTFE `1.350`, PVDF/PDMS `1.420`, PE/PMMA `1.500`, PS/PET `1.590`, and H₂O `1.333`) and incidence angle $\theta$ (`--atr-n`, `--atr-angle` on CLI), with live critical-angle $\theta_c$ and penetration-depth $d_p$ ($1000\text{ cm}^{-1}$) readouts plus an explicit Total Internal Reflection safety guard.
+- **Linear $r$ and Commercial $r^2$ (OMNIC) HQI (`r` in `[M]`)** — Toggle the Library Matcher & NNLS Mixture display between linear Pearson $r$ HQI and squared $r^2$ (OMNIC-style) HQI; mixture Markdown reports include both columns.
+- **Polyurethane HBI molar extinction ratio $k_\varepsilon$** — Polymer Lab Tab 4 (`PhaseIndex`) now exposes $k_\varepsilon = \varepsilon_{\text{bonded}} / \varepsilon_{\text{free}}$ (`Bonded% = HBI / (k_ε + HBI) × 100%`, defaulting to `1.00`).
+- **Signed derivative step & ascending X-axis verification** — `spectral_derivative` uses signed median $\Delta x$ and all loaders/generators enforce a strictly ascending internal X-axis invariant.
+
+### Scientific Methodology & Conventions
+- **Baselines & Integration**: Signed residuals around the fitted baseline cancel symmetric noise; enable `--clamp-zero` (or `[O]` in TUI) only if downstream non-negativity is desired.
+- **ATR Correction**: Uses Harrick penetration-depth scaling combined with Kramers–Kronig anomalous dispersion for $n_1 > n_2 / \sin\theta$; sub-critical angles return the uncorrected absorbance without NaN.
+- **HQI Scaling**: Linear $r$ HQI weights correlation coefficients directly; OMNIC-style $r^2$ weights $r^2$ terms, giving stronger contrast between near-matches and mid-tier candidates.
+- **Internal X-Axis Invariant**: All parsers and generators normalize X to strictly ascending order internally; IUPAC descending display (`4000 → 400 cm⁻¹`, `14 → -0.5 ppm`) is applied only during rendering and export.
+
+---
+
 ## What's New in v0.7.0
 
 - **Native binary instrument parsers** — pure Rust, zero new dependencies: Galactic/Thermo `.spc` (SPCHDR, explicit or linear X, float32/int32/scaled Y), Bruker **OPUS** `.0`/`.1`/`.0000`/`.opus` (block directory + NPF/FXV/LXV/CSF tags), and Thermo Nicolet OMNIC **`.spa`** (key-2 header / key-3 data). All are auto-detected by magic bytes.

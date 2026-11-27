@@ -27,14 +27,14 @@ use crate::io::{
     search_library,
 };
 use crate::processing::{
-    absorbance_to_transmittance, apply_x_calibration, auto_ftir_conversion, average_spectra,
-    beer_lambert_conc,
-    compute_spectral_math, compute_tauc_band_gap_with_optics, detect_peaks,
-    ftir_conversion_percent, integrate_spectrum_window, interpolate_y, nmr_mn_dpn,
-    optimal_subtraction_factor, process_trace, pu_hydrogen_bond_index, pvdf_beta_fraction,
-    tacticity_stats, BaselineMode, ConversionResult, HydrogenBondIndex, IntegrationRegion,
-    OpticsMode, Peak, ProcessConfig, SmoothLevel, SpectralOp, TacticityResult, TaucMode,
-    TaucResult, YAxisPreference,
+    absorbance_to_transmittance, apply_x_calibration, atr_critical_angle_deg,
+    auto_ftir_conversion, average_spectra, beer_lambert_conc, compute_spectral_math,
+    compute_tauc_band_gap_with_optics, detect_peaks, ftir_conversion_percent,
+    integrate_spectrum_window, interpolate_y, nmr_mn_dpn, optimal_subtraction_factor,
+    process_trace, pu_hydrogen_bond_index_with_ratio, pvdf_beta_fraction, tacticity_stats,
+    BaselineMode, ConversionResult, HydrogenBondIndex, IntegrationRegion, OpticsMode, Peak,
+    ProcessConfig, SmoothLevel, SpectralOp, TacticityResult, TaucMode, TaucResult,
+    YAxisPreference,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +266,15 @@ pub struct LibraryMatchState {
     pub mixture_mode: bool,
     pub mixture_results: Vec<crate::mixture::MixtureMatch>,
     pub mixture_selected: usize,
+    pub use_r2: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpticsModalState {
+    pub field_idx: usize, // 0: OpticsMode, 1: n_sample, 2: angle_deg, 3: clamp_non_negative
+    pub n_buf: String,
+    pub angle_buf: String,
+    pub feedback: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -385,6 +394,7 @@ pub enum Modal {
     Integration(IntegrationModalState),
     Calibration(CalibrationModalState),
     SaveData(SaveDataModalState),
+    OpticsConfig(OpticsModalState),
 }
 
 #[derive(Debug, Clone)]
@@ -464,6 +474,7 @@ pub struct PolymerLabState {
     pub a763: String,
     pub a1703: String,
     pub a1732: String,
+    pub pu_eps_ratio: String,
     // Sub 5: UV-Vis Tauc band gap & Beer-Lambert
     /// true = direct allowed transition (αhν)², false = indirect (αhν)^½
     pub tauc_direct: bool,
@@ -504,6 +515,7 @@ impl Default for PolymerLabState {
             a763: "1.00".into(),
             a1703: "0.72".into(),
             a1732: "0.45".into(),
+            pu_eps_ratio: "1.00".into(),
             tauc_direct: true,
             uv_manual: false,
             uv_abs: "0.50".into(),
@@ -1104,6 +1116,7 @@ impl App {
                     mixture_mode: false,
                     mixture_results: Vec::new(),
                     mixture_selected: 0,
+                    use_r2: false,
                 });
             }
             TaskOutcome::MixtureMatch(mix) => {
@@ -1113,6 +1126,7 @@ impl App {
                     mixture_mode: true,
                     mixture_results: Vec::new(),
                     mixture_selected: 0,
+                    use_r2: false,
                 });
                 if mix.is_empty() {
                     self.modal = Modal::LibraryMatch(st);
@@ -1335,7 +1349,8 @@ impl App {
             | Modal::SpectralMath(_)
             | Modal::Integration(_)
             | Modal::Calibration(_)
-            | Modal::SaveData(_) => {
+            | Modal::SaveData(_)
+            | Modal::OpticsConfig(_) => {
                 return;
             }
             Modal::FilePicker(_) => {
@@ -1887,6 +1902,7 @@ impl App {
                 short: c.short.clone(),
                 source: c.source.clone(),
                 hqi_pct: m.composite_hqi_pct,
+                hqi_r2_pct: m.composite_r2_pct,
                 r_abs: m.r_abs,
                 r_deriv: m.r_deriv,
                 is_builtin: c.is_builtin,
@@ -2223,7 +2239,12 @@ impl App {
                 self.pull_peak_absorbance(1732.0, 15.0)?,
             )
         };
-        pu_hydrogen_bond_index(a1703, a1732)
+        let eps_ratio = if self.polymer_lab.pu_eps_ratio.trim().is_empty() {
+            1.0
+        } else {
+            self.polymer_lab.pu_eps_ratio.trim().parse().ok()?
+        };
+        pu_hydrogen_bond_index_with_ratio(a1703, a1732, eps_ratio)
     }
 
     /// Tauc band gap of the active UV-Vis trace in the selected transition mode.
@@ -2735,6 +2756,15 @@ impl App {
                 }
             }
             KeyCode::Char('c') => self.copy_cursor_summary(),
+            KeyCode::Char('O') | KeyCode::Char('o') if shift || key.code == KeyCode::Char('O') => {
+                self.modal = Modal::OpticsConfig(OpticsModalState {
+                    field_idx: 0,
+                    n_buf: format!("{:.3}", self.process_cfg.atr_n_sample()),
+                    angle_buf: format!("{:.1}", self.process_cfg.atr_angle_deg()),
+                    feedback: None,
+                });
+                self.status_msg = "Optics & Baseline Parameters — ATR n_sample, θ, zero-clamp".into();
+            }
             KeyCode::Char('o') => {
                 if self.traces.len() >= 2 {
                     let ta = self.active_trace.min(self.traces.len() - 1);
@@ -2901,6 +2931,7 @@ impl App {
                 1 => Some(&mut p.a763),
                 2 => Some(&mut p.a1703),
                 3 => Some(&mut p.a1732),
+                4 => Some(&mut p.pu_eps_ratio),
                 _ => None,
             },
             PolymerSubTab::UvVisLab => match p.field_idx {
@@ -2917,7 +2948,7 @@ impl App {
             PolymerSubTab::Conversion => 4,
             PolymerSubTab::NmrMn => 6,
             PolymerSubTab::Tacticity => 3,
-            PolymerSubTab::PhaseIndex => 4,
+            PolymerSubTab::PhaseIndex => 5,
             PolymerSubTab::UvVisLab => 3,
         }
     }
@@ -3047,15 +3078,31 @@ impl App {
                         }
                     }
                     PolymerSubTab::PhaseIndex => match (self.compute_pvdf_beta(), self.compute_pu_hbi()) {
-                        (Some((a840, a763, f)), Some(h)) => format!(
-                            "PVDF F(β) = {:.1}% (A840={:.3}, A763={:.3}) | PU HBI = {:.3}, bonded = {:.1}%",
-                            f, a840, a763, h.hbi, h.bonded_pct
-                        ),
+                        (Some((a840, a763, f)), Some(h)) => {
+                            if (h.eps_ratio - 1.0).abs() > 1e-3 {
+                                format!(
+                                    "PVDF F(β) = {:.1}% (A840={:.3}, A763={:.3}) | PU HBI = {:.3}, bonded = {:.1}% (k_ε={:.2})",
+                                    f, a840, a763, h.hbi, h.bonded_pct, h.eps_ratio
+                                )
+                            } else {
+                                format!(
+                                    "PVDF F(β) = {:.1}% (A840={:.3}, A763={:.3}) | PU HBI = {:.3}, bonded = {:.1}%",
+                                    f, a840, a763, h.hbi, h.bonded_pct
+                                )
+                            }
+                        }
                         (Some((a840, a763, f)), None) => {
                             format!("PVDF F(β) = {:.1}% (A840={:.3}, A763={:.3})", f, a840, a763)
                         }
                         (None, Some(h)) => {
-                            format!("PU HBI = {:.3}, bonded C=O = {:.1}%", h.hbi, h.bonded_pct)
+                            if (h.eps_ratio - 1.0).abs() > 1e-3 {
+                                format!(
+                                    "PU HBI = {:.3}, bonded C=O = {:.1}% (k_ε={:.2})",
+                                    h.hbi, h.bonded_pct, h.eps_ratio
+                                )
+                            } else {
+                                format!("PU HBI = {:.3}, bonded C=O = {:.1}%", h.hbi, h.bonded_pct)
+                            }
                         }
                         (None, None) => "Invalid phase-index inputs".into(),
                     },
@@ -3262,6 +3309,10 @@ impl App {
                     }
                     self.modal = Modal::LibraryMatch(st);
                 }
+                KeyCode::Char('r') => {
+                    st.use_r2 = !st.use_r2;
+                    self.modal = Modal::LibraryMatch(st);
+                }
                 KeyCode::Char('/') => self.open_search_modal(),
                 KeyCode::Char('c') if st.mixture_mode => {
                     if st.mixture_results.is_empty() {
@@ -3293,6 +3344,135 @@ impl App {
                 }
                 _ => self.modal = Modal::LibraryMatch(st),
             },
+            Modal::OpticsConfig(mut st) => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                        st.field_idx = (st.field_idx + 3) % 4;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                        st.field_idx = (st.field_idx + 1) % 4;
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                        if st.field_idx == 0 {
+                            self.process_cfg.optics = self.process_cfg.optics.next();
+                            self.recompute_processing();
+                            st.feedback = Some(format!("Optics: {}", self.process_cfg.optics.label()));
+                        } else if st.field_idx == 3 {
+                            self.process_cfg.clamp_non_negative =
+                                !self.process_cfg.clamp_non_negative;
+                            self.recompute_processing();
+                            st.feedback = Some(format!(
+                                "Baseline Zero-Clamp: {}",
+                                if self.process_cfg.clamp_non_negative {
+                                    "ON (≥0)"
+                                } else {
+                                    "OFF (Unbiased)"
+                                }
+                            ));
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if st.field_idx == 1 {
+                            st.n_buf.pop();
+                        } else if st.field_idx == 2 {
+                            st.angle_buf.pop();
+                        }
+                    }
+                    KeyCode::Char('f') => {
+                        st.n_buf = "1.350".into();
+                        st.feedback = Some("Preset: PTFE / Fluoropolymer (n = 1.350)".into());
+                    }
+                    KeyCode::Char('v') => {
+                        st.n_buf = "1.420".into();
+                        st.feedback = Some("Preset: PVDF / PDMS (n = 1.420)".into());
+                    }
+                    KeyCode::Char('p') => {
+                        st.n_buf = "1.500".into();
+                        st.feedback = Some("Preset: Standard Polymer PE/PMMA (n = 1.500)".into());
+                    }
+                    KeyCode::Char('r') => {
+                        st.n_buf = "1.590".into();
+                        st.feedback = Some("Preset: Aromatic PS/PET/PC (n = 1.590)".into());
+                    }
+                    KeyCode::Char('w') => {
+                        st.n_buf = "1.333".into();
+                        st.feedback = Some("Preset: Water / Aqueous (n = 1.333)".into());
+                    }
+                    KeyCode::Char('a') => {
+                        let cur: f64 = st.angle_buf.trim().parse().unwrap_or(45.0);
+                        let next = if (cur - 45.0).abs() < 1.0 {
+                            60.0
+                        } else if (cur - 60.0).abs() < 1.0 {
+                            30.0
+                        } else {
+                            45.0
+                        };
+                        st.angle_buf = format!("{:.1}", next);
+                        st.feedback = Some(format!("Incidence angle θ = {:.1}°", next));
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                        if st.field_idx == 1 {
+                            st.n_buf.push(c);
+                        } else if st.field_idx == 2 {
+                            st.angle_buf.push(c);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let parsed_n = st.n_buf.trim().parse::<f64>();
+                        let parsed_a = st.angle_buf.trim().parse::<f64>();
+                        match (parsed_n, parsed_a) {
+                            (Ok(n_val), Ok(a_val))
+                                if (1.10..=2.50).contains(&n_val)
+                                    && (20.0..=80.0).contains(&a_val) =>
+                            {
+                                if let Some(n1) = self.process_cfg.optics.atr_n1() {
+                                    if let Some(theta_c) = atr_critical_angle_deg(n1, n_val) {
+                                        if a_val <= theta_c + 0.5 {
+                                            st.feedback = Some(format!(
+                                                "Warning: θ = {:.1}° ≤ θ_c ({:.1}°) — no TIR for n₁={:.2}, n₂={:.3}",
+                                                a_val, theta_c, n1, n_val
+                                            ));
+                                            self.modal = Modal::OpticsConfig(st);
+                                            return;
+                                        }
+                                    } else {
+                                        st.feedback = Some(format!(
+                                            "Warning: n₂ ({:.3}) ≥ n₁ ({:.2}) — no TIR possible",
+                                            n_val, n1
+                                        ));
+                                        self.modal = Modal::OpticsConfig(st);
+                                        return;
+                                    }
+                                }
+                                self.process_cfg.atr_n_sample_milli =
+                                    (n_val * 1000.0).round() as u16;
+                                self.process_cfg.atr_angle_deci_deg = (a_val * 10.0).round() as u16;
+                                self.recompute_processing();
+                                self.status_msg = format!(
+                                    "Optics: {} | n₂={:.3}, θ={:.1}° | Baseline clamp: {}",
+                                    self.process_cfg.optics.label(),
+                                    self.process_cfg.atr_n_sample(),
+                                    self.process_cfg.atr_angle_deg(),
+                                    if self.process_cfg.clamp_non_negative {
+                                        "ON"
+                                    } else {
+                                        "OFF"
+                                    }
+                                );
+                                self.modal = Modal::None;
+                                return;
+                            }
+                            _ => {
+                                st.feedback = Some(
+                                    "Enter n_sample in 1.10–2.50 and θ in 20.0–80.0°".into(),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.modal = Modal::OpticsConfig(st);
+            }
             Modal::Search(mut st) => match key.code {
                 KeyCode::Down => {
                     if !st.results.is_empty() {

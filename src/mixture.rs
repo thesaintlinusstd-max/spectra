@@ -28,6 +28,7 @@ pub struct MixtureComponent {
 pub struct MixtureMatch {
     pub components: Vec<MixtureComponent>, // 1, 2, or 3 components sorted by weight_pct desc
     pub composite_hqi_pct: f64,
+    pub composite_r2_pct: f64,
     pub r_abs: f64,
     pub r_deriv: f64,
     pub improvement_pct: f64, // composite_hqi_pct - best_single_hqi_pct
@@ -416,6 +417,7 @@ pub fn analyze_mixture(
         let r_abs = pearson_local(&qy, &y_hat).clamp(0.0, 1.0);
         let r_deriv = pearson_local(&qd, &d_hat).clamp(0.0, 1.0);
         let composite_hqi_pct = (0.55 * r_abs + 0.45 * r_deriv) * 100.0;
+        let composite_r2_pct = (0.55 * r_abs * r_abs + 0.45 * r_deriv * r_deriv) * 100.0;
 
         let mut components: Vec<MixtureComponent> = subset
             .iter()
@@ -438,6 +440,7 @@ pub fn analyze_mixture(
         Some(MixtureMatch {
             components,
             composite_hqi_pct,
+            composite_r2_pct,
             r_abs,
             r_deriv,
             improvement_pct: 0.0,
@@ -581,11 +584,11 @@ pub fn format_mixture_markdown(results: &[MixtureMatch], kind: SpectrumKind) -> 
     );
     let _ = writeln!(
         out,
-        "| Rank | Composite HQI | ΔHQI | r_abs | r_deriv | Components |"
+        "| Rank | HQI (r) | HQI (r², OMNIC) | ΔHQI | r_abs | r_deriv | Components |"
     );
     let _ = writeln!(
         out,
-        "|-----:|--------------:|-----:|------:|--------:|:-----------|"
+        "|-----:|--------:|----------------:|-----:|------:|--------:|:-----------|"
     );
     for (i, m) in results.iter().enumerate() {
         let comps = m
@@ -596,9 +599,10 @@ pub fn format_mixture_markdown(results: &[MixtureMatch], kind: SpectrumKind) -> 
             .join(" + ");
         let _ = writeln!(
             out,
-            "| {} | {:.2}% | {:+.2}% | {:.4} | {:.4} | {} |",
+            "| {} | {:.2}% | {:.2}% | {:+.2}% | {:.4} | {:.4} | {} |",
             i + 1,
             m.composite_hqi_pct,
+            m.composite_r2_pct,
             m.improvement_pct,
             m.r_abs,
             m.r_deriv,
@@ -608,7 +612,7 @@ pub fn format_mixture_markdown(results: &[MixtureMatch], kind: SpectrumKind) -> 
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Composite HQI = 0.55 × absorbance correlation + 0.45 × derivative correlation."
+        "Composite HQI (r) = (0.55 × r_abs + 0.45 × r_deriv) × 100%; HQI (r², OMNIC) = (0.55 × r_abs² + 0.45 × r_deriv²) × 100%."
     );
     out
 }

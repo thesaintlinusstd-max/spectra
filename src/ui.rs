@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::app::{
     ActiveTab, App, CalibrationModalState, DeconvModalState, IntegrationModalState, Modal,
-    PolymerSubTab, SaveDataModalState, SpectralMathState, MONOMER_PRESETS,
+    OpticsModalState, PolymerSubTab, SaveDataModalState, SpectralMathState, MONOMER_PRESETS,
 };
 use crate::data::{
     match_cnmr, match_ftir_with_context, match_hnmr, match_polymers,
@@ -17,7 +17,8 @@ use crate::data::{
     SOLVENT_IMPURITIES,
 };
 use crate::processing::{
-    analyze_hnmr_multiplet, interpolate_y, spectrum_nmr_freq_mhz,
+    analyze_hnmr_multiplet, atr_critical_angle_deg, atr_penetration_depth_um, interpolate_y,
+    spectrum_nmr_freq_mhz,
 };
 use crate::theme::*;
 
@@ -1564,13 +1565,14 @@ fn draw_polymer_lab_tab(frame: &mut Frame, app: &App, area: Rect) {
                 field_line(1, "A_763 (α-phase, ±15 cm⁻¹):", &pl.a763),
                 field_line(2, "A_1703 (bonded C=O, ±15):", &pl.a1703),
                 field_line(3, "A_1732 (free C=O, ±15):", &pl.a1732),
+                field_line(4, "k_ε (ε_bond/ε_free):", &pl.pu_eps_ratio),
                 TextLine::from(""),
                 TextLine::from(Span::styled(
                     " Gregorio: F(β) = A_840 / (1.26·A_763 + A_840)",
                     Style::default().fg(TEXT_MUTED),
                 )),
                 TextLine::from(Span::styled(
-                    " PU: HBI = A_1703 / A_1732; Bonded% = HBI/(1+HBI)",
+                    " PU: HBI = A_1703 / A_1732; Bonded% = HBI/(k_ε+HBI)",
                     Style::default().fg(TEXT_MUTED),
                 )),
             ];
@@ -1643,8 +1645,8 @@ fn draw_polymer_lab_tab(frame: &mut Frame, app: &App, area: Rect) {
                     ]));
                     right.push(TextLine::from(Span::styled(
                         format!(
-                            "  A_1703 = {:.4}   A_1732 = {:.4}",
-                            h.a_bonded, h.a_free
+                            "  A_1703 = {:.4}   A_1732 = {:.4}   k_ε = {:.2}",
+                            h.a_bonded, h.a_free, h.eps_ratio
                         ),
                         Style::default().fg(ACCENT_AQUA),
                     )));
@@ -2291,6 +2293,23 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                     "  520–3760 cm⁻¹ · AsLS + SG deriv + fingerprint (CO₂ 2280–2410 cm⁻¹ masked)",
                 ),
             };
+            let metric_badge = if st.use_r2 {
+                Span::styled(
+                    "  [Metric: r² (OMNIC)]",
+                    Style::default()
+                        .fg(DARK_TEXT)
+                        .bg(ACCENT_AQUA)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    "  [Metric: r (Linear)]",
+                    Style::default()
+                        .fg(DARK_TEXT)
+                        .bg(ACCENT_AMBER)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
             let mode_banner = if st.mixture_mode {
                 TextLine::from(vec![
                     Span::styled(
@@ -2305,6 +2324,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(" [m] switch mode", Style::default().fg(ACCENT_YELLOW)),
+                    metric_badge,
                 ])
             } else {
                 TextLine::from(vec![
@@ -2320,6 +2340,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(TEXT_MUTED),
                     ),
                     Span::styled("  [m] switch mode", Style::default().fg(ACCENT_YELLOW)),
+                    metric_badge,
                 ])
             };
             let mut lines = vec![
@@ -2347,12 +2368,17 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                         .take(max_vis)
                     {
                         let active = i == st.mixture_selected;
+                        let score_pct = if st.use_r2 {
+                            m.composite_r2_pct
+                        } else {
+                            m.composite_hqi_pct
+                        };
                         let bar_w = 18usize;
                         let filled =
-                            ((m.composite_hqi_pct / 100.0) * bar_w as f64).round() as usize;
-                        let color = if m.composite_hqi_pct >= 92.0 {
+                            ((score_pct / 100.0) * bar_w as f64).round() as usize;
+                        let color = if score_pct >= 92.0 {
                             ACCENT_GREEN
-                        } else if m.composite_hqi_pct >= 75.0 {
+                        } else if score_pct >= 75.0 {
                             ACCENT_YELLOW
                         } else {
                             ACCENT_CORAL
@@ -2372,7 +2398,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                                 Style::default().fg(TEXT_MUTED),
                             ),
                             Span::styled(
-                                format!(" {:5.1}%", m.composite_hqi_pct),
+                                format!(" {:5.1}%", score_pct),
                                 Style::default().fg(color).add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
@@ -2443,7 +2469,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 lines.push(TextLine::from(""));
                 lines.push(TextLine::from(Span::styled(
-                    "  [j/k] Navigate   [Enter] Overlay Components   [c] Copy Report   [m] Single Mode   [Esc] Close",
+                    "  [j/k] Navigate   [Enter] Overlay Components   [c] Copy Report   [r] r↔r² (OMNIC)   [m] Single Mode   [Esc] Close",
                     Style::default().fg(TEXT_MUTED),
                 )));
             } else {
@@ -2482,11 +2508,12 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                     .take(max_vis)
                 {
                     let active = i == st.selected;
+                    let score_pct = if st.use_r2 { m.hqi_r2_pct } else { m.hqi_pct };
                     let bar_w = 20usize;
-                    let filled = ((m.hqi_pct / 100.0) * bar_w as f64).round() as usize;
-                    let color = if m.hqi_pct >= 88.0 {
+                    let filled = ((score_pct / 100.0) * bar_w as f64).round() as usize;
+                    let color = if score_pct >= 88.0 {
                         ACCENT_GREEN
-                    } else if m.hqi_pct >= 70.0 {
+                    } else if score_pct >= 70.0 {
                         ACCENT_YELLOW
                     } else {
                         ACCENT_CORAL
@@ -2511,7 +2538,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                             Style::default().fg(TEXT_MUTED),
                         ),
                         Span::styled(
-                            format!(" {:5.1}%", m.hqi_pct),
+                            format!(" {:5.1}%", score_pct),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(" "),
@@ -2546,7 +2573,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                     )));
                 }
                 lines.push(TextLine::from(Span::styled(
-                    "  [j/k] Navigate   [Enter] Overlay Reference   [m] Mixture NNLS   [/] Search   [Esc] Close",
+                    "  [j/k] Navigate   [Enter] Overlay Reference   [r] r↔r² (OMNIC)   [m] Mixture NNLS   [/] Search   [Esc] Close",
                     Style::default().fg(TEXT_MUTED),
                 )));
             }
@@ -2790,6 +2817,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
         Modal::Integration(st) => draw_integration_modal(frame, app, st, area),
         Modal::Calibration(st) => draw_calibration_modal(frame, app, st, area),
         Modal::SaveData(st) => draw_save_data_modal(frame, app, st, area),
+        Modal::OpticsConfig(st) => draw_optics_modal(frame, app, st, area),
     }
 }
 
@@ -3374,6 +3402,133 @@ fn draw_save_data_modal(
     );
 }
 
+fn draw_optics_modal(frame: &mut Frame, app: &App, st: &OpticsModalState, area: Rect) {
+    let rect = centered_rect(72, 62, area);
+    frame.render_widget(Clear, rect);
+
+    let row = |idx: usize, label: &str, val: &str| {
+        let active = st.field_idx == idx;
+        TextLine::from(vec![
+            Span::styled(
+                if active { " ▶ " } else { "   " },
+                Style::default().fg(ACCENT_GREEN),
+            ),
+            Span::styled(
+                format!("{:<28} ", label),
+                Style::default().fg(if active { ACCENT_AQUA } else { TEXT_PRIMARY }),
+            ),
+            Span::styled(
+                format!(" {} ", val),
+                Style::default()
+                    .fg(if active { DARK_TEXT } else { ACCENT_YELLOW })
+                    .bg(if active { ACCENT_GREEN } else { SURFACE_DARK })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
+
+    let clamp_lbl = if app.process_cfg.clamp_non_negative {
+        "ON (≥0, legacy rectified)"
+    } else {
+        "OFF (Unbiased signed residuals)"
+    };
+
+    let mut lines = vec![
+        TextLine::from(Span::styled(
+            "  Configure ATR crystal, sample refractive index n₂, incidence angle θ, and baseline clamping:",
+            Style::default().fg(TEXT_MUTED),
+        )),
+        TextLine::from(""),
+        row(0, "Crystal / Optics Mode:", app.process_cfg.optics.label()),
+        row(1, "Sample Refractive Index n₂:", &st.n_buf),
+        row(2, "Incidence Angle θ (deg):", &st.angle_buf),
+        row(3, "Baseline Zero-Clamp:", clamp_lbl),
+        TextLine::from(""),
+    ];
+
+    let n_val = st
+        .n_buf
+        .trim()
+        .parse::<f64>()
+        .unwrap_or_else(|_| app.process_cfg.atr_n_sample());
+    let a_val = st
+        .angle_buf
+        .trim()
+        .parse::<f64>()
+        .unwrap_or_else(|_| app.process_cfg.atr_angle_deg());
+
+    if let Some(n1) = app.process_cfg.optics.atr_n1() {
+        let theta_c = atr_critical_angle_deg(n1, n_val);
+        let dp_1000 = atr_penetration_depth_um(1000.0, n1, n_val, a_val);
+        match (theta_c, dp_1000) {
+            (Some(tc), Some(dp)) => {
+                lines.push(TextLine::from(vec![
+                    Span::styled("  Physics Readout: ", Style::default().fg(ACCENT_AQUA)),
+                    Span::styled(
+                        format!(
+                            "n₁ = {:.2} · θ_c = {:.1}° · d_p (1000 cm⁻¹) = {:.2} µm",
+                            n1, tc, dp
+                        ),
+                        Style::default().fg(ACCENT_GREEN),
+                    ),
+                ]));
+            }
+            (Some(tc), None) => {
+                lines.push(TextLine::from(Span::styled(
+                    format!(
+                        "  ⚠ θ = {:.1}° ≤ θ_c ({:.1}°) — no Total Internal Reflection!",
+                        a_val, tc
+                    ),
+                    Style::default().fg(ACCENT_CORAL).add_modifier(Modifier::BOLD),
+                )));
+            }
+            _ => {
+                lines.push(TextLine::from(Span::styled(
+                    format!(
+                        "  ⚠ n₂ ({:.3}) ≥ n₁ ({:.2}) — no Total Internal Reflection!",
+                        n_val, n1
+                    ),
+                    Style::default().fg(ACCENT_CORAL).add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+    } else {
+        lines.push(TextLine::from(Span::styled(
+            "  Select an ATR crystal (←/→ on row 1) to view critical angle θ_c and penetration depth d_p.",
+            Style::default().fg(TEXT_MUTED),
+        )));
+    }
+
+    lines.push(TextLine::from(""));
+    lines.push(TextLine::from(Span::styled(
+        "  Presets: [f] PTFE 1.35  [v] PVDF 1.42  [p] PE/PMMA 1.50  [r] PS/PET 1.59  [w] H₂O 1.33  [a] θ 45/60/30°",
+        Style::default().fg(ACCENT_AMBER),
+    )));
+
+    if let Some(fb) = &st.feedback {
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(Span::styled(
+            format!("  {}", fb),
+            Style::default().fg(if fb.starts_with("Warning") || fb.starts_with("Enter") {
+                ACCENT_CORAL
+            } else {
+                ACCENT_GREEN
+            }),
+        )));
+    }
+
+    lines.push(TextLine::from(""));
+    lines.push(TextLine::from(Span::styled(
+        "  [↑/↓] Field   [←/→/Space] Toggle   [Enter] Apply & Recompute   [Esc] Close",
+        Style::default().fg(TEXT_MUTED),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(modal_block("Optics & Baseline Parameters [O]", ACCENT_AQUA)),
+        rect,
+    );
+}
+
 fn help_guide_lines() -> Vec<TextLine<'static>> {
     let section = |title: &'static str| {
         TextLine::from(Span::styled(
@@ -3422,7 +3577,7 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   4 UV-Vis       nm (ascending), Abs/%T, Tauc band gap, Beer–Lambert,"),
         TextLine::from("                  photon energy (eV), solution colour and library matching."),
         TextLine::from("   5 Solvents     Searchable solvent/impurity shifts with editable tolerance."),
-        TextLine::from("   6 Polymer Lab  Conversion, NMR Mn/DPn, tacticity, PVDF F(β), PU H-bond."),
+        TextLine::from("   6 Polymer Lab  Conversion, NMR Mn/DPn, tacticity, PVDF F(β), PU H-bond (with k_ε)."),
         TextLine::from("                  Calculators assist interpretation; verify against your method."),
         TextLine::from(""),
         section("  NAVIGATION & MOUSE"),
@@ -3442,6 +3597,7 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   m                Savitzky-Golay smoothing: OFF → 5 → 9 → 15 points"),
         TextLine::from("   w                Normalization: OFF → MinMax → SNV → Area"),
         TextLine::from("   A                ATR crystal (diamond/ZnSe/Ge/Si) and Kubelka–Munk optics"),
+        TextLine::from("   O                Optics & Baseline config: ATR n₂/θ presets + unbiased baseline clamp"),
         TextLine::from("   t                Derivative: Raw → 1st → 2nd"),
         TextLine::from("   C                FTIR atmospheric CO₂ suppression (2280–2410 cm⁻¹)"),
         TextLine::from("   s                Overlay ↔ stacked-offset layout"),
@@ -3458,8 +3614,8 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("                           ratios straight into Polymer Lab."),
         TextLine::from("   X  X-Axis Calibration   Snap an observed peak to TMS, solvent residual,"),
         TextLine::from("                           polystyrene 1601.4 cm⁻¹ or holmium oxide."),
-        TextLine::from("   M  Library Matcher      HQI ranking; [m] toggles single ↔ NNLS mixture (1–3)."),
-        TextLine::from("                           Enter overlays hits, [c] copies the report."),
+        TextLine::from("   M  Library Matcher      HQI ranking; [m] toggles single ↔ NNLS mixture (1–3);"),
+        TextLine::from("                           [r] toggles r (linear) vs r² (OMNIC); Enter overlays, [c] copies."),
         TextLine::from(""),
         section("  FILES"),
         TextLine::from("   f / F            File browser: replace workspace / append overlay"),

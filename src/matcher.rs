@@ -20,7 +20,7 @@ use crate::data::{
 };
 use crate::io::load_spectrum_file;
 use crate::processing::{
-    asls_baseline, process_trace, savitzky_golay, savitzky_golay_deriv1, BaselineMode,
+    asls_baseline_ex, process_trace, savitzky_golay, savitzky_golay_deriv1, BaselineMode,
     ProcessConfig, SmoothLevel, YAxisPreference,
 };
 
@@ -60,6 +60,7 @@ pub struct LibraryMatch {
     pub short: String,
     pub source: String,
     pub hqi_pct: f64,
+    pub hqi_r2_pct: f64,
     pub r_abs: f64,
     pub r_deriv: f64,
     pub is_builtin: bool,
@@ -220,7 +221,7 @@ fn prepare_ftir(spec: &Spectrum, cfg: ProcessConfig) -> Option<(Vec<f64>, Vec<f6
     if xs.len() < 2 {
         return None;
     }
-    let corrected = asls_baseline(&raw, 1e6, 0.01, 8);
+    let corrected = asls_baseline_ex(&raw, 1e6, 0.01, 8, true);
     let g = grid_ftir();
     interpolate_and_normalize(&xs, &corrected, &g, MIN_POINTS)
 }
@@ -240,7 +241,7 @@ fn prepare_uvvis(spec: &Spectrum, cfg: ProcessConfig) -> Option<(Vec<f64>, Vec<f
     if xs.len() < 2 {
         return None;
     }
-    let corrected = asls_baseline(&raw, 5e5, 0.01, 8);
+    let corrected = asls_baseline_ex(&raw, 5e5, 0.01, 8, true);
     let g = grid_uvvis();
     interpolate_and_normalize(&xs, &corrected, &g, UVVIS_MIN_POINTS)
 }
@@ -260,7 +261,7 @@ fn prepare_nmr(spec: &Spectrum, cfg: ProcessConfig, g: &[f64]) -> Option<(Vec<f6
     if xs.len() < 2 {
         return None;
     }
-    let corrected = asls_baseline(&raw, 5e5, 0.005, 8);
+    let corrected = asls_baseline_ex(&raw, 5e5, 0.005, 8, true);
     interpolate_and_normalize(&xs, &corrected, g, NMR_MIN_POINTS)
 }
 
@@ -661,7 +662,7 @@ fn score_ftir_pair(
     c_val: &[f32],
     c_der: &[f32],
     g: &[f64],
-) -> Option<(f64, f64, f64)> {
+) -> Option<(f64, f64, f64, f64)> {
     let n = g
         .len()
         .min(q_val.len())
@@ -704,8 +705,10 @@ fn score_ftir_pair(
     let overlap_ratio = (abs_acc.n as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
     let cov_factor = 0.55 + 0.45 * overlap_ratio;
     let hqi_pct = (0.35 * r_abs + 0.40 * r_deriv + 0.25 * r_fp) * cov_factor * 100.0;
+    let hqi_r2_pct =
+        (0.35 * r_abs * r_abs + 0.40 * r_deriv * r_deriv + 0.25 * r_fp * r_fp) * cov_factor * 100.0;
 
-    Some((hqi_pct, r_abs, r_deriv))
+    Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv))
 }
 
 fn score_uvvis_pair(
@@ -713,7 +716,7 @@ fn score_uvvis_pair(
     q_der: &[f64],
     c_val: &[f32],
     c_der: &[f32],
-) -> Option<(f64, f64, f64)> {
+) -> Option<(f64, f64, f64, f64)> {
     let n = q_val
         .len()
         .min(q_der.len())
@@ -746,8 +749,9 @@ fn score_uvvis_pair(
     let overlap_ratio = (abs_acc.n as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
     let cov_factor = 0.60 + 0.40 * overlap_ratio;
     let hqi_pct = (0.60 * r_abs + 0.40 * r_deriv) * cov_factor * 100.0;
+    let hqi_r2_pct = (0.60 * r_abs * r_abs + 0.40 * r_deriv * r_deriv) * cov_factor * 100.0;
 
-    Some((hqi_pct, r_abs, r_deriv))
+    Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv))
 }
 
 fn score_nmr_pair(
@@ -756,7 +760,7 @@ fn score_nmr_pair(
     c_val: &[f32],
     c_der: &[f32],
     masked: &[bool],
-) -> Option<(f64, f64, f64)> {
+) -> Option<(f64, f64, f64, f64)> {
     let n = masked
         .len()
         .min(q_val.len())
@@ -793,8 +797,9 @@ fn score_nmr_pair(
     let overlap_ratio = (abs_acc.n as f64 / q_valid.max(1) as f64).clamp(0.0, 1.0);
     let cov_factor = 0.60 + 0.40 * overlap_ratio;
     let hqi_pct = (0.65 * r_abs + 0.35 * r_deriv) * cov_factor * 100.0;
+    let hqi_r2_pct = (0.65 * r_abs * r_abs + 0.35 * r_deriv * r_deriv) * cov_factor * 100.0;
 
-    Some((hqi_pct, r_abs, r_deriv))
+    Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv))
 }
 
 // ============================================================================
@@ -821,7 +826,8 @@ pub fn match_ftir_library(query: &Spectrum, cfg: ProcessConfig) -> Vec<LibraryMa
         };
         let cv32 = to_f32_vec(&c_val);
         let cd32 = to_f32_vec(&c_der);
-        let Some((hqi_pct, r_abs, r_deriv)) = score_ftir_pair(&q_val, &q_der, &cv32, &cd32, &g)
+        let Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv)) =
+            score_ftir_pair(&q_val, &q_der, &cv32, &cd32, &g)
         else {
             continue;
         };
@@ -830,6 +836,7 @@ pub fn match_ftir_library(query: &Spectrum, cfg: ProcessConfig) -> Vec<LibraryMa
             short: poly.short.to_string(),
             source: "Built-in".to_string(),
             hqi_pct,
+            hqi_r2_pct,
             r_abs,
             r_deriv,
             is_builtin: true,
@@ -838,7 +845,7 @@ pub fn match_ftir_library(query: &Spectrum, cfg: ProcessConfig) -> Vec<LibraryMa
     }
 
     for entry in cached_library_entries(SpectrumKind::Ftir) {
-        let Some((hqi_pct, r_abs, r_deriv)) =
+        let Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv)) =
             score_ftir_pair(&q_val, &q_der, &entry.vals, &entry.deriv, &g)
         else {
             continue;
@@ -848,6 +855,7 @@ pub fn match_ftir_library(query: &Spectrum, cfg: ProcessConfig) -> Vec<LibraryMa
             short: entry.short,
             source: entry.source,
             hqi_pct,
+            hqi_r2_pct,
             r_abs,
             r_deriv,
             is_builtin: false,
@@ -885,7 +893,7 @@ pub fn match_uvvis_library(query: &Spectrum, cfg: ProcessConfig) -> Vec<LibraryM
             };
             let cv32 = to_f32_vec(&c_val);
             let cd32 = to_f32_vec(&c_der);
-            let Some((hqi_pct, r_abs, r_deriv)) =
+            let Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv)) =
                 score_uvvis_pair(&q_val, &q_der, &cv32, &cd32)
             else {
                 continue;
@@ -901,6 +909,7 @@ pub fn match_uvvis_library(query: &Spectrum, cfg: ProcessConfig) -> Vec<LibraryM
                     .to_string(),
                 source: "Built-in".to_string(),
                 hqi_pct,
+                hqi_r2_pct,
                 r_abs,
                 r_deriv,
                 is_builtin: true,
@@ -910,7 +919,7 @@ pub fn match_uvvis_library(query: &Spectrum, cfg: ProcessConfig) -> Vec<LibraryM
     }
 
     for entry in cached_library_entries(SpectrumKind::UvVis) {
-        let Some((hqi_pct, r_abs, r_deriv)) =
+        let Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv)) =
             score_uvvis_pair(&q_val, &q_der, &entry.vals, &entry.deriv)
         else {
             continue;
@@ -920,6 +929,7 @@ pub fn match_uvvis_library(query: &Spectrum, cfg: ProcessConfig) -> Vec<LibraryM
             short: entry.short,
             source: entry.source,
             hqi_pct,
+            hqi_r2_pct,
             r_abs,
             r_deriv,
             is_builtin: false,
@@ -995,7 +1005,7 @@ pub fn match_nmr_library(
         };
         let cv32 = to_f32_vec(&c_val);
         let cd32 = to_f32_vec(&c_der);
-        let Some((hqi_pct, r_abs, r_deriv)) =
+        let Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv)) =
             score_nmr_pair(&q_val, &q_der, &cv32, &cd32, &masked)
         else {
             continue;
@@ -1005,6 +1015,7 @@ pub fn match_nmr_library(
             short: poly.short.to_string(),
             source: "Built-in".to_string(),
             hqi_pct,
+            hqi_r2_pct,
             r_abs,
             r_deriv,
             is_builtin: true,
@@ -1013,7 +1024,7 @@ pub fn match_nmr_library(
     }
 
     for entry in cached_library_entries(query.kind) {
-        let Some((hqi_pct, r_abs, r_deriv)) =
+        let Some((hqi_pct, hqi_r2_pct, r_abs, r_deriv)) =
             score_nmr_pair(&q_val, &q_der, &entry.vals, &entry.deriv, &masked)
         else {
             continue;
@@ -1023,6 +1034,7 @@ pub fn match_nmr_library(
             short: entry.short,
             source: entry.source,
             hqi_pct,
+            hqi_r2_pct,
             r_abs,
             r_deriv,
             is_builtin: false,

@@ -170,6 +170,12 @@ pub struct ProcessConfig {
     pub optics: OpticsMode,
     pub deriv: DerivOrder,
     pub atm_co2: bool,
+    /// Optional non-negative clipping after baseline subtraction (default: false = unbiased signed residuals)
+    pub clamp_non_negative: bool,
+    /// ATR sample refractive index scaled by 1000 (default: 1500 => n_sample = 1.500)
+    pub atr_n_sample_milli: u16,
+    /// ATR incidence angle in tenths of a degree (default: 450 => theta = 45.0 deg)
+    pub atr_angle_deci_deg: u16,
 }
 
 impl Default for ProcessConfig {
@@ -182,6 +188,9 @@ impl Default for ProcessConfig {
             optics: OpticsMode::Off,
             deriv: DerivOrder::Raw,
             atm_co2: false,
+            clamp_non_negative: false,
+            atr_n_sample_milli: 1500,
+            atr_angle_deci_deg: 450,
         }
     }
 }
@@ -192,6 +201,14 @@ impl ProcessConfig {
             y_pref: YAxisPreference::Swapped,
             ..Self::default()
         }
+    }
+
+    pub fn atr_n_sample(self) -> f64 {
+        (self.atr_n_sample_milli as f64 / 1000.0).clamp(1.10, 2.50)
+    }
+
+    pub fn atr_angle_deg(self) -> f64 {
+        (self.atr_angle_deci_deg as f64 / 10.0).clamp(20.0, 80.0)
     }
 }
 
@@ -320,7 +337,16 @@ pub fn savitzky_golay_deriv2(ys: &[f64], win15: bool) -> Vec<f64> {
     out
 }
 
-/// Physical Savitzky-Golay spectral derivative scaled by median |Δx|.
+/// Verify that an X-axis vector is strictly ascending and finite.
+#[allow(dead_code)]
+pub fn is_strictly_ascending(xs: &[f64]) -> bool {
+    xs.len() >= 2
+        && xs
+            .windows(2)
+            .all(|w| w[0].is_finite() && w[1].is_finite() && w[0] < w[1])
+}
+
+/// Physical Savitzky-Golay spectral derivative scaled by signed median Δx.
 pub fn spectral_derivative(xs: &[f64], ys: &[f64], order: DerivOrder) -> Vec<f64> {
     if order == DerivOrder::Raw {
         return ys.to_vec();
@@ -331,8 +357,8 @@ pub fn spectral_derivative(xs: &[f64], ys: &[f64], order: DerivOrder) -> Vec<f64
     }
     let mut dxs: Vec<f64> = xs[..n]
         .windows(2)
-        .map(|w| (w[1] - w[0]).abs())
-        .filter(|&d| d > 1e-12)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d.abs() > 1e-12)
         .collect();
     let dx = if dxs.is_empty() {
         1.0
@@ -344,7 +370,7 @@ pub fn spectral_derivative(xs: &[f64], ys: &[f64], order: DerivOrder) -> Vec<f64
         DerivOrder::Raw => ys.to_vec(),
         DerivOrder::First => {
             let d1 = savitzky_golay_deriv1(&ys[..n]);
-            if dx > 1e-9 {
+            if dx.abs() > 1e-9 {
                 d1.into_iter().map(|v| v / dx).collect()
             } else {
                 d1
@@ -352,7 +378,7 @@ pub fn spectral_derivative(xs: &[f64], ys: &[f64], order: DerivOrder) -> Vec<f64
         }
         DerivOrder::Second => {
             let d2 = savitzky_golay_deriv2(&ys[..n], n > 600);
-            if dx > 1e-9 {
+            if dx.abs() > 1e-9 {
                 let dx2 = dx * dx;
                 d2.into_iter().map(|v| v / dx2).collect()
             } else {
@@ -433,7 +459,13 @@ fn pentadiag_ldlt_solve(w: &[f64], ys: &[f64], lam: f64) -> Vec<f64> {
 /// Eilers & Boelens (2005) Asymmetric Least Squares (AsLS) baseline correction.
 /// Solves `(W + λ D₂ᵀD₂) z = W y` in O(N) via symmetric pentadiagonal LDLᵀ factorization.
 /// `base_lambda` is auto-scaled by `(n / 1800)⁴` for sampling-density invariance.
-pub fn asls_baseline(ys: &[f64], base_lambda: f64, p: f64, n_iter: usize) -> Vec<f64> {
+pub fn asls_baseline_ex(
+    ys: &[f64],
+    base_lambda: f64,
+    p: f64,
+    n_iter: usize,
+    clamp_non_negative: bool,
+) -> Vec<f64> {
     let n = ys.len();
     if n < 5 {
         return ys.to_vec();
@@ -450,11 +482,25 @@ pub fn asls_baseline(ys: &[f64], base_lambda: f64, p: f64, n_iter: usize) -> Vec
         }
     }
 
-    ys.iter().zip(&z).map(|(&y, &b)| (y - b).max(0.0)).collect()
+    ys.iter()
+        .zip(&z)
+        .map(|(&y, &b)| if clamp_non_negative { (y - b).max(0.0) } else { y - b })
+        .collect()
+}
+
+#[allow(dead_code)]
+pub fn asls_baseline(ys: &[f64], base_lambda: f64, p: f64, n_iter: usize) -> Vec<f64> {
+    asls_baseline_ex(ys, base_lambda, p, n_iter, false)
 }
 
 /// Baek et al. (Analyst 2015, 140, 250) asymmetrically reweighted Penalized Least Squares (arPLS).
-pub fn arpls_baseline(ys: &[f64], base_lambda: f64, ratio: f64, max_iter: usize) -> Vec<f64> {
+pub fn arpls_baseline_ex(
+    ys: &[f64],
+    base_lambda: f64,
+    ratio: f64,
+    max_iter: usize,
+    clamp_non_negative: bool,
+) -> Vec<f64> {
     let n = ys.len();
     if n < 5 {
         return ys.to_vec();
@@ -511,12 +557,25 @@ pub fn arpls_baseline(ys: &[f64], base_lambda: f64, ratio: f64, max_iter: usize)
             break;
         }
     }
-    ys.iter().zip(&z).map(|(&y, &b)| (y - b).max(0.0)).collect()
+    ys.iter()
+        .zip(&z)
+        .map(|(&y, &b)| if clamp_non_negative { (y - b).max(0.0) } else { y - b })
+        .collect()
+}
+
+#[allow(dead_code)]
+pub fn arpls_baseline(ys: &[f64], base_lambda: f64, ratio: f64, max_iter: usize) -> Vec<f64> {
+    arpls_baseline_ex(ys, base_lambda, ratio, max_iter, false)
 }
 
 /// Bruker OPUS-style Rubberband (Convex Hull) Baseline Correction.
 /// `upper = true` for %Transmittance (peaks point down), `false` for Absorbance/NMR (peaks point up).
-pub fn rubberband_baseline(xs: &[f64], ys: &[f64], upper: bool) -> Vec<f64> {
+pub fn rubberband_baseline_ex(
+    xs: &[f64],
+    ys: &[f64],
+    upper: bool,
+    clamp_non_negative: bool,
+) -> Vec<f64> {
     let n = xs.len().min(ys.len());
     if n < 3 {
         return ys.to_vec();
@@ -566,9 +625,14 @@ pub fn rubberband_baseline(xs: &[f64], ys: &[f64], upper: bool) -> Vec<f64> {
         // Shift Absorbance/NMR so rubberband baseline sits cleanly at 0
         ys.iter()
             .zip(&baseline)
-            .map(|(&y, &b)| (y - b).max(0.0))
+            .map(|(&y, &b)| if clamp_non_negative { (y - b).max(0.0) } else { y - b })
             .collect()
     }
+}
+
+#[allow(dead_code)]
+pub fn rubberband_baseline(xs: &[f64], ys: &[f64], upper: bool) -> Vec<f64> {
+    rubberband_baseline_ex(xs, ys, upper, false)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -702,6 +766,29 @@ fn kk_n_from_k(wn: &[f64], k: &[f64], n_inf: f64) -> Vec<f64> {
     }
 }
 
+/// Critical angle in degrees for total internal reflection: arcsin(n_sample / n1).
+pub fn atr_critical_angle_deg(n1: f64, n_sample: f64) -> Option<f64> {
+    if n1 <= 0.0 || n_sample <= 0.0 || n_sample >= n1 {
+        return None;
+    }
+    Some((n_sample / n1).asin().to_degrees())
+}
+
+/// Evanescent penetration depth d_p in micrometers at `wn_cm1` (e.g. 1000 cm⁻¹).
+/// Returns `None` if `theta_deg` is at or below the critical angle (no TIR).
+pub fn atr_penetration_depth_um(wn_cm1: f64, n1: f64, n_sample: f64, theta_deg: f64) -> Option<f64> {
+    if wn_cm1 <= 0.0 || n1 <= 0.0 || n_sample <= 0.0 {
+        return None;
+    }
+    let sin_th = theta_deg.to_radians().sin();
+    let n21 = n_sample / n1;
+    let rad_sq = sin_th * sin_th - n21 * n21;
+    if rad_sq <= 1e-6 {
+        return None;
+    }
+    Some((10_000.0 / wn_cm1) / (2.0 * std::f64::consts::PI * n1 * rad_sq.sqrt()))
+}
+
 /// Advanced ATR-to-Transmission correction (Fresnel + Kramers-Kronig anomalous dispersion +
 /// Harrick penetration depth scaling). Input & output are in linear Absorbance units.
 pub fn advanced_atr_correction(
@@ -717,6 +804,9 @@ pub fn advanced_atr_correction(
     }
     let th = theta_deg.to_radians();
     let (s, c) = (th.sin(), th.cos());
+    if n1 * s <= n_sample + 0.02 {
+        return abs_ys.to_vec();
+    }
     let n21 = n_sample / n1;
     let rad = (s * s - n21 * n21).max(1e-6).sqrt();
     let de_perp = n21 * c / (std::f64::consts::PI * n1 * (1.0 - n21 * n21) * rad);
@@ -738,7 +828,7 @@ pub fn advanced_atr_correction(
         .iter()
         .map(|&a| (a / scale_k.max(1e-6)).clamp(0.0, k_limit))
         .collect();
-    let n_cap = n1 * s * 0.992;
+    let n_cap = (n1 * s * 0.992).max(1.06);
 
     for _ in 0..8 {
         let n_est = kk_n_from_k(&wn[..n], &k_est, n_sample);
@@ -828,7 +918,7 @@ pub fn process_trace(spec: &Spectrum, cfg: ProcessConfig) -> (Vec<f64>, Vec<f64>
             }
             _ => spec.y.clone(),
         };
-        let corr = advanced_atr_correction(&xs, &abs, n1, 1.50, 45.0);
+        let corr = advanced_atr_correction(&xs, &abs, n1, cfg.atr_n_sample(), cfg.atr_angle_deg());
         if cfg.y_pref == YAxisPreference::Native
             && cfg.deriv == DerivOrder::Raw
             && !matches!(cfg.norm, NormMode::VectorSnv | NormMode::Area)
@@ -902,17 +992,25 @@ pub fn process_trace(spec: &Spectrum, cfg: ProcessConfig) -> (Vec<f64>, Vec<f64>
         if y_unit == YUnit::Transmittance {
             let abs: Vec<f64> = ys.iter().copied().map(transmittance_to_absorbance).collect();
             let corr = match cfg.baseline {
-                BaselineMode::Rubberband => rubberband_baseline(&xs, &abs, false),
-                BaselineMode::Asls => asls_baseline(&abs, lam, 0.01, 10),
-                BaselineMode::Arpls => arpls_baseline(&abs, lam, 1e-3, 40),
+                BaselineMode::Rubberband => {
+                    rubberband_baseline_ex(&xs, &abs, false, cfg.clamp_non_negative)
+                }
+                BaselineMode::Asls => asls_baseline_ex(&abs, lam, 0.01, 10, cfg.clamp_non_negative),
+                BaselineMode::Arpls => {
+                    arpls_baseline_ex(&abs, lam, 1e-3, 40, cfg.clamp_non_negative)
+                }
                 BaselineMode::Off => abs,
             };
             ys = corr.into_iter().map(absorbance_to_transmittance).collect();
         } else {
             ys = match cfg.baseline {
-                BaselineMode::Rubberband => rubberband_baseline(&xs, &ys, false),
-                BaselineMode::Asls => asls_baseline(&ys, lam, 0.01, 10),
-                BaselineMode::Arpls => arpls_baseline(&ys, lam, 1e-3, 40),
+                BaselineMode::Rubberband => {
+                    rubberband_baseline_ex(&xs, &ys, false, cfg.clamp_non_negative)
+                }
+                BaselineMode::Asls => asls_baseline_ex(&ys, lam, 0.01, 10, cfg.clamp_non_negative),
+                BaselineMode::Arpls => {
+                    arpls_baseline_ex(&ys, lam, 1e-3, 40, cfg.clamp_non_negative)
+                }
                 BaselineMode::Off => ys,
             };
         }
@@ -1173,8 +1271,17 @@ pub fn detect_peaks(
     chosen
 }
 
-/// Returns (baseline-corrected integrated area, baseline-corrected peak height) on Absorbance/Intensity
-pub fn integrate_region(xs: &[f64], ys: &[f64], x_lo: f64, x_hi: f64) -> Option<(f64, f64)> {
+/// Local linear-baseline-corrected trapezoidal integration.
+/// When `clamp_negative == false` (recommended unbiased default), signed noise
+/// fluctuations around the local baseline cancel symmetrically instead of creating
+/// a positive area bias.
+pub fn integrate_region_ex(
+    xs: &[f64],
+    ys: &[f64],
+    x_lo: f64,
+    x_hi: f64,
+    clamp_negative: bool,
+) -> Option<(f64, f64)> {
     if xs.len() < 2 || x_lo >= x_hi {
         return None;
     }
@@ -1191,16 +1298,25 @@ pub fn integrate_region(xs: &[f64], ys: &[f64], x_lo: f64, x_hi: f64) -> Option<
     let span_x = (x_b - x_a).max(1e-12);
 
     let mut area = 0.0;
-    let mut max_h = 0.0_f64;
+    let mut max_h = f64::NEG_INFINITY;
     for k in i0..i1 {
         let base0 = y_a + (y_b - y_a) * ((xs[k] - x_a) / span_x);
         let base1 = y_a + (y_b - y_a) * ((xs[k + 1] - x_a) / span_x);
-        let h0 = (ys[k] - base0).max(0.0);
-        let h1 = (ys[k + 1] - base1).max(0.0);
+        let mut h0 = ys[k] - base0;
+        let mut h1 = ys[k + 1] - base1;
+        if clamp_negative {
+            h0 = h0.max(0.0);
+            h1 = h1.max(0.0);
+        }
         max_h = max_h.max(h0).max(h1);
         area += 0.5 * (h0 + h1) * (xs[k + 1] - xs[k]);
     }
-    Some((area, max_h))
+    Some((area, max_h.max(0.0)))
+}
+
+/// Returns (baseline-corrected integrated area, baseline-corrected peak height) on Absorbance/Intensity
+pub fn integrate_region(xs: &[f64], ys: &[f64], x_lo: f64, x_hi: f64) -> Option<(f64, f64)> {
+    integrate_region_ex(xs, ys, x_lo, x_hi, false)
 }
 
 // ============================================================================
@@ -1494,23 +1610,43 @@ pub fn pvdf_beta_fraction(a_840: f64, a_763: f64) -> Option<f64> {
 pub struct HydrogenBondIndex {
     pub a_bonded: f64,
     pub a_free: f64,
+    pub eps_ratio: f64, // k_eps = eps_bonded / eps_free (1.0 = equal extinction)
     pub hbi: f64,
     pub bonded_pct: f64,
 }
 
-/// Polyurethane carbonyl hydrogen-bonding index:
-/// `HBI = A_1703 / A_1732` and bonded fraction `= HBI / (1 + HBI) × 100%`
-pub fn pu_hydrogen_bond_index(a_1703: f64, a_1732: f64) -> Option<HydrogenBondIndex> {
-    if !a_1703.is_finite() || !a_1732.is_finite() || a_1703 < 0.0 || a_1732 <= 1e-12 {
+/// Polyurethane carbonyl hydrogen-bonding index with configurable extinction ratio
+/// `eps_ratio = ε_bonded / ε_free` (1.0 default; ~1.20–1.45 in polymer literature):
+/// `HBI = A_1703 / A_1732`, `Bonded% = HBI / (eps_ratio + HBI) × 100%`.
+pub fn pu_hydrogen_bond_index_with_ratio(
+    a_1703: f64,
+    a_1732: f64,
+    eps_ratio: f64,
+) -> Option<HydrogenBondIndex> {
+    if !a_1703.is_finite()
+        || !a_1732.is_finite()
+        || !eps_ratio.is_finite()
+        || a_1703 < 0.0
+        || a_1732 <= 1e-12
+        || eps_ratio <= 1e-6
+    {
         return None;
     }
     let hbi = a_1703 / a_1732;
     Some(HydrogenBondIndex {
         a_bonded: a_1703,
         a_free: a_1732,
+        eps_ratio,
         hbi,
-        bonded_pct: (hbi / (1.0 + hbi) * 100.0).clamp(0.0, 100.0),
+        bonded_pct: (hbi / (eps_ratio + hbi) * 100.0).clamp(0.0, 100.0),
     })
+}
+
+/// Polyurethane carbonyl hydrogen-bonding index (default equal extinction `eps_ratio = 1.0`):
+/// `HBI = A_1703 / A_1732` and bonded fraction `= HBI / (1 + HBI) × 100%`
+#[allow(dead_code)]
+pub fn pu_hydrogen_bond_index(a_1703: f64, a_1732: f64) -> Option<HydrogenBondIndex> {
+    pu_hydrogen_bond_index_with_ratio(a_1703, a_1732, 1.0)
 }
 
 // ============================================================================
