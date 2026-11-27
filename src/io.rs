@@ -1031,9 +1031,8 @@ fn push_unique_dir(out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: Pat
     }
 }
 
-/// Directories scanned for reference spectra, resolved relative to the binary,
-/// the manifest, `SPECTRA_HOME`, and the current working directory.
-pub fn library_roots() -> Vec<PathBuf> {
+/// Base directories that may contain a `library/` tree, in lookup order.
+fn candidate_bases() -> Vec<PathBuf> {
     let mut bases: Vec<PathBuf> = Vec::new();
     if let Ok(home) = std::env::var("SPECTRA_HOME") {
         if !home.trim().is_empty() {
@@ -1053,16 +1052,236 @@ pub fn library_roots() -> Vec<PathBuf> {
     if let Ok(cwd) = std::env::current_dir() {
         bases.push(cwd);
     }
+    bases
+}
 
+/// Directories scanned for reference spectra, resolved relative to the binary,
+/// the manifest, `SPECTRA_HOME`, and the current working directory.
+pub fn library_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
-    for base in bases {
+    for base in candidate_bases() {
         push_unique_dir(&mut roots, &mut seen, base.join("library/ftir"));
         push_unique_dir(&mut roots, &mut seen, base.join("library/nmr"));
         push_unique_dir(&mut roots, &mut seen, base.join("library/uvvis"));
         push_unique_dir(&mut roots, &mut seen, base.join("samples"));
     }
     roots
+}
+
+/// Canonical `library/` directory used for installed-pack inspection and downloads.
+pub fn library_base_dir() -> PathBuf {
+    for base in candidate_bases() {
+        let lib = base.join("library");
+        if lib.is_dir() {
+            return lib;
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("library")
+}
+
+/// One downloadable reference-library pack shown in the Library Manager.
+#[derive(Debug, Clone, Copy)]
+pub struct LibraryPackInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub modality: &'static str,
+    pub subfolder: &'static str,
+    pub spectra_est: &'static str,
+    pub size_est: &'static str,
+    pub institution: &'static str,
+    pub default_checked: bool,
+}
+
+pub const LIBRARY_PACKS: &[LibraryPackInfo] = &[
+    LibraryPackInfo {
+        id: "nist_ftir",
+        name: "NIST WebBook (Organics & Monomers)",
+        modality: "FTIR",
+        subfolder: "ftir",
+        spectra_est: "~180",
+        size_est: "~5 MB",
+        institution: "NIST (USA)",
+        default_checked: true,
+    },
+    LibraryPackInfo {
+        id: "flopp_ftir",
+        name: "FLOPP & FLOPP-e (Polymers ATR)",
+        modality: "FTIR",
+        subfolder: "ftir",
+        spectra_est: "381",
+        size_est: "~11 MB",
+        institution: "Univ. of Toronto",
+        default_checked: true,
+    },
+    LibraryPackInfo {
+        id: "uvvis_pack",
+        name: "PhotochemCAD + NIST UV-Vis",
+        modality: "UV-Vis",
+        subfolder: "uvvis",
+        spectra_est: "~189",
+        size_est: "~2 MB",
+        institution: "NC State / OMLC / NIST",
+        default_checked: true,
+    },
+    LibraryPackInfo {
+        id: "rruff_ir",
+        name: "RRUFF Minerals & Inorganics",
+        modality: "FTIR",
+        subfolder: "ftir",
+        spectra_est: "~1,200+",
+        size_est: "14 MB",
+        institution: "Univ. of Arizona",
+        default_checked: false,
+    },
+    LibraryPackInfo {
+        id: "toffolo_ir",
+        name: "Toffolo Materials (Trans + ATR)",
+        modality: "FTIR",
+        subfolder: "ftir",
+        spectra_est: "~150+",
+        size_est: "23 MB",
+        institution: "CENIEH (Spain)",
+        default_checked: false,
+    },
+    LibraryPackInfo {
+        id: "infra_art",
+        name: "INFRA-ART (Resins, Pigments, Waxes)",
+        modality: "FTIR",
+        subfolder: "ftir",
+        spectra_est: "1,085",
+        size_est: "39 MB",
+        institution: "INOE 2000 (Romania)",
+        default_checked: false,
+    },
+    LibraryPackInfo {
+        id: "mnhn_paris",
+        name: "MNHN Paris (Minerals + Organics)",
+        modality: "FTIR",
+        subfolder: "ftir",
+        spectra_est: "~450+",
+        size_est: "48 MB",
+        institution: "MNHN Paris (France)",
+        default_checked: false,
+    },
+    LibraryPackInfo {
+        id: "zenodo_plastics",
+        name: "FTIR-Plastics (6 Industrial Polymers)",
+        modality: "FTIR",
+        subfolder: "ftir",
+        spectra_est: "18 master",
+        size_est: "~250 MB",
+        institution: "TecNM Toluca / UAEMex",
+        default_checked: false,
+    },
+    LibraryPackInfo {
+        id: "nmrshiftdb2",
+        name: "nmrshiftdb2 (¹H & ¹³C NMR + 58k SDF)",
+        modality: "NMR",
+        subfolder: "nmr",
+        spectra_est: "~68 (+58k)",
+        size_est: "159 MB",
+        institution: "Univ. of Cologne",
+        default_checked: false,
+    },
+];
+
+/// True when `filename` inside `subfolder` belongs to `pack_id`.
+pub fn file_matches_pack(pack_id: &str, subfolder: &str, filename: &str) -> bool {
+    let name = filename.to_ascii_lowercase();
+    match pack_id {
+        "nist_ftir" => {
+            subfolder == "ftir"
+                && (name.ends_with("_nist.jdx") || name.starts_with("org_nist_"))
+        }
+        "flopp_ftir" => subfolder == "ftir" && name.starts_with("poly_flopp_"),
+        "uvvis_pack" => {
+            subfolder == "uvvis"
+                && (name.starts_with("pcad_") || name.starts_with("nist_uv_"))
+        }
+        "rruff_ir" => subfolder == "ftir" && name.starts_with("inorg_rruff_"),
+        "toffolo_ir" => subfolder == "ftir" && name.starts_with("mat_toffolo_"),
+        "infra_art" => subfolder == "ftir" && name.starts_with("mat_infra_"),
+        "mnhn_paris" => subfolder == "ftir" && name.contains("_mnhn_"),
+        "zenodo_plastics" => subfolder == "ftir" && name.contains("_real_"),
+        "nmrshiftdb2" => {
+            subfolder == "nmr" && (name.ends_with("_1h.csv") || name.ends_with("_13c.csv"))
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InstalledPackStatus {
+    pub count: usize,
+    pub bytes: u64,
+}
+
+/// Inspect `library/ftir`, `library/nmr`, and `library/uvvis` and report how
+/// many files (and bytes) each known pack currently occupies.
+pub fn detect_installed_packs() -> Vec<InstalledPackStatus> {
+    let base = library_base_dir();
+    LIBRARY_PACKS
+        .iter()
+        .map(|pack| {
+            let dir = base.join(pack.subfolder);
+            let mut status = InstalledPackStatus::default();
+            let Ok(rd) = fs::read_dir(&dir) else {
+                return status;
+            };
+            for item in rd.flatten() {
+                let path = item.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !path.is_file() || !file_matches_pack(pack.id, pack.subfolder, name) {
+                    continue;
+                }
+                status.count += 1;
+                if let Ok(meta) = item.metadata() {
+                    status.bytes += meta.len();
+                }
+            }
+            status
+        })
+        .collect()
+}
+
+/// Delete only the files that belong to `pack_id`, refresh the library index,
+/// and return how many files were removed.
+pub fn uninstall_library_pack(pack_id: &str) -> Result<usize> {
+    let Some(pack) = LIBRARY_PACKS.iter().find(|p| p.id == pack_id) else {
+        return Err(anyhow!("Unknown library pack: {}", pack_id));
+    };
+    let dir = library_base_dir().join(pack.subfolder);
+    let mut removed = 0usize;
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for item in rd.flatten() {
+            let path = item.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_file() && file_matches_pack(pack.id, pack.subfolder, name) {
+                if fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    refresh_library_index();
+    Ok(removed)
+}
+
+/// Whether the user has already seen (and dismissed) the first-run wizard.
+pub fn has_seen_library_setup() -> bool {
+    state_base().join("setup_seen").is_file()
+}
+
+/// Record that the first-run wizard was shown. Best-effort only.
+pub fn mark_library_setup_seen() {
+    let base = state_base();
+    let _ = fs::create_dir_all(&base);
+    let _ = fs::write(base.join("setup_seen"), b"1\n");
 }
 
 fn infer_file_kind(path: &Path, stem: &str) -> SpectrumKind {

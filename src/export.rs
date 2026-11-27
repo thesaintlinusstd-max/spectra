@@ -1,6 +1,7 @@
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -348,6 +349,7 @@ pub fn open_exported_file(path: &Path) -> Result<()> {
 // Library Downloader Integration
 // ============================================================================
 
+#[allow(dead_code)]
 /// Run selected library download packs and return a summary string.
 /// Items are tuples of (script_name, args_as_single_string).
 /// Returns a clean summary with total files downloaded per pack.
@@ -413,6 +415,128 @@ pub fn run_library_downloads(items: &[(&str, &str)]) -> Result<String> {
     ));
     out.push_str(&summary_lines.join("\n"));
     Ok(out)
+}
+
+/// One live update from `python/library_manager.py`.
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    Progress {
+        pack_idx: usize,
+        total_packs: usize,
+        pack_id: String,
+        pct: f64,
+        detail: String,
+    },
+    Finished(std::result::Result<String, String>),
+}
+
+/// Parse `PROGRESS|idx|total|pack_id|pct|detail` into its components.
+pub fn parse_download_progress_line(line: &str) -> Option<(usize, usize, String, f64, String)> {
+    let rest = line.trim().strip_prefix("PROGRESS|")?;
+    let mut parts = rest.splitn(5, '|');
+    let pack_idx = parts.next()?.trim().parse::<usize>().ok()?;
+    let total_packs = parts.next()?.trim().parse::<usize>().ok()?;
+    let pack_id = parts.next()?.trim().to_string();
+    let pct = parts.next()?.trim().parse::<f64>().ok()?;
+    let detail = parts.next().unwrap_or("").trim().to_string();
+    Some((pack_idx, total_packs, pack_id, pct, detail))
+}
+
+/// Spawn `python/library_manager.py` and stream its machine-readable progress
+/// lines to the TUI without blocking the main thread.
+pub fn spawn_library_download_stream(
+    pack_ids: Vec<String>,
+) -> std::sync::mpsc::Receiver<DownloadEvent> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<String> {
+            let (python, script) = find_python_script("library_manager.py")?;
+            let mut child = Command::new(&python)
+                .arg("-u")
+                .arg(&script)
+                .arg("--packs")
+                .arg(pack_ids.join(","))
+                .arg("--lib-root")
+                .arg(crate::io::library_base_dir())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| {
+                    format!("Failed executing {} {}", python.display(), script.display())
+                })?;
+
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("library_manager.py produced no stdout"))?;
+            let stderr = child.stderr.take();
+            let stderr_handle = std::thread::spawn(move || {
+                let mut buf = String::new();
+                if let Some(mut err) = stderr {
+                    let _ = err.read_to_string(&mut buf);
+                }
+                buf
+            });
+
+            let mut summary: Option<String> = None;
+            let mut errors: Vec<String> = Vec::new();
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some((pack_idx, total_packs, pack_id, pct, detail)) =
+                    parse_download_progress_line(trimmed)
+                {
+                    let _ = tx.send(DownloadEvent::Progress {
+                        pack_idx,
+                        total_packs,
+                        pack_id,
+                        pct,
+                        detail,
+                    });
+                } else if let Some(rest) = trimmed.strip_prefix("DONE|") {
+                    let mut parts = rest.splitn(2, '|');
+                    let _added = parts.next().unwrap_or("0");
+                    summary = Some(
+                        parts
+                            .next()
+                            .unwrap_or("Library download complete")
+                            .to_string(),
+                    );
+                } else if let Some(rest) = trimmed.strip_prefix("ERROR|") {
+                    let mut parts = rest.splitn(2, '|');
+                    let _pack = parts.next().unwrap_or("");
+                    errors.push(parts.next().unwrap_or("unknown error").to_string());
+                }
+            }
+
+            let status = child
+                .wait()
+                .context("Failed waiting for library_manager.py")?;
+            let stderr_text = stderr_handle.join().unwrap_or_default();
+            crate::io::refresh_library_index();
+
+            if !status.success() {
+                let msg = if !errors.is_empty() {
+                    errors.join("; ")
+                } else if !stderr_text.trim().is_empty() {
+                    stderr_text.trim().to_string()
+                } else {
+                    format!("library_manager.py exited with {}", status)
+                };
+                return Err(anyhow!(msg));
+            }
+            if !errors.is_empty() {
+                return Err(anyhow!(errors.join("; ")));
+            }
+            Ok(summary.unwrap_or_else(|| "Library download complete".into()))
+        })();
+
+        let _ = tx.send(DownloadEvent::Finished(result.map_err(|e| e.to_string())));
+    });
+    rx
 }
 
 #[allow(dead_code)]

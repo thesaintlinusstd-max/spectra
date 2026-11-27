@@ -1485,8 +1485,126 @@ mod tests {
     }
 
     #[test]
-    fn test_version_is_0_7() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.7.2");
+    fn test_version_is_0_8() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.8.0");
+    }
+
+    #[test]
+    fn test_library_pack_catalog_and_file_matching() {
+        use std::collections::HashSet;
+
+        assert_eq!(crate::io::LIBRARY_PACKS.len(), 9);
+        let ids: HashSet<&str> = crate::io::LIBRARY_PACKS.iter().map(|p| p.id).collect();
+        assert_eq!(ids.len(), crate::io::LIBRARY_PACKS.len());
+
+        let cases = [
+            ("nist_ftir", "ftir", "org_nist_n_butane.jdx"),
+            ("flopp_ftir", "ftir", "poly_flopp_pe_01.csv"),
+            ("uvvis_pack", "uvvis", "pcad_041_beta_carotene.csv"),
+            ("rruff_ir", "ftir", "inorg_rruff_quartz.csv"),
+            ("toffolo_ir", "ftir", "mat_toffolo_calcite.csv"),
+            ("infra_art", "ftir", "mat_infra_ochre.csv"),
+            ("mnhn_paris", "ftir", "inorg_mnhn_calcite.jdx"),
+            ("zenodo_plastics", "ftir", "PET_real_c8_median.csv"),
+            ("nmrshiftdb2", "nmr", "styrene_1h.csv"),
+        ];
+        for (expected_pack, subfolder, filename) in cases {
+            assert!(
+                crate::io::file_matches_pack(expected_pack, subfolder, filename),
+                "{filename} should match {expected_pack}"
+            );
+            for pack in crate::io::LIBRARY_PACKS {
+                if pack.id != expected_pack {
+                    assert!(
+                        !crate::io::file_matches_pack(pack.id, subfolder, filename),
+                        "{filename} must not cross-match {}",
+                        pack.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_library_setup_state_defaults_and_toggle() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let st = crate::app::LibrarySetupState::new(false);
+        assert_eq!(st.checks.len(), crate::io::LIBRARY_PACKS.len());
+        assert_eq!(st.statuses.len(), crate::io::LIBRARY_PACKS.len());
+        for (i, pack) in crate::io::LIBRARY_PACKS.iter().enumerate() {
+            if st.statuses[i].count > 0 {
+                assert!(!st.checks[i], "installed pack {} must not be checked", pack.id);
+            } else if pack.default_checked {
+                assert!(st.checks[i], "missing starter pack {} should be checked", pack.id);
+            }
+        }
+
+        let mut app = App::new(vec![], None);
+        app.modal = crate::app::Modal::LibrarySetup(st);
+        let before = match &app.modal {
+            crate::app::Modal::LibrarySetup(state) => state.checks[0],
+            _ => unreachable!(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        match &app.modal {
+            crate::app::Modal::LibrarySetup(state) => assert_eq!(state.checks[0], !before),
+            _ => panic!("Library Manager modal closed while toggling"),
+        }
+    }
+
+    #[test]
+    fn test_progress_line_protocol_parsing() {
+        let (pack_idx, total_packs, pack_id, pct, detail) = crate::export::parse_download_progress_line(
+            "PROGRESS|2|3|flopp_ftir|64.5|Downloading 7.1/11.2 MB",
+        )
+        .expect("valid progress line");
+        assert_eq!(pack_idx, 2);
+        assert_eq!(total_packs, 3);
+        assert_eq!(pack_id, "flopp_ftir");
+        assert!((pct - 64.5).abs() < 1e-6);
+        assert_eq!(detail, "Downloading 7.1/11.2 MB");
+    }
+
+    #[test]
+    fn test_library_file_matching_rejects_unrelated_files() {
+        let negatives = [
+            ("nist_ftir", "nmr", "org_nist_n_butane.jdx"),
+            ("flopp_ftir", "ftir", "poly_other_pe_01.csv"),
+            ("uvvis_pack", "ftir", "pcad_041_beta_carotene.csv"),
+            ("rruff_ir", "ftir", "inorg_rruffish_quartz.csv"),
+            ("toffolo_ir", "ftir", "mat_infra_calcite.csv"),
+            ("infra_art", "ftir", "mat_toffolo_calcite.csv"),
+            ("mnhn_paris", "ftir", "mnhn_calcite.jdx"),
+            ("zenodo_plastics", "ftir", "PET_master.csv"),
+            ("nmrshiftdb2", "ftir", "styrene_1h.csv"),
+        ];
+        for (pack_id, subfolder, filename) in negatives {
+            assert!(
+                !crate::io::file_matches_pack(pack_id, subfolder, filename),
+                "{filename} must not match {pack_id} in {subfolder}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_library_setup_state_first_run_flag() {
+        assert!(crate::app::LibrarySetupState::new(true).is_first_run);
+        assert!(!crate::app::LibrarySetupState::new(false).is_first_run);
+    }
+
+    #[test]
+    fn test_progress_protocol_rejects_malformed_lines() {
+        for line in [
+            "DONE|4|complete",
+            "PROGRESS|x|3|nist_ftir|25|bad index",
+            "PROGRESS|1|3|nist_ftir|not-a-number|bad percent",
+        ] {
+            assert!(
+                crate::export::parse_download_progress_line(line).is_none(),
+                "malformed progress should be rejected: {line}"
+            );
+        }
     }
 
     #[test]

@@ -102,37 +102,48 @@ fn draw_topbar(frame: &mut Frame, app: &mut App, area: Rect) {
         left_spans.push(Span::raw(" "));
     }
 
-    let right_spans = if compact {
+    app.libs_btn_rect = None;
+    let badges: Vec<(&str, Color, bool)> = if compact {
         vec![
-            key_badge("[f]", ACCENT_AQUA),
-            Span::raw(" "),
-            key_badge("[e]", ACCENT_AMBER),
-            Span::raw(" "),
-            key_badge("[/]", ACCENT_YELLOW),
-            Span::raw(" "),
-            key_badge("[?]", ACCENT_GREEN),
-            Span::raw(" "),
-            key_badge("[q]", ACCENT_CORAL),
+            ("[f]", ACCENT_AQUA, false),
+            ("[e]", ACCENT_AMBER, false),
+            ("[/]", ACCENT_YELLOW, false),
+            ("[D]", ACCENT_GREEN, true),
+            ("[?]", ACCENT_GREEN, false),
+            ("[q]", ACCENT_CORAL, false),
         ]
     } else {
         vec![
-            key_badge("[f] Open", ACCENT_AQUA),
-            Span::raw(" "),
-            key_badge("[e] Export", ACCENT_AMBER),
-            Span::raw(" "),
-            key_badge("[/] Search", ACCENT_YELLOW),
-            Span::raw(" "),
-            key_badge("[?] Help", ACCENT_GREEN),
-            Span::raw(" "),
-            key_badge("[q] Quit", ACCENT_CORAL),
+            ("[f] Open", ACCENT_AQUA, false),
+            ("[e] Export", ACCENT_AMBER, false),
+            ("[/] Search", ACCENT_YELLOW, false),
+            ("[D] Libs", ACCENT_GREEN, true),
+            ("[?] Help", ACCENT_GREEN, false),
+            ("[q] Quit", ACCENT_CORAL, false),
         ]
     };
+    let mut right_spans: Vec<Span> = Vec::new();
+    let mut right_width = 0u16;
+    let mut libs_offset = 0u16;
+    let mut libs_width = 0u16;
+    for (i, (label, color, is_libs)) in badges.iter().enumerate() {
+        if i > 0 {
+            right_spans.push(Span::raw(" "));
+            right_width += 1;
+        }
+        if *is_libs {
+            libs_offset = right_width;
+            libs_width = label.chars().count() as u16 + 2;
+        }
+        right_spans.push(key_badge(label, *color));
+        right_width += label.chars().count() as u16 + 2;
+    }
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(40),
-            Constraint::Length(if compact { 28 } else { 60 }),
+            Constraint::Length(if compact { 36 } else { 70 }),
         ])
         .split(area);
 
@@ -141,6 +152,14 @@ fn draw_topbar(frame: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(TextLine::from(right_spans)).alignment(Alignment::Right),
         cols[1],
     );
+
+    if libs_width > 0 {
+        let start = cols[1]
+            .x
+            .saturating_add(cols[1].width.saturating_sub(right_width))
+            .saturating_add(libs_offset);
+        app.libs_btn_rect = Some((start, start.saturating_add(libs_width)));
+    }
 }
 
 fn draw_spectrum_workspace(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -2658,115 +2677,197 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         Modal::LibrarySetup(st) => {
-            let rect = centered_rect(76, 52, area);
+            let rect = centered_rect(92, 78, area);
             frame.render_widget(Clear, rect);
-            let inner_w = rect.width.saturating_sub(2) as usize;
-            let source_w = inner_w.saturating_sub(3 + 4 + 32 + 24).max(1);
+            let title = if st.is_first_run {
+                "Welcome to SPECTRA v0.8 — First-Run Library Setup"
+            } else {
+                "Reference Library Manager [D] — Open Scientific Databases"
+            };
+            let block = modal_block(title, ACCENT_GREEN);
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            if inner.height < 6 {
+                return;
+            }
+            let inner_w = inner.width as usize;
+            let total_files: usize = st.statuses.iter().map(|s| s.count).sum();
+            let total_bytes: u64 = st.statuses.iter().map(|s| s.bytes).sum();
+            let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
+            let installed_packs = st.statuses.iter().filter(|s| s.count > 0).count();
+            let total_packs = crate::io::LIBRARY_PACKS.len();
 
-            let pack_info: [(&str, &str, &str, &str); 5] = [
-                (
-                    "NIST FTIR",
-                    "download_polymer_pack.py --nist",
-                    "~2 MB  •  ~35 spectra",
-                    "NIST WebBook (JCAMP-DX)",
+            let mut lines: Vec<TextLine> = Vec::new();
+            lines.push(TextLine::from(Span::styled(
+                truncate_ellipsis(
+                    &format!(
+                        "  Installed: {} spectra ({:.1} MB) across {}/{} packs · Auto-routed to library/ftir, library/nmr, library/uvvis",
+                        total_files, total_mb, installed_packs, total_packs
+                    ),
+                    inner_w,
                 ),
-                (
-                    "UV-Vis PhotochemCAD + NIST",
-                    "download_uvvis_pack.py --all",
-                    "~2 MB  •  189 spectra",
-                    "OMLC PhotochemCAD + NIST WebBook UV-Vis",
-                ),
-                (
-                    "Zenodo FTIR-Plastics",
-                    "download_polymer_pack.py --zenodo",
-                    "~253 MB  •  ~1,200 spectra",
-                    "Zenodo FTIR-Plastics (INFRA-ART, MNHN)",
-                ),
-                (
-                    "nmrshiftdb2 NMR",
-                    "download_polymer_pack.py --nmr",
-                    "~159 MB  •  58k compounds",
-                    "nmrshiftdb2 SDF dump (1H/13C shifts)",
-                ),
-                (
-                    "Mega FTIR (RRUFF + INFRA-ART + MNHN + NIST)",
-                    "download_mega_ir.py --all",
-                    "~158 MB  •  ~2,000 spectra",
-                    "RRUFF minerals + INFRA-ART pigments + MNHN + NIST",
-                ),
-            ];
+                Style::default().fg(TEXT_MUTED),
+            )));
+            lines.push(TextLine::from(""));
 
-            let mut lines = vec![
-                TextLine::from(Span::styled(
-                    "  Select reference library packs to download (network required):",
-                    Style::default().fg(TEXT_MUTED),
-                )),
-                TextLine::from(""),
-            ];
+            let sel_w = 7usize;
+            let name_w = 32usize;
+            let type_w = 7usize;
+            let status_w = 15usize;
+            let spec_w = 9usize;
+            let size_w = 8usize;
+            let inst_w = inner_w
+                .saturating_sub(sel_w + name_w + type_w + status_w + spec_w + size_w)
+                .max(8);
+            let header = format!(
+                "{}{}{}{}{}{}{}",
+                fit_col("Sel", sel_w),
+                fit_col("Library", name_w),
+                fit_col("Type", type_w),
+                fit_col("Status", status_w),
+                fit_col("Spectra", spec_w),
+                fit_col("Size", size_w),
+                fit_col("Institution", inst_w),
+            );
+            lines.push(TextLine::from(Span::styled(
+                header,
+                Style::default()
+                    .fg(ACCENT_AMBER)
+                    .add_modifier(Modifier::BOLD),
+            )));
 
-            for (i, (name, _script, size, source)) in pack_info.iter().enumerate() {
+            for (i, pack) in crate::io::LIBRARY_PACKS.iter().enumerate() {
                 let is_sel = i == st.selected;
-                let checked = if st.checks[i] { "✓" } else { " " };
-                let check_style = if st.checks[i] {
-                    Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD)
+                let status = st.statuses.get(i).cloned().unwrap_or_default();
+                let checked = st.checks.get(i).copied().unwrap_or(false);
+                let sel_text = format!(
+                    " {} [{}] ",
+                    if is_sel { "▶" } else { " " },
+                    if checked { "✓" } else { " " }
+                );
+                let row_style = if is_sel {
+                    Style::default()
+                        .bg(SURFACE_ALT)
+                        .fg(ACCENT_YELLOW)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT_PRIMARY)
+                };
+                let status_text = if status.count > 0 {
+                    format!("✓ {} files", status.count)
+                } else {
+                    "○ Not installed".to_string()
+                };
+                let status_style = if status.count > 0 {
+                    Style::default()
+                        .fg(ACCENT_GREEN)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(TEXT_MUTED)
                 };
-                let row_style = if is_sel {
-                    Style::default().bg(SURFACE_ALT).fg(ACCENT_YELLOW).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-
                 lines.push(TextLine::from(vec![
                     Span::styled(
-                        if is_sel { " ▶ " } else { "   " },
-                        Style::default().fg(ACCENT_GREEN),
+                        sel_text,
+                        Style::default()
+                            .fg(if is_sel { ACCENT_GREEN } else { TEXT_MUTED })
+                            .bg(if is_sel { SURFACE_ALT } else { Color::Reset }),
+                    ),
+                    Span::styled(fit_col(pack.name, name_w), row_style),
+                    Span::styled(fit_col(pack.modality, type_w), Style::default().fg(ACCENT_AQUA)),
+                    Span::styled(fit_col(&status_text, status_w), status_style),
+                    Span::styled(
+                        fit_col(pack.spectra_est, spec_w),
+                        Style::default().fg(TEXT_PRIMARY),
                     ),
                     Span::styled(
-                        format!("[{}] ", checked),
-                        check_style,
+                        fit_col(pack.size_est, size_w),
+                        Style::default().fg(ACCENT_AMBER),
                     ),
                     Span::styled(
-                        fit_col(name, 32),
-                        row_style,
-                    ),
-                    Span::styled(
-                        fit_col(size, 24),
-                        Style::default().fg(ACCENT_AQUA),
-                    ),
-                    Span::styled(
-                        truncate_ellipsis(&format!("— {}", source), source_w),
+                        truncate_ellipsis(pack.institution, inst_w),
                         Style::default().fg(TEXT_MUTED),
                     ),
                 ]));
             }
 
             lines.push(TextLine::from(""));
-            lines.push(TextLine::from(Span::styled(
-                "  Default: NIST FTIR + UV-Vis (fast ~4 MB). Large packs unchecked to avoid accidental 400+ MB downloads.",
-                Style::default().fg(ACCENT_AMBER),
-            )));
-            lines.push(TextLine::from(""));
-
-            if let Some(ref fb) = st.feedback {
-                for line in fb.lines() {
-                    lines.push(TextLine::from(Span::styled(
-                        format!("  {}", line),
-                        Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
-                    )));
-                }
-                lines.push(TextLine::from(""));
+            if let Some(prog) = &st.downloading {
+                let pct = prog.pct.clamp(0.0, 100.0);
+                let filled = (((pct / 100.0) * 44.0).round() as usize).min(44);
+                lines.push(TextLine::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("█".repeat(filled), Style::default().fg(ACCENT_GREEN)),
+                    Span::styled(
+                        "░".repeat(44 - filled),
+                        Style::default().fg(TEXT_MUTED),
+                    ),
+                    Span::styled(
+                        format!(" {:5.1}%", pct),
+                        Style::default()
+                            .fg(ACCENT_GREEN)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                let pack_name = crate::io::LIBRARY_PACKS
+                    .iter()
+                    .find(|p| p.id == prog.pack_id)
+                    .map(|p| p.name)
+                    .unwrap_or(prog.pack_id.as_str());
+                lines.push(TextLine::from(Span::styled(
+                    truncate_ellipsis(
+                        &format!(
+                            "  [{}/{}] {}  ·  {}",
+                            prog.pack_idx, prog.total_packs, pack_name, prog.detail
+                        ),
+                        inner_w,
+                    ),
+                    Style::default().fg(TEXT_PRIMARY),
+                )));
+                lines.push(TextLine::from(Span::styled(
+                    format!("  elapsed {:.1}s", prog.started.elapsed().as_secs_f64()),
+                    Style::default().fg(TEXT_MUTED),
+                )));
+            } else {
+                lines.push(TextLine::from(Span::styled(
+                    "  Ready — select packs and press [Enter] to download.",
+                    Style::default().fg(TEXT_MUTED),
+                )));
             }
 
-            lines.push(TextLine::from(Span::styled(
-                "  [j/k] Move  [Space] Toggle  [a] Select All/None  [Enter] Download  [Esc] Close",
-                Style::default().fg(TEXT_MUTED),
-            )));
+            if let Some(ref feedback) = st.feedback {
+                lines.push(TextLine::from(""));
+                for line in feedback.lines() {
+                    lines.push(TextLine::from(Span::styled(
+                        truncate_ellipsis(&format!("  {}", line), inner_w),
+                        Style::default()
+                            .fg(ACCENT_GREEN)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                }
+            }
 
+            let hotkeys = "  [j/k] Move  [Space] Toggle  [a] Select Missing  [Enter] Download Checked  [x] Uninstall  [Esc] Close";
+            let body_h = inner.height.saturating_sub(1) as usize;
+            if lines.len() > body_h {
+                lines.truncate(body_h);
+            }
             frame.render_widget(
-                Paragraph::new(lines).block(modal_block("Reference Library Downloader [D]", ACCENT_GREEN)),
-                rect,
+                Paragraph::new(lines),
+                Rect {
+                    height: body_h as u16,
+                    ..inner
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(TextLine::from(Span::styled(
+                    truncate_ellipsis(hotkeys, inner_w),
+                    Style::default().fg(TEXT_MUTED),
+                ))),
+                Rect {
+                    y: inner.y + inner.height - 1,
+                    height: 1,
+                    ..inner
+                },
             );
         }
         Modal::Help => {
@@ -3633,7 +3734,11 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   e                Publication figure: ACS/RSC/Everforest, stacked or overlay,"),
         TextLine::from("                    native Rust SVG + PNG/PDF up to 600 DPI, deconv sub-peaks,"),
         TextLine::from("                    and a visible-light rainbow strip for UV-Vis."),
-        TextLine::from("   D                Download open reference libraries (network required)"),
+        TextLine::from("   D                Reference Library Manager: installed-pack detection, 9 open"),
+        TextLine::from("                    databases, live progress bar and smart routing into library/ftir,"),
+        TextLine::from("                    library/nmr and library/uvvis. [Space] toggle, [x] uninstall."),
+        TextLine::from("                    New: FLOPP/FLOPP-e polymers (Univ. of Toronto) and Toffolo"),
+        TextLine::from("                    materials (CENIEH Spain, CC-BY-4.0)."),
         TextLine::from("   c                Copy the cursor assignment; [x] pins a peak"),
         TextLine::from("   Calibration [X]  Persistently shifts X values — the only spectrum mutation."),
         TextLine::from(""),

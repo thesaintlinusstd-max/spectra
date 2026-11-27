@@ -1,8 +1,35 @@
-# SPECTRA v0.7.2
+# SPECTRA v0.8.0
 
 **Offline Terminal Workbench for FTIR, ¹H NMR, ¹³C NMR & UV-Vis Spectroscopy and Polymer Chemistry**
 
 Built in **Rust** (`ratatui` + `crossterm`) with optional **Python** (`matplotlib` / `scipy` / `numpy`) tools for publication figures, printed-spectrum digitization, and open-library fetching.
+
+---
+
+## What's New in v0.8.0 (Interactive Library Manager & New Scientific Databases)
+
+- **Interactive Reference Library Manager (`[D]`)** — a single 9-pack manager with installed-pack detection, per-pack file counts and sizes, `[Space]` toggles, `[a]` select-missing, `[x]` uninstall, and a clickable **`[D] Libs`** top-bar button.
+- **First-Run Setup Wizard** — on a fresh install with no reference spectra, SPECTRA opens the manager automatically with the three fast starter packs pre-selected (NIST FTIR, FLOPP/FLOPP-e, UV-Vis; ~18 MB total).
+- **Real-time live progress bar** — `python/library_manager.py` streams machine-readable `PROGRESS` lines, so the TUI shows a 44-cell Unicode bar, current pack `[i/n]`, live MB counters and elapsed time while downloading.
+- **Smart subfolder routing** — every pack is written to `library/ftir/`, `library/nmr/`, or `library/uvvis/` with deterministic prefixes, so installed counts survive restarts and partial downloads.
+- **Two new verified open peer-reviewed databases** — **FLOPP & FLOPP-e** (University of Toronto; De Frond et al., *Anal. Chem.* **2021**, DOI [10.1021/acs.analchem.1c02549](https://doi.org/10.1021/acs.analchem.1c02549)) and the **Toffolo FTIR Library** (CENIEH Spain, CC-BY-4.0, DOI [10.5281/zenodo.14170891](https://doi.org/10.5281/zenodo.14170891)).
+- **Streaming downloads with persistent caching** — large archives (Figshare, Zenodo, SourceForge) stream in 64 KB chunks to atomic `.part` files, then are reused from `library/.cache/` on subsequent runs.
+
+### Verified Open Reference Databases (v0.8.0)
+
+| # | Database | Institution | Spectra | Size | License | DOI / URL |
+|---|----------|-------------|---------|------|---------|-----------|
+| 1 | NIST Chemistry WebBook (IR) | NIST (USA) | ~180 | ~5 MB | Public domain (US Gov) | https://webbook.nist.gov/chemistry/ |
+| 2 | FLOPP & FLOPP-e | Univ. of Toronto | 381 | ~11 MB | Open access (Figshare) | https://doi.org/10.1021/acs.analchem.1c02549 · https://figshare.com/articles/dataset/17070065 |
+| 3 | PhotochemCAD + NIST UV-Vis | NC State / OMLC / NIST | ~189 | ~2 MB | Free academic use | https://omlc.org/spectra/PhotochemCAD/ |
+| 4 | RRUFF Infrared | Univ. of Arizona | ~1,200+ | 14 MB | Free research/education | https://rruff.net/ |
+| 5 | Toffolo FTIR Library | CENIEH (Spain) | ~150+ | 23 MB | CC BY 4.0 | https://doi.org/10.5281/zenodo.14170891 |
+| 6 | INFRA-ART Reference Materials | INOE 2000 (Romania) | 1,085 | 39 MB | CC BY 4.0 | https://doi.org/10.5281/zenodo.21993883 |
+| 7 | MNHN Paris ATR-FTIR | MNHN Paris (France) | ~450+ | 48 MB | CC BY 4.0 | https://doi.org/10.5281/zenodo.10658337 |
+| 8 | FTIR-Plastics | TecNM Toluca / UAEMex | 18 master | ~250 MB | CC BY 4.0 | https://doi.org/10.5281/zenodo.10736649 |
+| 9 | nmrshiftdb2 (¹H & ¹³C) | Univ. of Cologne | ~68 (+58k SDF) | 159 MB | ODbL | https://nmrshiftdb.nmr.uni-koeln.de/ |
+
+*Licenses are as stated by each data provider; cite the original publications when using these spectra in derived work.*
 
 ---
 
@@ -199,16 +226,21 @@ spectra convert polymer_blend.csv -o exports/blend_processed.jdx --arpls --smoot
 
 ---
 
-## Fetching Open Reference Libraries (`Shift+D` or CLI)
+## Fetching Open Reference Libraries (`[D]` Library Manager or CLI)
 
 The core binary embeds 280+ correlation bands, 63 solvent impurity entries, 39 polymer fingerprints, and 9 demo presets with zero downloads required.
 
 To download optional experimental reference spectra into `library/`:
-- **Inside the TUI**: Press **`Shift+D`** to open the interactive **Reference Library Downloader** and toggle the packs you want.
+- **Inside the TUI**: Press **`[D]`** (or click **`[D] Libs`** in the top bar) to open the **Reference Library Manager**. It detects what is already installed, shows per-pack file counts and sizes, and streams a live progress bar while downloading. `[Space]` toggles a pack, `[a]` selects every missing pack, `[x]` uninstalls the selected pack, and `[Esc]` hides the manager while a download continues in the background.
+- **First run**: if `library/` is empty, SPECTRA opens the wizard automatically with NIST FTIR, FLOPP/FLOPP-e, and UV-Vis pre-selected (fast ~18 MB starter set).
 - **From CLI**:
 
 | Command | Source | Content | Approx. Download |
 |---------|--------|---------|------------------|
+| `python3 python/library_manager.py --packs nist_ftir,flopp_ftir,uvvis_pack` | NIST + FLOPP + PhotochemCAD | Starter FTIR + polymer ATR + UV-Vis | ~18 MB |
+| `python3 python/library_manager.py --packs rruff_ir,toffolo_ir` | RRUFF + CENIEH Toffolo | Minerals + heritage materials | ~37 MB |
+| `python3 python/library_manager.py --packs infra_art,mnhn_paris` | INFRA-ART + MNHN Paris | Pigments, resins, waxes, minerals | ~87 MB |
+| `python3 python/library_manager.py --packs zenodo_plastics,nmrshiftdb2` | FTIR-Plastics + nmrshiftdb2 | Industrial polymers + ¹H/¹³C NMR | ~409 MB |
 | `spectra fetch pack --nist` | NIST Chemistry WebBook | ~38 polymer monomers & solvents (FTIR `.jdx`) | ~0.4 MB |
 | `spectra fetch pack --uvvis` | OMLC PhotochemCAD + NIST WebBook | ~187 experimental UV-Vis spectra | ~2 MB |
 | `spectra fetch pack --zenodo` | Zenodo FTIR-Plastics | 36 Jasco ATR-FTIR spectra (`PET, HDPE, LDPE, PP, PS, PVC`) | ~253 MB zip |
@@ -220,6 +252,8 @@ To download optional experimental reference spectra into `library/`:
 
 **Open Data Acknowledgments:**
 - **NIST Chemistry WebBook** (U.S. Secretary of Commerce) — experimental IR & UV-Vis JCAMP-DX data
+- **FLOPP & FLOPP-e** (University of Toronto; De Frond et al., *Anal. Chem.* **2021**, DOI `10.1021/acs.analchem.1c02549`) — polymer ATR-FTIR reference spectra
+- **Toffolo FTIR Library** (CENIEH Spain, CC-BY-4.0, DOI `10.5281/zenodo.14170891`) — transmission and ATR materials spectra
 - **OMLC PhotochemCAD** (Oregon Medical Laser Center) — measured UV-Vis absorption spectra
 - **Zenodo FTIR-Plastics** (`10.5281/zenodo.10736649`), **INFRA-ART** (`10.5281/zenodo.21993883`), and **MNHN Paris ATR-FTIR** (`10.5281/zenodo.10658337`)
 - **RRUFF Project** (University of Arizona) — mineral & inorganic infrared spectra
@@ -243,7 +277,7 @@ To download optional experimental reference spectra into `library/`:
 | `a` / `b` / `m` / `w` / `t` | `%T↔Abs` / baseline / smoothing / normalization / derivative |
 | `A` / `C` | ATR Kramers–Kronig or Kubelka–Munk / atmospheric CO₂ suppression |
 | `P` / `o` / `I` / `X` | Deconvolution / Spectral Math / Integration / X-axis calibration studios |
-| `Shift+M` / `Shift+D` | Spectral library matcher (HQI + NNLS mixture) / interactive library downloader |
+| `Shift+M` / `D` | Spectral library matcher (HQI + NNLS mixture) / interactive Reference Library Manager (`[D] Libs` is also clickable) |
 | `Shift+W` / `e` / `?` / `q` | Save processed data & report / export figure / user guide / quit |
 
 ### NMR & Polymer Lab

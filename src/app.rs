@@ -305,23 +305,52 @@ pub struct CandidatePickerState {
     pub selected: usize,
 }
 
-/// State for the Reference Library Downloader modal (Shift+D / D).
+/// Live progress for an in-flight Library Manager download.
+#[derive(Debug, Clone)]
+pub struct DownloadProgress {
+    pub pack_idx: usize,
+    pub total_packs: usize,
+    pub pack_id: String,
+    pub pct: f64,
+    pub detail: String,
+    pub started: Instant,
+}
+
+/// State for the Reference Library Manager modal (`[D]`).
 #[derive(Debug, Clone)]
 pub struct LibrarySetupState {
-    pub selected: usize,          // 0..4 index of current row
-    pub checks: [bool; 5],        // checkbox state per pack
-    pub feedback: Option<String>, // status message after download
+    pub selected: usize,
+    pub checks: Vec<bool>,
+    pub statuses: Vec<crate::io::InstalledPackStatus>,
+    pub downloading: Option<DownloadProgress>,
+    pub feedback: Option<String>,
+    pub is_first_run: bool,
+}
+
+impl LibrarySetupState {
+    pub fn new(is_first_run: bool) -> Self {
+        let statuses = crate::io::detect_installed_packs();
+        let checks = crate::io::LIBRARY_PACKS
+            .iter()
+            .enumerate()
+            .map(|(i, pack)| {
+                pack.default_checked && statuses.get(i).map_or(true, |s| s.count == 0)
+            })
+            .collect();
+        Self {
+            selected: 0,
+            checks,
+            statuses,
+            downloading: None,
+            feedback: None,
+            is_first_run,
+        }
+    }
 }
 
 impl Default for LibrarySetupState {
     fn default() -> Self {
-        // Default: NIST FTIR (~2 MB) + UV-Vis (~2 MB) checked for quick start.
-        // Large packs (Zenodo 253 MB, nmrshiftdb2 159 MB, Mega FTIR 158 MB) unchecked.
-        Self {
-            selected: 0,
-            checks: [true, true, false, false, false],
-            feedback: None,
-        }
+        Self::new(false)
     }
 }
 
@@ -371,6 +400,7 @@ pub enum TaskOutcome {
     LibraryMatch(Vec<crate::matcher::LibraryMatch>),
     MixtureMatch(Vec<crate::mixture::MixtureMatch>),
     Export(std::result::Result<PathBuf, String>),
+    #[allow(dead_code)]
     LibraryDownload(std::result::Result<String, String>),
     Deconv(std::result::Result<DeconvResult, String>),
 }
@@ -570,6 +600,12 @@ pub struct App {
 
     /// Receiver for the currently running background task (loading, matching, export).
     pub pending: Option<Receiver<TaskOutcome>>,
+    /// Streaming download events from `python/library_manager.py`.
+    pub download_rx: Option<Receiver<crate::export::DownloadEvent>>,
+    /// Latest progress, kept so `[D]` can restore the bar after the modal is hidden.
+    pub download_progress: Option<DownloadProgress>,
+    /// Top-bar hitbox (start, end) for the clickable `[D] Libs` badge.
+    pub libs_btn_rect: Option<(u16, u16)>,
     /// Export settings preserved while the Python figure is generated.
     pub pending_export: Option<ExportModalState>,
     /// Active multi-peak deconvolution overlay on the spectrum plot.
@@ -598,6 +634,7 @@ impl App {
         let mut traces: Vec<Spectrum> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
         let status_msg;
+        let no_input_files = files.is_empty();
 
         for path in files.into_iter().take(8) {
             // A bare word such as `spectra butane` is a library name, not a path.
@@ -699,6 +736,9 @@ impl App {
             hd_mode: crate::kitty_plot::is_kitty_terminal(),
             help_scroll: 0,
             pending: None,
+            download_rx: None,
+            download_progress: None,
+            libs_btn_rect: None,
             pending_export: None,
             deconv_overlay: None,
             pending_deconv: None,
@@ -729,7 +769,26 @@ impl App {
             }
         }
 
+        // First-run wizard: only on a genuine empty launch, and never in unit
+        // tests (which construct `App::new(vec![], …)` and expect `Modal::None`).
+        if no_input_files && !cfg!(test) {
+            let statuses = crate::io::detect_installed_packs();
+            let total: usize = statuses.iter().map(|s| s.count).sum();
+            if total == 0 && !crate::io::has_seen_library_setup() {
+                app.modal = Modal::LibrarySetup(LibrarySetupState::new(true));
+            }
+        }
+
         app
+    }
+
+    /// Open the Library Manager, restoring live progress if a download is running.
+    pub fn open_library_manager(&mut self) {
+        let mut st = LibrarySetupState::new(false);
+        if let Some(progress) = self.download_progress.clone() {
+            st.downloading = Some(progress);
+        }
+        self.modal = Modal::LibrarySetup(st);
     }
 
     pub fn current_kind(&self) -> SpectrumKind {
@@ -934,6 +993,8 @@ impl App {
 
     /// Called from the main loop; applies a finished background task, if any.
     pub fn poll_background(&mut self) {
+        self.poll_download_events();
+
         let Some(rx) = &self.pending else {
             return;
         };
@@ -949,6 +1010,91 @@ impl App {
                     self.modal = Modal::None;
                 }
                 self.status_msg = "Background task failed unexpectedly".into();
+            }
+        }
+    }
+
+    /// Drain streamed `library_manager.py` events without blocking the UI.
+    fn poll_download_events(&mut self) {
+        loop {
+            let event = match self.download_rx.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.download_rx = None;
+                        self.download_progress = None;
+                        break;
+                    }
+                },
+                None => break,
+            };
+
+            match event {
+                crate::export::DownloadEvent::Progress {
+                    pack_idx,
+                    total_packs,
+                    pack_id,
+                    pct,
+                    detail,
+                } => {
+                    let started = self
+                        .download_progress
+                        .as_ref()
+                        .map(|p| p.started)
+                        .unwrap_or_else(Instant::now);
+                    let progress = DownloadProgress {
+                        pack_idx,
+                        total_packs,
+                        pack_id: pack_id.clone(),
+                        pct,
+                        detail: detail.clone(),
+                        started,
+                    };
+                    self.status_msg = format!(
+                        "Downloading {} [{}/{}] {:.1}% — {}",
+                        pack_id, pack_idx, total_packs, pct, detail
+                    );
+                    self.download_progress = Some(progress.clone());
+                    if let Modal::LibrarySetup(st) = &mut self.modal {
+                        st.downloading = Some(progress);
+                        st.feedback = None;
+                    }
+                }
+                crate::export::DownloadEvent::Finished(result) => {
+                    self.download_rx = None;
+                    self.download_progress = None;
+                    crate::io::mark_library_setup_seen();
+                    let statuses = crate::io::detect_installed_packs();
+                    match result {
+                        Ok(summary) => {
+                            self.status_msg = format!(
+                                "Library download complete — {}",
+                                summary.lines().next().unwrap_or("ready")
+                            );
+                            if let Modal::LibrarySetup(st) = &mut self.modal {
+                                st.statuses = statuses;
+                                st.downloading = None;
+                                for (i, status) in st.statuses.iter().enumerate() {
+                                    if status.count > 0 {
+                                        if let Some(check) = st.checks.get_mut(i) {
+                                            *check = false;
+                                        }
+                                    }
+                                }
+                                st.feedback = Some(summary);
+                            }
+                        }
+                        Err(err) => {
+                            self.status_msg = format!("Library download failed: {}", err);
+                            if let Modal::LibrarySetup(st) = &mut self.modal {
+                                st.statuses = statuses;
+                                st.downloading = None;
+                                st.feedback = Some(format!("Error: {}", err));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1176,19 +1322,15 @@ impl App {
                     Ok(summary) => {
                         // Refresh the library index so new files are immediately visible
                         crate::io::refresh_library_index();
-                        self.modal = Modal::LibrarySetup(LibrarySetupState {
-                            selected: 0,
-                            checks: [false, false, false, false, false], // uncheck all after success
-                            feedback: Some(summary),
-                        });
+                        let mut st = LibrarySetupState::new(false);
+                        st.feedback = Some(summary);
+                        self.modal = Modal::LibrarySetup(st);
                         self.status_msg = "Library download complete — press [M] to match or [/] to search".into();
                     }
                     Err(e) => {
-                        self.modal = Modal::LibrarySetup(LibrarySetupState {
-                            selected: 0,
-                            checks: [true, true, false, false, false],
-                            feedback: Some(format!("Error: {}", e)),
-                        });
+                        let mut st = LibrarySetupState::new(false);
+                        st.feedback = Some(format!("Error: {}", e));
+                        self.modal = Modal::LibrarySetup(st);
                         self.status_msg = format!("Library download failed: {}", e);
                     }
                 }
@@ -2492,12 +2634,12 @@ impl App {
                 return;
             }
             KeyCode::Char('D') => {
-                self.modal = Modal::LibrarySetup(LibrarySetupState::default());
+                self.open_library_manager();
                 return;
             }
             // Also allow Shift+d (explicit) as some terminals report it differently
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.modal = Modal::LibrarySetup(LibrarySetupState::default());
+                self.open_library_manager();
                 return;
             }
             KeyCode::Char('d') => {
@@ -3163,6 +3305,16 @@ impl App {
                     "Candidate picker dismissed — [f] opens files, [?] shows shortcuts".into();
             } else if matches!(self.modal, Modal::Busy(_)) {
                 self.status_msg = "Working in the background — results appear when ready".into();
+            } else if matches!(self.modal, Modal::LibrarySetup(_)) {
+                if self.download_rx.is_some() {
+                    crate::io::mark_library_setup_seen();
+                    self.status_msg =
+                        "Download continuing in background — press [D] to view progress".into();
+                } else if let Modal::LibrarySetup(st) = &self.modal {
+                    if st.is_first_run {
+                        crate::io::mark_library_setup_seen();
+                    }
+                }
             }
             self.modal = Modal::None;
             return;
@@ -3954,54 +4106,115 @@ impl App {
                 }
             }
             Modal::LibrarySetup(mut st) => {
+                // While a download runs, only Esc (handled above) is meaningful.
+                if st.downloading.is_some() {
+                    self.modal = Modal::LibrarySetup(st);
+                    return;
+                }
+                let n = crate::io::LIBRARY_PACKS.len().max(1);
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        st.selected = (st.selected + st.checks.len() - 1) % st.checks.len();
+                        st.selected = (st.selected + n - 1) % n;
                         st.feedback = None;
                         self.modal = Modal::LibrarySetup(st);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        st.selected = (st.selected + 1) % st.checks.len();
+                        st.selected = (st.selected + 1) % n;
                         st.feedback = None;
                         self.modal = Modal::LibrarySetup(st);
                     }
                     KeyCode::Char(' ') => {
-                        st.checks[st.selected] = !st.checks[st.selected];
+                        if let Some(check) = st.checks.get_mut(st.selected) {
+                            *check = !*check;
+                        }
                         st.feedback = None;
                         self.modal = Modal::LibrarySetup(st);
                     }
                     KeyCode::Char('a') => {
-                        let all_checked = st.checks.iter().all(|&c| c);
-                        st.checks.fill(!all_checked);
+                        let all_installed = st.statuses.iter().all(|s| s.count > 0);
+                        if all_installed {
+                            let all_checked = st.checks.iter().all(|&c| c);
+                            st.checks.fill(!all_checked);
+                        } else {
+                            let missing: Vec<usize> = st
+                                .statuses
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, s)| s.count == 0)
+                                .map(|(i, _)| i)
+                                .collect();
+                            let all_missing_checked = missing
+                                .iter()
+                                .all(|&i| st.checks.get(i).copied().unwrap_or(false));
+                            for i in missing {
+                                if let Some(check) = st.checks.get_mut(i) {
+                                    *check = !all_missing_checked;
+                                }
+                            }
+                        }
                         st.feedback = None;
                         self.modal = Modal::LibrarySetup(st);
                     }
+                    KeyCode::Char('x') => {
+                        let idx = st.selected.min(n - 1);
+                        let pack = crate::io::LIBRARY_PACKS[idx];
+                        if st.statuses.get(idx).map_or(false, |s| s.count > 0) {
+                            match crate::io::uninstall_library_pack(pack.id) {
+                                Ok(removed) => {
+                                    st.statuses = crate::io::detect_installed_packs();
+                                    if let Some(check) = st.checks.get_mut(idx) {
+                                        *check = false;
+                                    }
+                                    st.feedback = Some(format!(
+                                        "Removed {} files from {}",
+                                        removed, pack.name
+                                    ));
+                                    self.status_msg = format!(
+                                        "Uninstalled {} ({} files removed)",
+                                        pack.name, removed
+                                    );
+                                }
+                                Err(err) => {
+                                    st.feedback = Some(format!("Uninstall failed: {}", err));
+                                }
+                            }
+                        } else {
+                            st.feedback = Some(format!("{} is not installed", pack.name));
+                        }
+                        self.modal = Modal::LibrarySetup(st);
+                    }
                     KeyCode::Enter => {
-                        // Build the list of (script, args) for checked packs
-                        let packs: [(&str, &str); 5] = [
-                            ("download_polymer_pack.py", "--nist"),      // 0: NIST FTIR (~2 MB)
-                            ("download_uvvis_pack.py", "--all"),         // 1: UV-Vis PhotochemCAD + NIST (~2 MB)
-                            ("download_polymer_pack.py", "--zenodo"),    // 2: Zenodo FTIR-Plastics (~253 MB)
-                            ("download_polymer_pack.py", "--nmr"),       // 3: nmrshiftdb2 NMR (~159 MB)
-                            ("download_mega_ir.py", "--all"),            // 4: Mega FTIR RRUFF+INFRA-ART+MNHN+NIST (~158 MB)
-                        ];
-                        let selected: Vec<(&str, &str)> = st
+                        let ids: Vec<String> = st
                             .checks
                             .iter()
                             .enumerate()
-                            .filter(|(_, &c)| c)
-                            .map(|(i, _)| packs[i])
+                            .filter(|(_, &checked)| checked)
+                            .filter_map(|(i, _)| crate::io::LIBRARY_PACKS.get(i).map(|p| p.id.to_string()))
                             .collect();
-                        if selected.is_empty() {
-                            st.feedback = Some("No packs selected — press [Space] to check at least one".into());
+                        if ids.is_empty() {
+                            st.feedback =
+                                Some("Check at least one library with [Space]".into());
                             self.modal = Modal::LibrarySetup(st);
                             return;
                         }
-                        // `start_task` already opens the Busy modal.
-                        self.start_task("Downloading open reference libraries…", move || {
-                            let result = crate::export::run_library_downloads(&selected);
-                            TaskOutcome::LibraryDownload(result.map_err(|e| e.to_string()))
-                        });
+                        let total = ids.len();
+                        let first = ids[0].clone();
+                        self.download_rx =
+                            Some(crate::export::spawn_library_download_stream(ids));
+                        let progress = DownloadProgress {
+                            pack_idx: 1,
+                            total_packs: total,
+                            pack_id: first,
+                            pct: 0.0,
+                            detail: "Connecting…".into(),
+                            started: Instant::now(),
+                        };
+                        self.download_progress = Some(progress.clone());
+                        st.downloading = Some(progress);
+                        st.feedback = Some("Starting download…".into());
+                        self.status_msg =
+                            format!("Downloading {} library pack(s)…", total);
+                        self.modal = Modal::LibrarySetup(st);
                     }
                     _ => {
                         st.feedback = None;
@@ -4531,6 +4744,12 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && row == self.topbar_rect.y
         {
+            if let Some((x0, x1)) = self.libs_btn_rect {
+                if col >= x0 && col < x1 {
+                    self.open_library_manager();
+                    return;
+                }
+            }
             // Tab strip shown by `draw_topbar`; hitboxes are computed there.
             if let Some(&(_, _, tab)) = self
                 .tab_hitboxes
