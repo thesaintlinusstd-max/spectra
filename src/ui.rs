@@ -2713,14 +2713,14 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
             let sel_w = 7usize;
             let name_w = 32usize;
             let type_w = 7usize;
-            let status_w = 15usize;
-            let spec_w = 9usize;
+            let status_w = 16usize;
+            let spec_w = 11usize;
             let size_w = 8usize;
             let inst_w = inner_w
-                .saturating_sub(sel_w + name_w + type_w + status_w + spec_w + size_w)
+                .saturating_sub(sel_w + name_w + type_w + status_w + spec_w + size_w + 12)
                 .max(8);
             let header = format!(
-                "{}{}{}{}{}{}{}",
+                "{}  {}  {}  {}  {}  {}  {}",
                 fit_col("Sel", sel_w),
                 fit_col("Library", name_w),
                 fit_col("Type", type_w),
@@ -2772,17 +2772,23 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                             .fg(if is_sel { ACCENT_GREEN } else { TEXT_MUTED })
                             .bg(if is_sel { SURFACE_ALT } else { Color::Reset }),
                     ),
+                    Span::styled("  ", Style::default()),
                     Span::styled(fit_col(pack.name, name_w), row_style),
+                    Span::styled("  ", Style::default()),
                     Span::styled(fit_col(pack.modality, type_w), Style::default().fg(ACCENT_AQUA)),
+                    Span::styled("  ", Style::default()),
                     Span::styled(fit_col(&status_text, status_w), status_style),
+                    Span::styled("  ", Style::default()),
                     Span::styled(
                         fit_col(pack.spectra_est, spec_w),
                         Style::default().fg(TEXT_PRIMARY),
                     ),
+                    Span::styled("  ", Style::default()),
                     Span::styled(
                         fit_col(pack.size_est, size_w),
                         Style::default().fg(ACCENT_AMBER),
                     ),
+                    Span::styled("  ", Style::default()),
                     Span::styled(
                         truncate_ellipsis(pack.institution, inst_w),
                         Style::default().fg(TEXT_MUTED),

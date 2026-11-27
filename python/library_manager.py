@@ -11,6 +11,7 @@ import math
 import re
 import sys
 import time
+import posixpath
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,11 +53,33 @@ def _slug(text: str, max_len: int = 54) -> str:
     return (value or "spectrum")[:max_len].strip("_") or "spectrum"
 
 
+_BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+
+def _browser_headers(url: str) -> dict[str, str]:
+    """Standard browser headers with Referer set to parent directory of `url`."""
+    parsed = urllib.parse.urlparse(url)
+    parent = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, posixpath.dirname(parsed.path).rstrip("/") + "/", "", "", ""))
+    return {
+        "User-Agent": _BROWSER_UA,
+        "Accept": "*/*",
+        "Referer": parent,
+    }
+
+
 def _request(url: str, timeout: int = 45, headers: dict[str, str] | None = None):
     req_headers = {"User-Agent": UA}
     if headers:
         req_headers.update(headers)
-    return urllib.request.urlopen(urllib.request.Request(url, headers=req_headers), timeout=timeout)
+    try:
+        return urllib.request.urlopen(urllib.request.Request(url, headers=req_headers), timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            retry_headers = _browser_headers(url)
+            if headers:
+                retry_headers.update(headers)
+            return urllib.request.urlopen(urllib.request.Request(url, headers=retry_headers), timeout=timeout)
+        raise
 
 
 def stream_download(
