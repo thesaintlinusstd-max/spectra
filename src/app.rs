@@ -11,8 +11,9 @@ use crate::clipboard::{copy_png_file, copy_text};
 use crate::data::{
     best_peak_label_in_context, find_polymer_by_short,
     generate_demo_preset, match_cnmr, match_ftir, match_hnmr, match_solvent_impurities,
-    match_uvvis, synthesize_polymer_reference, uvvis_color_info, DemoPreset, SolventId, Spectrum,
-    SpectrumKind, YUnit, CNMR_DB, FTIR_DB, HNMR_DB, POLYMERS_DB, SOLVENT_IMPURITIES, UVVIS_DB,
+    match_uvvis, spectral_zone_name, synthesize_polymer_reference, uvvis_color_info, DemoPreset,
+    SolventId, Spectrum, SpectrumKind, YUnit, CNMR_DB, FTIR_DB, HNMR_DB, POLYMERS_DB,
+    SOLVENT_IMPURITIES, UVVIS_DB,
 };
 use crate::deconv::{
     deconvolve_window_with_context, format_deconv_csv, format_deconv_markdown, DeconvConfig,
@@ -34,7 +35,7 @@ use crate::processing::{
     process_trace, pu_hydrogen_bond_index_with_ratio, pvdf_beta_fraction, tacticity_stats,
     BaselineMode, ConversionResult, HydrogenBondIndex, IntegrationRegion, OpticsMode, Peak,
     ProcessConfig, SmoothLevel, SpectralOp, TacticityResult, TaucMode, TaucResult,
-    YAxisPreference,
+    YAxisPreference, DerivOrder, NormMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,12 +362,44 @@ pub struct BusyState {
     pub started: Instant,
 }
 
+/// Every processing transform that changes curve shape/scale — everything except
+/// `y_pref`, whose `%T ↔ Abs` conversion deconvolution overlays apply cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeconvProcSig {
+    pub baseline: BaselineMode,
+    pub smooth: SmoothLevel,
+    pub norm: NormMode,
+    pub optics: OpticsMode,
+    pub deriv: DerivOrder,
+    pub atm_co2: bool,
+    pub clamp_non_negative: bool,
+    pub atr_n_sample_milli: u16,
+    pub atr_angle_deci_deg: u16,
+}
+
+impl DeconvProcSig {
+    pub fn from_cfg(cfg: ProcessConfig) -> Self {
+        Self {
+            baseline: cfg.baseline,
+            smooth: cfg.smooth,
+            norm: cfg.norm,
+            optics: cfg.optics,
+            deriv: cfg.deriv,
+            atm_co2: cfg.atm_co2,
+            clamp_non_negative: cfg.clamp_non_negative,
+            atr_n_sample_milli: cfg.atr_n_sample_milli,
+            atr_angle_deci_deg: cfg.atr_angle_deci_deg,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DeconvOverlay {
     pub trace_idx: usize,
     pub result: DeconvResult,
     pub show_components: bool,
     pub show_residual: bool,
+    pub proc_sig: DeconvProcSig,
 }
 
 #[derive(Debug, Clone)]
@@ -627,6 +660,108 @@ pub struct App {
     pub plot_rect: Rect,
     pub drag_start_x: Option<f64>,
     pub drag_curr_x: Option<f64>,
+
+    /// Native terminal text selection (mouse reporting disabled) vs interactive plot mouse.
+    pub mouse_capture: bool,
+    /// Inspector pane hitbox for right-click full readout copy.
+    pub inspector_rect: Rect,
+    /// Quick-action button hitbox inside the Inspector.
+    pub quick_actions_rect: Rect,
+    /// Detected/pinned peaks pane hitbox for right-click list copy.
+    pub peaks_rect: Rect,
+}
+
+/// Map Persian (Linux XKB `ir` ISIRI 9147 & Windows Persian) key events onto their
+/// physical US-QWERTY equivalents so shortcuts work regardless of active OS keyboard layout.
+pub fn normalize_shortcut_key(mut key: KeyEvent) -> KeyEvent {
+    let KeyCode::Char(c) = key.code else {
+        return key;
+    };
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let mapped = match c {
+        // Digits & decimal separator
+        '۰' | '٠' => '0',
+        '۱' | '١' => '1',
+        '۲' | '٢' => '2',
+        '۳' | '٣' => '3',
+        '۴' | '٤' => '4',
+        '۵' | '٥' => '5',
+        '۶' | '٦' => '6',
+        '۷' | '٧' => '7',
+        '۸' | '٨' => '8',
+        '۹' | '٩' => '9',
+        '٫' => '.',
+        // Top row (unshifted)
+        'ض' => if shift { 'Q' } else { 'q' },
+        'ص' => if shift { 'W' } else { 'w' },
+        'ث' => if shift { 'E' } else { 'e' },
+        'ق' => if shift { 'R' } else { 'r' },
+        'ف' => if shift { 'T' } else { 't' },
+        'غ' => if shift { 'Y' } else { 'y' },
+        'ع' => if shift { 'U' } else { 'u' },
+        'ه' => if shift { 'I' } else { 'i' },
+        'خ' => if shift { 'O' } else { 'o' },
+        'ح' => if shift { 'P' } else { 'p' },
+        'ج' => '[',
+        'چ' => ']',
+        // Home row (unshifted)
+        'ش' => if shift { 'A' } else { 'a' },
+        'س' => if shift { 'S' } else { 's' },
+        'ی' => if shift { 'D' } else { 'd' },
+        'ب' => if shift { 'F' } else { 'f' },
+        'ل' => if shift { 'G' } else { 'g' },
+        'ا' => if shift { 'H' } else { 'h' },
+        'ت' => if shift { 'J' } else { 'j' },
+        'ن' => if shift { 'K' } else { 'k' },
+        'م' => if shift { 'L' } else { 'l' },
+        'ک' => ';',
+        'گ' => '\'',
+        // Bottom row (unshifted)
+        'ظ' => if shift { 'Z' } else { 'z' },
+        'ط' => if shift { 'X' } else { 'x' },
+        'ز' => if shift { 'C' } else { 'c' },
+        'ر' => if shift { 'V' } else { 'v' },
+        'ذ' => if shift { 'B' } else { 'b' },
+        'د' => if shift { 'N' } else { 'n' },
+        // On ISIRI 9147 `ir`, unshifted AB07 is 'ئ' ('m'), while Shift+S (AC02) also emits 'ئ' with SHIFT
+        'ئ' => if shift { 'S' } else { 'm' },
+        'پ' => if shift { 'M' } else { 'm' },
+        'و' => ',',
+        '؟' => '?',
+        // Shifted characters emitted by Linux XKB `ir` (ISIRI 9147) & Windows Persian:
+        '\u{0652}' => 'Q',       // sukun (Shift+Q)
+        '\u{064C}' => 'W',       // dammatan (Shift+W)
+        '\u{064D}' => 'E',       // kasratan (Shift+E)
+        '\u{064B}' => 'R',       // fathatan (Shift+R)
+        '\u{064F}' | '،' => 'T', // damma / Arabic comma (Shift+T)
+        '\u{0650}' => 'Y',       // kasra (Shift+Y)
+        '\u{064E}' => 'U',       // fatha (Shift+U)
+        '\u{0651}' => 'I',       // shadda (Shift+I)
+        // On ISIRI 9147, Shift+O emits ']' + SHIFT and Shift+P emits '[' + SHIFT
+        ']' if shift => 'O',
+        '[' if shift => 'P',
+        'ؤ' => 'A',                            // Shift+A
+        'ي' => if shift { 'D' } else { 'd' },  // Arabic yeh (Shift+D on ISIRI 9147)
+        'إ' => 'F',                            // Shift+F
+        'أ' => 'G',                            // Shift+G
+        'آ' => 'H',                            // Shift+H
+        'ة' => 'J',                            // Shift+J
+        '»' => 'K',                            // Shift+K
+        '«' => 'L',                            // Shift+L
+        'ك' => 'Z',                            // Shift+Z (ISIRI 9147)
+        '\u{0653}' => 'X',                     // maddah above (Shift+X)
+        'ژ' => 'C',                            // Shift+C
+        '\u{0670}' => 'V',                     // superscript alef (Shift+V)
+        '\u{200C}' => 'B',                     // ZWNJ (Shift+B)
+        '\u{0654}' => 'N',                     // hamza above (Shift+N)
+        'ء' | '÷' => 'M',                      // hamza / division (Shift+M)
+        _ => return key,
+    };
+    key.code = KeyCode::Char(mapped);
+    if mapped.is_ascii_uppercase() {
+        key.modifiers.insert(KeyModifiers::SHIFT);
+    }
+    key
 }
 
 impl App {
@@ -752,6 +887,10 @@ impl App {
             plot_rect: Rect::default(),
             drag_start_x: None,
             drag_curr_x: None,
+            mouse_capture: true,
+            inspector_rect: Rect::default(),
+            quick_actions_rect: Rect::default(),
+            peaks_rect: Rect::default(),
         };
 
         app.recompute_processing();
@@ -799,6 +938,14 @@ impl App {
     }
 
     pub fn recompute_processing(&mut self) {
+        let cur_sig = DeconvProcSig::from_cfg(self.process_cfg);
+        if self
+            .deconv_overlay
+            .as_ref()
+            .is_some_and(|ov| ov.proc_sig != cur_sig)
+        {
+            self.deconv_overlay = None;
+        }
         self.processed = self
             .traces
             .iter()
@@ -1361,6 +1508,7 @@ impl App {
                             result: res,
                             show_components: true,
                             show_residual: false,
+                            proc_sig: DeconvProcSig::from_cfg(self.process_cfg),
                         });
                         self.status_msg = format!("Deconvolution: {}", summary);
                         self.modal = Modal::Deconv(st);
@@ -1760,6 +1908,128 @@ impl App {
         match copy_text(&text) {
             Ok(tool) => self.status_msg = format!("Copied via {}: {}", tool, text),
             Err(e) => self.status_msg = format!("Copy failed: {}", e),
+        }
+    }
+
+    /// True only where Persian text must be typed verbatim instead of normalized
+    /// into shortcut keys (search, file filtering, export title/path, solvent query).
+    pub fn is_free_text_input(&self) -> bool {
+        match &self.modal {
+            Modal::Search(_) | Modal::FilePicker(_) => true,
+            Modal::Export(st) => st.field_idx == 5 || st.field_idx == 6,
+            Modal::None => self.tab == ActiveTab::Solvents && self.solvents_tab.editing,
+            _ => false,
+        }
+    }
+
+    /// Mouse reporting should be enabled only for interactive plot work; modals
+    /// release it so native terminal text selection works.
+    pub fn wants_mouse_capture(&self) -> bool {
+        self.mouse_capture && matches!(self.modal, Modal::None)
+    }
+
+    /// Plain-text snapshot of the Inspector, used by right-click copy.
+    pub fn format_inspector_text(&self) -> String {
+        let kind = self.current_kind();
+        let pos = match kind {
+            SpectrumKind::Ftir => format!("{:.1} cm⁻¹", self.cursor_x),
+            SpectrumKind::Hnmr => format!("{:.2} ppm", self.cursor_x),
+            SpectrumKind::Cnmr => format!("{:.1} ppm", self.cursor_x),
+            SpectrumKind::UvVis => format!("{:.1} nm", self.cursor_x),
+        };
+        let y = self
+            .processed
+            .get(self.active_trace)
+            .and_then(|pt| {
+                interpolate_y(&pt.x, &pt.y, self.cursor_x)
+                    .map(|v| format!("{} {}", crate::ui::format_y_val(v), pt.y_unit.label()))
+            })
+            .unwrap_or_else(|| "—".into());
+
+        let mut out = format!("SPECTRA Inspector — {}\n", kind.display_name());
+        out.push_str(&format!("Cursor: {} = {}\n", kind.symbol(), pos));
+        out.push_str(&format!("Y: {}\n", y));
+        out.push_str(&format!(
+            "Zone: {}\n",
+            spectral_zone_name(kind, self.cursor_x)
+        ));
+        out.push_str("Functional Groups:\n");
+        match kind {
+            SpectrumKind::Ftir => {
+                let hits = match_ftir(self.cursor_x);
+                if hits.is_empty() {
+                    out.push_str("  (none in this window)\n");
+                }
+                for b in hits.iter().take(6) {
+                    out.push_str(&format!(
+                        "  - {} ({:.0}–{:.0} cm⁻¹, {}, {})\n",
+                        b.group, b.min, b.max, b.intensity, b.mode
+                    ));
+                }
+            }
+            SpectrumKind::Hnmr => {
+                let hits = match_hnmr(self.cursor_x);
+                if hits.is_empty() {
+                    out.push_str("  (none in this window)\n");
+                }
+                for b in hits.iter().take(6) {
+                    out.push_str(&format!(
+                        "  - {} ({:.2}–{:.2} ppm, {})\n",
+                        b.group, b.min, b.max, b.example
+                    ));
+                }
+            }
+            SpectrumKind::Cnmr => {
+                let hits = match_cnmr(self.cursor_x);
+                if hits.is_empty() {
+                    out.push_str("  (none in this window)\n");
+                }
+                for b in hits.iter().take(6) {
+                    out.push_str(&format!(
+                        "  - {} ({:.0}–{:.0} ppm, {})\n",
+                        b.group, b.min, b.max, b.example
+                    ));
+                }
+            }
+            SpectrumKind::UvVis => {
+                let hits = match_uvvis(self.cursor_x);
+                if hits.is_empty() {
+                    out.push_str("  (none in this window)\n");
+                }
+                for b in hits.iter().take(6) {
+                    out.push_str(&format!(
+                        "  - {} ({:.0}–{:.0} nm, {}, ε {})\n",
+                        b.group, b.min, b.max, b.transition, b.epsilon
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn copy_full_inspector_text(&mut self) {
+        let text = self.format_inspector_text();
+        match copy_text(&text) {
+            Ok(tool) => self.status_msg = format!("Copied full Inspector via {}", tool),
+            Err(e) => self.status_msg = format!("Inspector copy failed: {}", e),
+        }
+    }
+
+    pub fn copy_peaks_list_text(&mut self) {
+        let kind = self.current_kind();
+        let mut text = format!("SPECTRA {} — Peaks\n", kind.display_name());
+        if self.pinned_peaks.is_empty() && self.auto_peaks.is_empty() {
+            text.push_str("No peaks detected.\n");
+        }
+        for p in &self.pinned_peaks {
+            text.push_str(&format!("★ pinned  {}\n", p.label));
+        }
+        for (i, p) in self.auto_peaks.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", i + 1, p.label));
+        }
+        match copy_text(&text) {
+            Ok(tool) => self.status_msg = format!("Copied peaks list via {}", tool),
+            Err(e) => self.status_msg = format!("Peaks copy failed: {}", e),
         }
     }
 
@@ -2566,10 +2836,18 @@ impl App {
     // KEYBOARD EVENT DISPATCHER
     // ========================================================================
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        // Normalize Persian layouts first so Ctrl+C / Ctrl+ز quits from any modal.
+        let norm = normalize_shortcut_key(key);
+        if norm.modifiers.contains(KeyModifiers::CONTROL)
+            && norm.code == KeyCode::Char('c')
+        {
             self.should_quit = true;
             return;
         }
+
+        // Free-text fields keep the original Persian characters; everything else
+        // (shortcuts, modal keys, numeric digits) uses physical US-QWERTY codes.
+        let key = if self.is_free_text_input() { key } else { norm };
 
         if !matches!(self.modal, Modal::None) {
             self.handle_modal_key(key);
@@ -2652,6 +2930,16 @@ impl App {
             }
             KeyCode::Char('M') => {
                 self.open_library_match();
+                return;
+            }
+            KeyCode::Char('y') => {
+                self.mouse_capture = !self.mouse_capture;
+                self.status_msg = if self.mouse_capture {
+                    "Mouse: INTERACTIVE mode (plot zoom · Shift+drag or [y] to select text)".into()
+                } else {
+                    "Mouse: TEXT-SELECT mode (drag any text to select/copy · [y] for plot zoom)"
+                        .into()
+                };
                 return;
             }
             // CapsLock + Shift is often reported as lowercase 'm' with SHIFT set.
@@ -3339,7 +3627,7 @@ impl App {
                     KeyCode::Left | KeyCode::Right => {}
                     KeyCode::Home => self.help_scroll = 0,
                     KeyCode::End => self.help_scroll = usize::MAX / 2,
-                    KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+                    KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Esc => {
                         self.modal = Modal::None;
                         return;
                     }
@@ -4739,6 +5027,57 @@ impl App {
 
         let col = mouse.column;
         let row = mouse.row;
+
+        let in_rect = |r: Rect| {
+            r.width > 0
+                && r.height > 0
+                && col >= r.x
+                && col < r.x + r.width
+                && row >= r.y
+                && row < r.y + r.height
+        };
+
+        // Right-click the Inspector pane: copy the full scientific readout.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            && in_rect(self.inspector_rect)
+        {
+            self.copy_full_inspector_text();
+            return;
+        }
+
+        // Right-click the peaks pane: copy the detected + pinned peak list.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            && in_rect(self.peaks_rect)
+        {
+            self.copy_peaks_list_text();
+            return;
+        }
+
+        // Left-click the Inspector quick-action buttons (2×2 grid).
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && in_rect(self.quick_actions_rect)
+        {
+            let mid = self.quick_actions_rect.x + self.quick_actions_rect.width / 2;
+            let left_half = col < mid;
+            match row.saturating_sub(self.quick_actions_rect.y) {
+                1 => {
+                    if left_half {
+                        self.copy_cursor_summary();
+                    } else {
+                        self.toggle_pin_at_cursor();
+                    }
+                }
+                2 => {
+                    if left_half {
+                        self.open_export_modal();
+                    } else {
+                        self.modal = Modal::DemoPicker(0);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // Topbar click -> switch tabs or trigger actions
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))

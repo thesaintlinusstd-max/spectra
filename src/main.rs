@@ -678,9 +678,20 @@ fn run_tui(targets: CliTargets, mode: Option<SpectrumKind>) -> Result<()> {
         app.status_msg = format!("{} · {}", app.status_msg, targets.notes.join(" · "));
     }
     let mut hd_state = kitty_plot::KittyPlotState::default();
+    let mut mouse_enabled = true;
 
     while !app.should_quit {
         app.poll_background();
+        let want_mouse = app.wants_mouse_capture();
+        if want_mouse != mouse_enabled {
+            let mut stdout = stdio::stdout();
+            if want_mouse {
+                let _ = execute!(stdout, EnableMouseCapture);
+            } else {
+                let _ = execute!(stdout, DisableMouseCapture);
+            }
+            mouse_enabled = want_mouse;
+        }
         terminal.draw(|frame| ui::render(frame, &mut app))?;
         let _ = kitty_plot::sync_hd_plot(&app, &mut hd_state, &mut stdio::stdout());
 
@@ -1486,7 +1497,7 @@ mod tests {
 
     #[test]
     fn test_version_is_0_8() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.8.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.8.1");
     }
 
     #[test]
@@ -2674,7 +2685,7 @@ mod tests {
                 ..ProcessConfig::default()
             },
         );
-        assert_eq!(yu, YUnit::Absorbance);
+        assert_eq!(yu, YUnit::Intensity);
         let mean = yn.iter().sum::<f64>() / yn.len() as f64;
         let var = yn.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / yn.len() as f64;
         assert!(mean.abs() < 1e-9, "SNV mean = {:.3e}", mean);
@@ -3646,6 +3657,182 @@ mod tests {
             max_diff > 1e-3,
             "expected PTFE (n=1.35) vs PS (n=1.59) ATR traces to differ, max_diff={}",
             max_diff
+        );
+    }
+
+    fn dummy_deconv_result() -> crate::deconv::DeconvResult {
+        crate::deconv::DeconvResult {
+            kind: SpectrumKind::Ftir,
+            shape: PeakShape::PseudoVoigt,
+            x_lo: 1650.0,
+            x_hi: 1800.0,
+            x: vec![1700.0, 1725.0],
+            y_obs: vec![0.9, 1.0],
+            y_fit: vec![0.9, 1.0],
+            y_baseline: vec![0.0, 0.0],
+            y_residual: vec![0.0, 0.0],
+            components: vec![vec![0.9, 1.0]],
+            peaks: vec![crate::deconv::FittedPeak {
+                center: 1725.0,
+                err_center: 0.1,
+                height: 1.0,
+                err_height: 0.01,
+                fwhm: 12.0,
+                err_fwhm: 0.2,
+                eta: 0.5,
+                err_eta: 0.01,
+                area: 1.0,
+                area_pct: 100.0,
+                label: "C=O".into(),
+            }],
+            baseline_b0: 0.0,
+            baseline_b1: 0.0,
+            r_squared: 0.995,
+            adj_r_squared: 0.994,
+            reduced_chi2: 1e-6,
+            rmse: 0.001,
+            iterations: 8,
+            converged: true,
+        }
+    }
+
+    #[test]
+    fn test_deconv_overlay_clears_on_norm_but_persists_on_transmittance_toggle() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(vec![], None);
+        assert!(matches!(app.modal, crate::app::Modal::None));
+        app.deconv_overlay = Some(crate::app::DeconvOverlay {
+            trace_idx: app.active_trace,
+            result: dummy_deconv_result(),
+            show_components: true,
+            show_residual: false,
+            proc_sig: crate::app::DeconvProcSig::from_cfg(app.process_cfg),
+        });
+
+        // `a` only flips %T ↔ Abs; deconv overlays convert cleanly, so it persists.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(
+            app.deconv_overlay.is_some(),
+            "transmittance/absorbance toggle must keep the deconvolution overlay"
+        );
+
+        // `w` changes curve shape/scale, so the stale fit must be cleared.
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(
+            app.deconv_overlay.is_none(),
+            "normalization change must auto-clear the stale overlay"
+        );
+    }
+
+    #[test]
+    fn test_format_y_val_handles_area_norm_and_derivatives() {
+        assert_eq!(crate::ui::format_y_val(0.00324), "0.0032");
+        assert_eq!(crate::ui::format_y_val(0.00012), "1.20e-4");
+        assert_eq!(crate::ui::format_y_val(12.09), "12.09");
+        assert_eq!(crate::ui::format_y_val(100.0), "100.0");
+    }
+
+    #[test]
+    fn test_persian_keyboard_shortcuts_normalized() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let map = |c: char, m: KeyModifiers| crate::app::normalize_shortcut_key(KeyEvent::new(KeyCode::Char(c), m));
+
+        assert_eq!(map('ض', KeyModifiers::NONE).code, KeyCode::Char('q'));
+        assert_eq!(map('ب', KeyModifiers::NONE).code, KeyCode::Char('f'));
+        assert_eq!(map('ذ', KeyModifiers::NONE).code, KeyCode::Char('b'));
+        assert_eq!(map('ش', KeyModifiers::NONE).code, KeyCode::Char('a'));
+        assert_eq!(map('غ', KeyModifiers::NONE).code, KeyCode::Char('y'));
+        assert_eq!(map('۱', KeyModifiers::NONE).code, KeyCode::Char('1'));
+        assert_eq!(map('؟', KeyModifiers::NONE).code, KeyCode::Char('?'));
+        assert_eq!(map('٫', KeyModifiers::NONE).code, KeyCode::Char('.'));
+        assert_eq!(map('ؤ', KeyModifiers::NONE).code, KeyCode::Char('A'));
+        assert_eq!(map('ئ', KeyModifiers::NONE).code, KeyCode::Char('m'));
+        assert_eq!(map('ئ', KeyModifiers::SHIFT).code, KeyCode::Char('S'));
+        assert_eq!(map('ء', KeyModifiers::NONE).code, KeyCode::Char('M'));
+        assert_eq!(map('[', KeyModifiers::SHIFT).code, KeyCode::Char('P'));
+        assert_eq!(map(']', KeyModifiers::SHIFT).code, KeyCode::Char('O'));
+        let ctrl_z = map('ز', KeyModifiers::CONTROL);
+        assert_eq!(ctrl_z.code, KeyCode::Char('c'));
+        assert!(ctrl_z.modifiers.contains(KeyModifiers::CONTROL));
+
+        // A Persian `ذ` drives the real shortcut path (Baseline Off → Rubberband).
+        let mut app = App::new(vec![], None);
+        assert_eq!(app.process_cfg.baseline, crate::processing::BaselineMode::Off);
+        app.handle_key(KeyEvent::new(KeyCode::Char('ذ'), KeyModifiers::NONE));
+        assert_eq!(
+            app.process_cfg.baseline,
+            crate::processing::BaselineMode::Rubberband
+        );
+
+        // Free-text search keeps Persian verbatim …
+        app.modal = crate::app::Modal::Search(crate::app::SearchState {
+            query: String::new(),
+            results: Vec::new(),
+            selected: 0,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('ب'), KeyModifiers::NONE));
+        match &app.modal {
+            crate::app::Modal::Search(st) => assert_eq!(st.query, "ب"),
+            other => panic!("expected Search modal, got {:?}", other),
+        }
+
+        // … while Ctrl+ز still quits immediately.
+        app.modal = crate::app::Modal::None;
+        app.should_quit = false;
+        app.handle_key(KeyEvent::new(KeyCode::Char('ز'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "Ctrl+ز must quit from any modal");
+    }
+
+    #[test]
+    fn test_mouse_capture_toggle_and_modal_auto_release() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(vec![], None);
+        assert!(app.wants_mouse_capture());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!app.mouse_capture);
+        assert!(!app.wants_mouse_capture());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.mouse_capture);
+        assert!(app.wants_mouse_capture());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, crate::app::Modal::Help));
+        assert!(!app.wants_mouse_capture(), "modals must release the mouse");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.modal, crate::app::Modal::None));
+        assert!(app.wants_mouse_capture());
+    }
+
+    #[test]
+    fn test_format_inspector_text_non_empty() {
+        let mut app = App::new(vec![], None);
+
+        app.load_demo(DemoPreset::MmaVsPmmaFtir);
+        app.cursor_x = 1725.0;
+        let ftir = app.format_inspector_text();
+        assert!(ftir.contains("Cursor"), "missing cursor line: {}", ftir);
+        assert!(ftir.contains("Zone"), "missing zone line: {}", ftir);
+        assert!(
+            ftir.contains("Functional Groups"),
+            "missing functional groups: {}",
+            ftir
+        );
+
+        app.load_demo(DemoPreset::PmmaHnmr);
+        app.cursor_x = 3.60;
+        let hnmr = app.format_inspector_text();
+        assert!(hnmr.contains("Cursor"), "missing cursor line: {}", hnmr);
+        assert!(hnmr.contains("Zone"), "missing zone line: {}", hnmr);
+        assert!(
+            hnmr.contains("Functional Groups"),
+            "missing functional groups: {}",
+            hnmr
         );
     }
 }

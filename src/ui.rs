@@ -18,9 +18,29 @@ use crate::data::{
 };
 use crate::processing::{
     analyze_hnmr_multiplet, atr_critical_angle_deg, atr_penetration_depth_um, interpolate_y,
-    spectrum_nmr_freq_mhz,
+    spectrum_nmr_freq_mhz, DerivOrder, NormMode,
 };
 use crate::theme::*;
+
+/// Adaptive scientific Y formatter: never truncates small Area-normalized or
+/// 2nd-derivative values to a meaningless `0.00`.
+pub(crate) fn format_y_val(v: f64) -> String {
+    if !v.is_finite() {
+        return "—".to_string();
+    }
+    let a = v.abs();
+    if a == 0.0 {
+        "0.00".to_string()
+    } else if a >= 100.0 {
+        format!("{:.1}", v)
+    } else if a >= 0.05 {
+        format!("{:.2}", v)
+    } else if a >= 0.0005 {
+        format!("{:.4}", v)
+    } else {
+        format!("{:.2e}", v)
+    }
+}
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -690,7 +710,7 @@ fn draw_spectrum_canvas(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &mut App, area: Rect) {
     let kind = app.current_kind();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -711,7 +731,7 @@ fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &App, area: Rect) {
             .processed
             .get(idx)
             .and_then(|pt| interpolate_y(&pt.x, &pt.y, app.cursor_x))
-            .map(|v| format!("{:.2}", v))
+            .map(|v| format_y_val(v))
             .unwrap_or_else(|| "—".into());
         t_lines.push(TextLine::from(vec![
             Span::styled(active_mark, Style::default().fg(ACCENT_YELLOW)),
@@ -816,9 +836,12 @@ fn draw_trace_and_peaks_strip(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
     frame.render_widget(Paragraph::new(p_lines).block(p_block), cols[1]);
+    app.peaks_rect = cols[1];
 }
 
-fn draw_inspector(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_inspector(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.inspector_rect = area;
+    app.quick_actions_rect = Rect::default();
     let kind = app.current_kind();
     let title = format!("Inspector · {}", kind.display_name());
     let outer = panel_block(title, BORDER_RIGHT);
@@ -850,7 +873,8 @@ fn draw_inspector(frame: &mut Frame, app: &App, area: Rect) {
         .processed
         .get(app.active_trace)
         .and_then(|pt| {
-            interpolate_y(&pt.x, &pt.y, app.cursor_x).map(|v| format!("{:.2} {}", v, pt.y_unit.label()))
+            interpolate_y(&pt.x, &pt.y, app.cursor_x)
+                .map(|v| format!("{} {}", format_y_val(v), pt.y_unit.label()))
         })
         .unwrap_or_else(|| "—".into());
 
@@ -1150,6 +1174,7 @@ fn draw_inspector(frame: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
     frame.render_widget(Paragraph::new(btn_lines), chunks[2]);
+    app.quick_actions_rect = chunks[2];
 }
 
 // ============================================================================
@@ -1765,7 +1790,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .get(app.active_trace)
         .map(|pt| pt.y_unit.label().to_string())
         .unwrap_or_else(|| "Int".to_string());
-    let flags = TextLine::from(vec![
+    let mut flag_spans = vec![
         Span::styled(" ● ", Style::default().fg(ACCENT_GREEN)),
         Span::styled(app.status_msg.clone(), Style::default().fg(TEXT_PRIMARY)),
         Span::styled("   │ ", Style::default().fg(TEXT_MUTED)),
@@ -1796,10 +1821,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             },
             Style::default().fg(ACCENT_AMBER),
         ),
-    ]);
+    ];
+    if !app.mouse_capture {
+        flag_spans.push(Span::styled(
+            "  Mouse:SELECT [y]",
+            Style::default()
+                .fg(DARK_TEXT)
+                .bg(ACCENT_AQUA)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let flags = TextLine::from(flag_spans);
 
     let hints = TextLine::from(Span::styled(
-        " Click/Drag:Cursor/Zoom | h/l:Move | a:%T↔Abs | b:Base | w:Norm | A:ATR/KM | t:Deriv | C:CO₂ | P:Deconv | o:Math | I:Integ | X:Calib | W:Save | M:Match/Mix | m:Smooth | s:Stack | p:Peaks | x:Pin | c:Copy",
+        " Click/Drag:Cursor/Zoom | y:Select | h/l:Move | a:%T↔Abs | b:Base | w:Norm | A:ATR/KM | t:Deriv | C:CO₂ | P:Deconv | o:Math | I:Integ | X:Calib | W:Save | M:Match/Mix | m:Smooth | s:Stack | p:Peaks | x:Pin | c:Copy",
         Style::default().fg(TEXT_MUTED),
     ));
 
@@ -2919,7 +2954,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
                 },
             );
         }
-        Modal::Deconv(st) => draw_deconv_modal(frame, st, area),
+        Modal::Deconv(st) => draw_deconv_modal(frame, app, st, area),
         Modal::SpectralMath(st) => draw_spectral_math_modal(frame, app, st, area),
         Modal::Integration(st) => draw_integration_modal(frame, app, st, area),
         Modal::Calibration(st) => draw_calibration_modal(frame, app, st, area),
@@ -2945,7 +2980,7 @@ fn field_line(label: &str, value: String, cursor: bool, active: bool) -> TextLin
     ))
 }
 
-fn draw_deconv_modal(frame: &mut Frame, st: &DeconvModalState, area: Rect) {
+fn draw_deconv_modal(frame: &mut Frame, app: &App, st: &DeconvModalState, area: Rect) {
     let rect = centered_rect(88, 78, area);
     frame.render_widget(Clear, rect);
     let block = modal_block("Peak Deconvolution Studio [P] · Levenberg–Marquardt", ACCENT_YELLOW);
@@ -2957,7 +2992,7 @@ fn draw_deconv_modal(frame: &mut Frame, st: &DeconvModalState, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
+            Constraint::Length(10),
             Constraint::Min(8),
             Constraint::Length(2),
         ])
@@ -2985,6 +3020,27 @@ fn draw_deconv_modal(frame: &mut Frame, st: &DeconvModalState, area: Rect) {
         field_line("Window X Min", st.x_lo.clone(), st.field_idx == 3, st.field_idx == 3),
         field_line("Window X Max", st.x_hi.clone(), st.field_idx == 4, st.field_idx == 4),
     ];
+    if let (Ok(lo), Ok(hi)) = (st.x_lo.trim().parse::<f64>(), st.x_hi.trim().parse::<f64>()) {
+        let win_span = (hi - lo).abs();
+        let (full_lo, full_hi) = app.full_bounds();
+        let full_span = (full_hi - full_lo).abs();
+        if full_span > 1e-6 && win_span > 0.40 * full_span {
+            cfg_lines.push(TextLine::from(Span::styled(
+                format!(
+                    "  ⚠ Wide window ({:.0} {}) — zoom into 1 overlapping band before fitting for R² > 0.99!",
+                    win_span,
+                    app.current_kind().x_unit()
+                ),
+                Style::default().fg(ACCENT_AMBER).add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    if app.process_cfg.norm == NormMode::VectorSnv || app.process_cfg.deriv != DerivOrder::Raw {
+        cfg_lines.push(TextLine::from(Span::styled(
+            "  Note: Fit works best on Raw Absorbance/Intensity (SNV/Deriv active).",
+            Style::default().fg(ACCENT_AQUA),
+        )));
+    }
     if let Some(fb) = &st.feedback {
         cfg_lines.push(TextLine::from(""));
         cfg_lines.push(TextLine::from(Span::styled(
@@ -3000,6 +3056,13 @@ fn draw_deconv_modal(frame: &mut Frame, st: &DeconvModalState, area: Rect) {
             .constraints([Constraint::Length(2), Constraint::Min(5)])
             .split(rows[1]);
 
+        let r2_color = if res.r_squared >= 0.98 {
+            ACCENT_GREEN
+        } else if res.r_squared >= 0.90 {
+            ACCENT_AMBER
+        } else {
+            ACCENT_CORAL
+        };
         let metrics = Paragraph::new(vec![
             TextLine::from(Span::styled(
                 format!(
@@ -3011,7 +3074,7 @@ fn draw_deconv_modal(frame: &mut Frame, st: &DeconvModalState, area: Rect) {
                     res.iterations,
                     if res.converged { "converged" } else { "max-iter" }
                 ),
-                Style::default().fg(ACCENT_AQUA).add_modifier(Modifier::BOLD),
+                Style::default().fg(r2_color).add_modifier(Modifier::BOLD),
             )),
             TextLine::from(""),
         ]);
@@ -3691,6 +3754,11 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   ←/→ or h/l       Move the cursor (Shift = coarse jump)"),
         TextLine::from("   Mouse            Click places the cursor; drag a box zooms; scroll zooms"),
         TextLine::from("                    around the pointer; right-click resets the view."),
+        TextLine::from("   y                Mouse INTERACTIVE ↔ TEXT-SELECT (native drag-select/copy;"),
+        TextLine::from("                    modals release the mouse automatically)."),
+        TextLine::from("   Right-click      Inspector pane → copy full readout; peaks pane → copy list."),
+        TextLine::from("   Persian layout   ISIRI 9147 / Windows Persian keys map to US-QWERTY, so every"),
+        TextLine::from("                    shortcut and digit works; Ctrl+ز (Ctrl+C) always quits."),
         TextLine::from("   g                Jump to an exact cm⁻¹ / ppm / nm value"),
         TextLine::from("   + / = / z        Zoom in;  - / Z zoom out around the cursor"),
         TextLine::from("   0 or r           Reset zoom to the full spectrum"),
@@ -3703,6 +3771,7 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from("   b                Baseline: OFF → Rubberband → AsLS → arPLS"),
         TextLine::from("   m                Savitzky-Golay smoothing: OFF → 5 → 9 → 15 points"),
         TextLine::from("   w                Normalization: OFF → MinMax → SNV → Area"),
+        TextLine::from("                    (SNV/Area report Intensity and use adaptive Y formatting)"),
         TextLine::from("   A                ATR crystal (diamond/ZnSe/Ge/Si) and Kubelka–Munk optics"),
         TextLine::from("   O                Optics & Baseline config: ATR n₂/θ presets + unbiased baseline clamp"),
         TextLine::from("   t                Derivative: Raw → 1st → 2nd"),
@@ -3715,7 +3784,9 @@ fn help_guide_lines() -> Vec<TextLine<'static>> {
         TextLine::from(""),
         section("  ANALYSIS STUDIOS"),
         TextLine::from("   P  Peak Deconvolution   Pseudo-Voigt/Gaussian/Lorentzian multi-peak LM fit"),
-        TextLine::from("                           inside the zoom window; overlay stays on the plot."),
+        TextLine::from("                           inside the zoom window; overlay stays on the plot and"),
+        TextLine::from("                           auto-clears when b/m/w/A/O/t/C changes curve shape."),
+        TextLine::from("                           Wide windows warn; R² colors green ≥0.98, amber ≥0.90."),
         TextLine::from("   o  Spectral Math        Weighted subtract, add, ratio and average of traces."),
         TextLine::from("   I  Integration Studio   Mnova-style regions with relative integrals; push"),
         TextLine::from("                           ratios straight into Polymer Lab."),

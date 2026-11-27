@@ -1037,7 +1037,6 @@ pub fn process_trace(spec: &Spectrum, cfg: ProcessConfig) -> (Vec<f64>, Vec<f64>
             NormMode::VectorSnv => {
                 if y_unit == YUnit::Transmittance {
                     ys = ys.into_iter().map(transmittance_to_absorbance).collect();
-                    y_unit = YUnit::Absorbance;
                 }
                 let n_f = ys.len() as f64;
                 let mean = ys.iter().sum::<f64>() / n_f;
@@ -1046,11 +1045,12 @@ pub fn process_trace(spec: &Spectrum, cfg: ProcessConfig) -> (Vec<f64>, Vec<f64>
                 for v in &mut ys {
                     *v = (*v - mean) / std;
                 }
+                // SNV Z-scores are dimensionless and signed — not Beer–Lambert absorbance.
+                y_unit = YUnit::Intensity;
             }
             NormMode::Area => {
                 if y_unit == YUnit::Transmittance {
                     ys = ys.into_iter().map(transmittance_to_absorbance).collect();
-                    y_unit = YUnit::Absorbance;
                 }
                 let mut area = 0.0;
                 for k in 0..(xs.len().min(ys.len()) - 1) {
@@ -1062,6 +1062,8 @@ pub fn process_trace(spec: &Spectrum, cfg: ProcessConfig) -> (Vec<f64>, Vec<f64>
                         *v /= area;
                     }
                 }
+                // Area-normalized curves are scaled arbitrary units, not absorbance.
+                y_unit = YUnit::Intensity;
             }
         }
     }

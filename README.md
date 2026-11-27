@@ -1,8 +1,19 @@
-# SPECTRA v0.8.0
+# SPECTRA v0.8.1
 
 **Offline Terminal Workbench for FTIR, ¹H NMR, ¹³C NMR & UV-Vis Spectroscopy and Polymer Chemistry**
 
 Built in **Rust** (`ratatui` + `crossterm`) with optional **Python** (`matplotlib` / `scipy` / `numpy`) tools for publication figures, printed-spectrum digitization, and open-library fetching.
+
+---
+
+## What's New in v0.8.1 (Persian Keyboard, Native Text Selection & Scientific Polish)
+
+- **Full Persian keyboard support** — Linux XKB `ir` (ISIRI 9147) and Windows Persian key events are normalized to their physical US-QWERTY equivalents, so every shortcut, modal key and numeric digit works while the OS layout is Persian. Free-text search/title fields still receive Persian characters verbatim, and `Ctrl+ز` (`Ctrl+C`) always quits.
+- **Native mouse text selection (`y`)** — toggle `INTERACTIVE` (plot click/drag zoom) ↔ `TEXT-SELECT` (drag any terminal text to select/copy). Modals automatically release mouse capture, and the footer shows a `Mouse:SELECT [y]` badge.
+- **Clickable Inspector** — right-click the Inspector to copy the full scientific readout; right-click the peaks pane to copy the detected/pinned peak list; left-click the 2×2 quick-action grid for Copy/Pin/Export/Presets.
+- **Stale deconvolution overlays auto-clear** — any transform that changes curve shape or scale (`b`, `m`, `w`, `A`, `O`, `t`, `C`) now invalidates the fitted overlay, while `%T ↔ Abs` (`a`) keeps it cleanly transformed. The Deconv modal warns on windows wider than 40% of the full axis and colors R² green ≥ 0.98 / amber ≥ 0.90 / coral below.
+- **Adaptive scientific Y formatting** — Inspector and trace readouts no longer truncate small Area-normalized (`0.0032`) or 2nd-derivative (`1.20e-4`) values to `0.00`.
+- **Correct Y units for SNV & Area** — dimensionless SNV Z-scores and area-scaled curves now report `Intensity` instead of `Absorbance`.
 
 ---
 
@@ -271,6 +282,9 @@ To download optional experimental reference spectra into `library/`:
 | Drag box / Scroll / Right-click | Zoom window / zoom at cursor / reset zoom (`0` or `r`) |
 | `g` | Jump to exact `cm⁻¹`, `ppm`, or `nm` |
 | `Tab` / `Space` / `Del` | Switch active trace / hide trace / remove active trace |
+| `y` | Toggle `INTERACTIVE` (plot zoom) ↔ `TEXT-SELECT` (native drag-select/copy; modals auto-release the mouse) |
+| Right-click Inspector / peaks pane | Copy full Inspector readout / copy detected + pinned peak list |
+| Persian layout | ISIRI 9147 & Windows Persian keys map to US-QWERTY, so all shortcuts and digits work; `Ctrl+ز` (`Ctrl+C`) quits |
 | `s` / `v` | Toggle Stacked vs Overlay / toggle HD Kitty vs Braille |
 | `f` / `F` | Open file browser (replace / append overlay) |
 | `/` / `d` | Global search / built-in demo presets |
